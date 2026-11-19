@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/stuinxo/de_GWD/v3/internal/cert"
+	"github.com/stuinxo/de_GWD/v3/internal/state"
 )
 
 func TestCLISmokeEndToEnd(t *testing.T) {
@@ -113,5 +117,75 @@ func TestCLISmokeEndToEnd(t *testing.T) {
 	code, out, errOut = run("extra", "del", "9443")
 	if code != 0 {
 		t.Fatalf("extra del failed: %q", errOut)
+	}
+}
+
+func TestCertImportReloadsConsumersAndRefreshRespectsManualGuard(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	store := state.NewStore(stateDir)
+	s := state.NewDefaultState(state.RoleServer)
+	s.Server.Domain = "srv.example.com"
+	s.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	if err := store.Save(s); err != nil {
+		t.Fatalf("Save state: %v", err)
+	}
+
+	srcCert := filepath.Join(dir, "src.cer")
+	srcKey := filepath.Join(dir, "src.key")
+	if err := cert.EnsureSelfSigned(srcCert, srcKey, "srv.example.com"); err != nil {
+		t.Fatalf("EnsureSelfSigned: %v", err)
+	}
+
+	exec := &fakeOpsExec{
+		activeSvcs: map[string]bool{
+			"nginx":      true,
+			"dex-xray":   true,
+			"dex-daemon": true,
+		},
+	}
+	var out, errBuf bytes.Buffer
+	code := cmdCert(store, exec, []string{"import", srcCert, srcKey, "--allow-self-signed"}, &out, &errBuf)
+	if code != 0 {
+		t.Fatalf("cmdCert import failed: code=%d err=%q", code, errBuf.String())
+	}
+	if !reflect.DeepEqual(exec.reloaded, []string{"nginx"}) {
+		t.Fatalf("expected nginx reloaded on cert import, got %v", exec.reloaded)
+	}
+	if !reflect.DeepEqual(exec.restarted, []string{"dex-xray", "dex-daemon"}) {
+		t.Fatalf("expected dex-xray & dex-daemon restarted on cert import, got %v", exec.restarted)
+	}
+
+	// Second identical import should skip reload/restart (changed=false).
+	exec.reloaded = nil
+	exec.restarted = nil
+	code = cmdCert(store, exec, []string{"import", srcCert, srcKey, "--allow-self-signed"}, &out, &errBuf)
+	if code != 0 || len(exec.reloaded) != 0 || len(exec.restarted) != 0 {
+		t.Fatalf("expected no reload on unchanged cert import, got reloaded=%v restarted=%v", exec.reloaded, exec.restarted)
+	}
+
+	// dex refresh must NOT imply --force; manual edit to managed xray.json must fail.
+	root := filepath.Join(dir, "root")
+	xrayTarget := filepath.Join(store.GeneratedDir(), "xray.json")
+	xrayOnRoot := filepath.Join(root, strings.TrimPrefix(filepath.Clean(xrayTarget), string(filepath.Separator)))
+	_ = os.MkdirAll(filepath.Dir(xrayOnRoot), 0o755)
+	_ = os.MkdirAll(store.GeneratedDir(), 0o755)
+	_ = os.WriteFile(xrayOnRoot, []byte(`{"manual":true}`), 0o640)
+	_ = os.WriteFile(store.ManifestPath(), []byte(`{"files":{"`+xrayTarget+`":{"target_path":"`+xrayTarget+`","sha256":"0000","mode":416}}}`), 0o600)
+
+	var rOut, rErr bytes.Buffer
+	code = Run([]string{"--state-dir", stateDir, "refresh", "--root-prefix", root}, strings.NewReader(""), &rOut, &rErr)
+	if code == 0 || !strings.Contains(rErr.String(), "managed config modified outside dex") {
+		t.Fatalf("expected refresh to reject manual edit without --force, code=%d err=%q", code, rErr.String())
+	}
+
+	// cert reload subcommand reloads active TLS consumers.
+	exec.reloaded = nil
+	exec.restarted = nil
+	if c := cmdCert(store, exec, []string{"reload"}, &out, &errBuf); c != 0 {
+		t.Fatalf("cmdCert reload failed: %q", errBuf.String())
+	}
+	if !reflect.DeepEqual(exec.reloaded, []string{"nginx"}) || !reflect.DeepEqual(exec.restarted, []string{"dex-xray", "dex-daemon"}) {
+		t.Fatalf("unexpected cert reload actions: reloaded=%v restarted=%v", exec.reloaded, exec.restarted)
 	}
 }

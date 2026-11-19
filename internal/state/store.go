@@ -15,7 +15,8 @@ var ErrNotFound = errors.New("state file not found")
 
 // Store manages atomic, flock-serialized persistence for /etc/dex/state.json.
 type Store struct {
-	Dir string
+	Dir             string
+	OnApplyLockWait func() // optional callback invoked once if WithApplyLock waits >= 1s
 }
 
 // NewStore returns a Store rooted at stateDir (defaults to /etc/dex if empty).
@@ -47,6 +48,8 @@ func (s *Store) WithApplyLock(ctx context.Context, fn func() error) error {
 	}
 	defer lockFile.Close()
 
+	waitStarted := time.Now()
+	warned := false
 	for {
 		err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 		if err == nil {
@@ -54,6 +57,14 @@ func (s *Store) WithApplyLock(ctx context.Context, fn func() error) error {
 		}
 		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
 			return fmt.Errorf("apply flock: %w", err)
+		}
+		if !warned && time.Since(waitStarted) >= time.Second {
+			warned = true
+			if s.OnApplyLockWait != nil {
+				s.OnApplyLockWait()
+			} else {
+				fmt.Fprintln(os.Stderr, "waiting for another dex apply...")
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -65,11 +76,11 @@ func (s *Store) WithApplyLock(ctx context.Context, fn func() error) error {
 
 	return fn()
 }
-func (s *Store) GeneratedDir() string  { return filepath.Join(s.Dir, "generated") }
-func (s *Store) ManifestPath() string  { return filepath.Join(s.Dir, "generated", "manifest.json") }
-func (s *Store) CertDir() string       { return filepath.Join(s.Dir, "ssl") }
-func (s *Store) DefaultCert() string   { return filepath.Join(s.Dir, "ssl", "dex.cer") }
-func (s *Store) DefaultKey() string    { return filepath.Join(s.Dir, "ssl", "dex.key") }
+func (s *Store) GeneratedDir() string { return filepath.Join(s.Dir, "generated") }
+func (s *Store) ManifestPath() string { return filepath.Join(s.Dir, "generated", "manifest.json") }
+func (s *Store) CertDir() string      { return filepath.Join(s.Dir, "ssl") }
+func (s *Store) DefaultCert() string  { return filepath.Join(s.Dir, "ssl", "dex.cer") }
+func (s *Store) DefaultKey() string   { return filepath.Join(s.Dir, "ssl", "dex.key") }
 
 func (s *Store) ensureDir() error {
 	return os.MkdirAll(s.Dir, 0o755)

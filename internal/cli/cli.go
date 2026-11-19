@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -53,6 +54,9 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 
 	store := state.NewStore(stateDir)
+	store.OnApplyLockWait = func() {
+		fmt.Fprintln(stderr, "waiting for another dex apply...")
+	}
 	exec := reconcile.OSExecutor{}
 
 	if len(args) == 0 {
@@ -75,7 +79,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "apply":
 		return cmdApply(store, exec, rest, stdout, stderr)
 	case "refresh":
-		return cmdApply(store, exec, append([]string{"--force"}, rest...), stdout, stderr)
+		return cmdApply(store, exec, rest, stdout, stderr)
 	case "status":
 		return cmdStatus(store, exec, stdout, stderr)
 	case "node":
@@ -123,7 +127,7 @@ Commands:
   apply                 Validate, render, pre-flight check, and reconcile configs
   status                Show role, active node, certificate, and service health
   node <subcmd>         Manage client outbound nodes (list|add|del|select|show)
-  cert <subcmd>         Manage TLS certificates (self-sign|import|issue|inspect)
+  cert <subcmd>         Manage TLS certificates (self-sign|import|issue|inspect|reload)
   wg <subcmd>           Manage WireGuard VPN (enable|disable|peer-add|peer-del|show)
   ddns <subcmd>         Manage Cloudflare DDNS (set|sync|disable)
   socks5 <subcmd>       Manage server Option 35 SOCKS5 exits (list|add|del|toggle|test)
@@ -132,7 +136,7 @@ Commands:
   extra <subcmd>        Manage Option 55 extra inbounds (list|add-reality|add-socks5|del)
   rules <subcmd>        Inspect or hot-update GeoIP/Domain rule files (status|update)
   update                Upgrade dex, xray, mosdns, and/or rule datasets cleanly
-  migrate               Import v2 0conf, v2 server, des, or dexs state (--cleanup-v2)
+  migrate               Import v2 0conf, v2 server, des, or dexs state (--cleanup-v2 --apply)
   daemon                Run embedded Web UI + failover + Cloudflare DDNS loops
   serve-doh             Run standalone RFC 8484 DoH forwarding server
   refresh               Re-resolve dynamic relay targets and re-apply nftables
@@ -254,6 +258,7 @@ func cmdApply(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 	dryRun := fs.Bool("dry-run", false, "render and validate without modifying system")
 	outDir := fs.String("out-dir", "", "optional directory to write rendered files during --dry-run")
 	force := fs.Bool("force", false, "overwrite manually modified managed files")
+	restartAll := fs.Bool("restart-all", false, "force restart of all active managed services")
 	rootPrefix := fs.String("root-prefix", "", "optional target root directory prefix")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -262,6 +267,7 @@ func cmdApply(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 	res, err := reconcile.Reconcile(context.Background(), store, exec, reconcile.ApplyOptions{
 		DryRun:     *dryRun,
 		Force:      *force,
+		RestartAll: *restartAll,
 		RootPrefix: *rootPrefix,
 	})
 	if err != nil {
@@ -295,7 +301,11 @@ func cmdApply(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 		}
 		return 0
 	}
-	fmt.Fprintf(stdout, "Applied %d file(s). Active services: %s\n", len(res.FilesWritten), strings.Join(res.ServicesOn, ", "))
+	restarted := "none"
+	if len(res.ServicesRestarted) > 0 {
+		restarted = strings.Join(res.ServicesRestarted, ", ")
+	}
+	fmt.Fprintf(stdout, "Applied %d file(s). Active services: %s (restarted: %s)\n", len(res.FilesWritten), strings.Join(res.ServicesOn, ", "), restarted)
 	return 0
 }
 
@@ -527,9 +537,14 @@ func cmdCert(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 		if len(rest) > 0 {
 			cn = rest[0]
 		}
+		prevCert, _ := os.ReadFile(store.DefaultCert())
 		if err := cert.EnsureSelfSigned(store.DefaultCert(), store.DefaultKey(), cn); err != nil {
 			fmt.Fprintf(stderr, "self-sign failed: %v\n", err)
 			return 1
+		}
+		afterCert, _ := os.ReadFile(store.DefaultCert())
+		if !bytes.Equal(prevCert, afterCert) {
+			reloadCertConsumers(context.Background(), exec, stdout)
 		}
 		fmt.Fprintf(stdout, "Self-signed certificate ready at %s\n", store.DefaultCert())
 		return 0
@@ -547,6 +562,9 @@ func cmdCert(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 		if err != nil {
 			fmt.Fprintf(stderr, "import failed: %v\n", err)
 			return 1
+		}
+		if changed {
+			reloadCertConsumers(context.Background(), exec, stdout)
 		}
 		fmt.Fprintf(stdout, "Certificate imported (changed=%v, expires=%s, SANs=%s)\n",
 			changed, rep.NotAfter.Format("2006-01-02"), strings.Join(rep.SANs, ", "))
@@ -576,6 +594,7 @@ func cmdCert(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 			AutoRenew: *renew,
 			CertPath:  store.DefaultCert(),
 			KeyPath:   store.DefaultKey(),
+			ReloadCmd: buildCertReloadCmd(store.Dir),
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "acme issue failed: %v\n", err)
@@ -594,11 +613,50 @@ func cmdCert(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 				return nil
 			})
 		}
+		reloadCertConsumers(context.Background(), exec, stdout)
 		fmt.Fprintf(stdout, "Certificate issued for %s (expires %s)\n", strings.Join(rep.SANs, ", "), rep.NotAfter.Format("2006-01-02"))
+		return 0
+	case "reload":
+		reloadCertConsumers(context.Background(), exec, stdout)
 		return 0
 	default:
 		fmt.Fprintf(stderr, "unknown cert subcommand %q\n", sub)
 		return 2
+	}
+}
+
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func buildCertReloadCmd(stateDir string) string {
+	exe, err := os.Executable()
+	if err != nil || exe == "" || strings.HasSuffix(exe, ".test") || strings.Contains(exe, "/go-build") {
+		exe = "/usr/local/bin/dex"
+	}
+	return fmt.Sprintf("%s --state-dir %s cert reload", shellSingleQuote(exe), shellSingleQuote(stateDir))
+}
+
+func reloadCertConsumers(ctx context.Context, exec reconcile.SystemExecutor, stdout io.Writer) {
+	if exec == nil {
+		return
+	}
+	initSys := exec.DetectInitSystem()
+	var reloaded []string
+	if exec.ServiceIsActive(ctx, initSys, "nginx") {
+		if err := exec.ServiceReload(ctx, initSys, "nginx"); err != nil {
+			_ = exec.ServiceRestart(ctx, initSys, "nginx")
+		}
+		reloaded = append(reloaded, "nginx")
+	}
+	for _, svc := range []string{"dex-xray", "dex-daemon"} {
+		if exec.ServiceIsActive(ctx, initSys, svc) {
+			_ = exec.ServiceRestart(ctx, initSys, svc)
+			reloaded = append(reloaded, svc)
+		}
+	}
+	if stdout != nil && len(reloaded) > 0 {
+		fmt.Fprintf(stdout, "Reloaded TLS consumers: %s\n", strings.Join(reloaded, ", "))
 	}
 }
 
@@ -1515,13 +1573,21 @@ func cmdExtra(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 }
 
 func cmdMigrate(store *state.Store, exec reconcile.SystemExecutor, args []string, stdout, stderr io.Writer) int {
+	return runMigrateWithExec(store, exec, "/opt/de_GWD/nftables", reconcile.ApplyOptions{}, args, stdout, stderr)
+}
+
+func runMigrateWithExec(store *state.Store, exec reconcile.SystemExecutor, v2NFTDir string, baseOpts reconcile.ApplyOptions, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	from := fs.String("from", "/opt/de_GWD/0conf", "source file or root path")
 	kind := fs.String("kind", "v2_client", "v2_client|v2_server|des|dexs")
 	doApply := fs.Bool("apply", false, "apply immediately after migration")
-	cleanupV2 := fs.Bool("cleanup-v2", false, "stop legacy v2 services, pihole container, and de_GWD nft tables")
+	cleanupV2 := fs.Bool("cleanup-v2", false, "stop legacy v2 services, pihole container, and v2 nft tables (requires --apply)")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *cleanupV2 && !*doApply {
+		fmt.Fprintln(stderr, "migrate failed: --cleanup-v2 requires --apply")
 		return 2
 	}
 
@@ -1564,11 +1630,24 @@ func cmdMigrate(store *state.Store, exec reconcile.SystemExecutor, args []string
 	for _, n := range notes {
 		fmt.Fprintf(stdout, "  * %s\n", n)
 	}
+	ctx := context.Background()
 	if *cleanupV2 {
-		cleanupLegacyV2(context.Background(), exec, stdout)
+		dryOpts := baseOpts
+		dryOpts.DryRun = true
+		if _, err := reconcile.Reconcile(ctx, store, exec, dryOpts); err != nil {
+			fmt.Fprintf(stderr, "migrate dry-run validation failed (legacy v2 untouched): %v\n", err)
+			return 1
+		}
+		snap := cleanupLegacyV2WithNFTDir(ctx, exec, v2NFTDir, stdout)
+		if _, err := reconcile.Reconcile(ctx, store, exec, baseOpts); err != nil {
+			snap.restore(ctx, exec, stderr)
+			fmt.Fprintf(stderr, "apply failed after v2 cleanup (legacy v2 restored): %v\n", err)
+			return 1
+		}
+		return 0
 	}
 	if *doApply {
-		if _, err := reconcile.Reconcile(context.Background(), store, exec, reconcile.ApplyOptions{}); err != nil {
+		if _, err := reconcile.Reconcile(ctx, store, exec, baseOpts); err != nil {
 			fmt.Fprintf(stderr, "apply failed: %v\n", err)
 			return 1
 		}

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,34 +17,61 @@ import (
 	"testing"
 
 	"github.com/stuinxo/de_GWD/v3/internal/reconcile"
+	"github.com/stuinxo/de_GWD/v3/internal/render"
 	"github.com/stuinxo/de_GWD/v3/internal/state"
 )
 
 type fakeOpsExec struct {
 	reconcile.SystemExecutor
-	cmds        []string
-	stoppedSvcs []string
-	restarted   []string
+	cmds           []string
+	stoppedSvcs    []string
+	startedSvcs    []string
+	restarted      []string
+	reloaded       []string
+	activeSvcs     map[string]bool
+	piholeRunning  bool
+	failValidation string
+	failResolve    bool
 }
 
-func (f *fakeOpsExec) HasCommand(name string) bool { return name == "nft" || name == "docker" }
+func (f *fakeOpsExec) HasCommand(name string) bool {
+	return name == "nft" || name == "docker" || name == "bash" || name == "xray"
+}
 func (f *fakeOpsExec) RunCommand(ctx context.Context, env []string, name string, args ...string) (string, error) {
-	f.cmds = append(f.cmds, name+" "+strings.Join(args, " "))
+	full := name + " " + strings.Join(args, " ")
+	f.cmds = append(f.cmds, full)
+	if name == "docker" && len(args) >= 4 && args[0] == "inspect" && args[3] == "pihole" {
+		if f.piholeRunning {
+			return "true\n", nil
+		}
+		return "", errors.New("no such container")
+	}
+	if f.failValidation == "nft" && name == "nft" && strings.Contains(full, "-c") {
+		return "bad nft", errors.New("exit 1")
+	}
 	return "ok", nil
 }
-func (f *fakeOpsExec) DetectInitSystem() string  { return "systemd" }
-func (f *fakeOpsExec) DetectIsContainer() bool   { return false }
-func (f *fakeOpsExec) DetectMemMB() int          { return 512 }
+func (f *fakeOpsExec) DetectInitSystem() string     { return "systemd" }
+func (f *fakeOpsExec) DetectIsContainer() bool      { return false }
+func (f *fakeOpsExec) DetectMemMB() int             { return 512 }
 func (f *fakeOpsExec) DetectPhysicalNICs() []string { return []string{"eth0"} }
 func (f *fakeOpsExec) ResolveHostIPs(ctx context.Context, host string) ([]netip.Addr, error) {
+	if f.failResolve {
+		return nil, errors.New("dns resolution failed")
+	}
 	return []netip.Addr{netip.MustParseAddr("203.0.113.10")}, nil
 }
 func (f *fakeOpsExec) DaemonReload(ctx context.Context, initSys string) error { return nil }
 func (f *fakeOpsExec) ServiceEnableStart(ctx context.Context, initSys, name string) error {
+	f.startedSvcs = append(f.startedSvcs, name)
 	return nil
 }
 func (f *fakeOpsExec) ServiceRestart(ctx context.Context, initSys, name string) error {
 	f.restarted = append(f.restarted, name)
+	return nil
+}
+func (f *fakeOpsExec) ServiceReload(ctx context.Context, initSys, name string) error {
+	f.reloaded = append(f.reloaded, name)
 	return nil
 }
 func (f *fakeOpsExec) ServiceStopDisable(ctx context.Context, initSys, name string) error {
@@ -51,6 +79,9 @@ func (f *fakeOpsExec) ServiceStopDisable(ctx context.Context, initSys, name stri
 	return nil
 }
 func (f *fakeOpsExec) ServiceIsActive(ctx context.Context, initSys, name string) bool {
+	if f.activeSvcs != nil {
+		return f.activeSvcs[name]
+	}
 	return name == "dex-xray" || name == "dex-mosdns" || name == "dex-daemon"
 }
 
@@ -205,5 +236,337 @@ func TestUpdateComponentsAtomicAndCleanupV2(t *testing.T) {
 	cleanupLegacyV2(context.Background(), exec, &out)
 	if len(exec.stoppedSvcs) < 5 {
 		t.Fatalf("expected legacy v2 services stopped: %v", exec.stoppedSvcs)
+	}
+	for _, svc := range exec.stoppedSvcs {
+		if svc == "nftables" {
+			t.Fatalf("cleanupLegacyV2 must never stop system nftables service")
+		}
+	}
+	for _, cmd := range exec.cmds {
+		if strings.Contains(cmd, "docker rm") {
+			t.Fatalf("cleanupLegacyV2 must never run docker rm: %s", cmd)
+		}
+	}
+}
+
+func TestUpdateRulesRestoresBackupOnReconcileFailure(t *testing.T) {
+	v1Geoip := []byte("geoip-v1")
+	v1Geosite := []byte("geosite-v1")
+	v2Geoip := []byte("geoip-v2")
+	v2Geosite := []byte("geosite-v2")
+	v1Chn := "1.0.1.0/24\n1.0.2.0/23\n"
+	v2Chn := "2.0.1.0/24\n2.0.2.0/23\n"
+	v1Dom := "qq.com\nbaidu.com\n"
+	v2Dom := "jd.com\n163.com\n"
+
+	useV2 := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/geoip.dat":
+			if useV2 {
+				_, _ = w.Write(v2Geoip)
+			} else {
+				_, _ = w.Write(v1Geoip)
+			}
+		case "/geoip.dat.sha256sum":
+			data := v1Geoip
+			if useV2 {
+				data = v2Geoip
+			}
+			sum := sha256.Sum256(data)
+			fmt.Fprintf(w, "%s  geoip.dat\n", hex.EncodeToString(sum[:]))
+		case "/geosite.dat":
+			if useV2 {
+				_, _ = w.Write(v2Geosite)
+			} else {
+				_, _ = w.Write(v1Geosite)
+			}
+		case "/geosite.dat.sha256sum":
+			data := v1Geosite
+			if useV2 {
+				data = v2Geosite
+			}
+			sum := sha256.Sum256(data)
+			fmt.Fprintf(w, "%s  geosite.dat\n", hex.EncodeToString(sum[:]))
+		case "/cn.txt":
+			if useV2 {
+				_, _ = w.Write([]byte(v2Chn))
+			} else {
+				_, _ = w.Write([]byte(v1Chn))
+			}
+		case "/direct.txt":
+			if useV2 {
+				_, _ = w.Write([]byte(v2Dom))
+			} else {
+				_, _ = w.Write([]byte(v1Dom))
+			}
+		case "/reject.txt":
+			_, _ = w.Write([]byte("ads.example.com\ntracker.example.com\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	store := state.NewStore(filepath.Join(dir, "dex"))
+	st := state.NewDefaultState(state.RoleRelay)
+	st.Relay.Forwards = []state.ForwardRule{{
+		ID:         "f1",
+		ListenPort: 10001,
+		TargetHost: "unresolvable.invalid",
+		TargetPort: 443,
+		Proto:      "tcp",
+		Engine:     "nft",
+	}}
+	if err := store.Save(st); err != nil {
+		t.Fatalf("Save state: %v", err)
+	}
+
+	cfg := OpsConfig{
+		Client:          srv.Client(),
+		GeoIPURL:        srv.URL + "/geoip.dat",
+		GeoSiteURL:      srv.URL + "/geosite.dat",
+		ChnRouteURL:     srv.URL + "/cn.txt",
+		DomainsChnURL:   srv.URL + "/direct.txt",
+		DomainsAdsURL:   srv.URL + "/reject.txt",
+		MinChnRouteCIDR: 2,
+		MinChnDomains:   2,
+		MinAdsDomains:   2,
+	}
+
+	var out bytes.Buffer
+	if err := UpdateRules(context.Background(), store, &fakeOpsExec{}, cfg, false, true, &out); err != nil {
+		t.Fatalf("initial UpdateRules failed: %v", err)
+	}
+
+	// Second update with Reconcile failing must restore v1 rule files and remove newly added ads file.
+	useV2 = true
+	execFail := &fakeOpsExec{failResolve: true}
+	if err := UpdateRules(context.Background(), store, execFail, cfg, true, false, &out); err == nil {
+		t.Fatalf("expected UpdateRules to fail when Reconcile fails")
+	}
+
+	rulesDir := filepath.Join(store.Dir, "rules")
+	if got, _ := os.ReadFile(filepath.Join(rulesDir, "geoip.dat")); !bytes.Equal(got, v1Geoip) {
+		t.Fatalf("geoip.dat not restored, got %q", string(got))
+	}
+	if got, _ := os.ReadFile(filepath.Join(rulesDir, "IPchnroute")); string(got) != v1Chn {
+		t.Fatalf("IPchnroute not restored, got %q", string(got))
+	}
+	if got, _ := os.ReadFile(filepath.Join(rulesDir, "Domains.chn.txt")); string(got) != v1Dom {
+		t.Fatalf("Domains.chn.txt not restored, got %q", string(got))
+	}
+	if _, err := os.Stat(filepath.Join(rulesDir, "Domains.ads.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected newly added Domains.ads.txt removed on rollback, err=%v", err)
+	}
+}
+
+func TestMigrateCleanupV2OrderSafetyAndRestore(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "root")
+	stateDir := filepath.Join(root, "etc", "dex")
+	store := state.NewStore(stateDir)
+
+	zeroConf := filepath.Join(dir, "0conf")
+	_ = os.WriteFile(zeroConf, []byte(`{
+  "address": {"webUIport": "8443"},
+  "v2node": [{"domain": "hk.example.com:443", "name": "HK", "uuid": "11111111-1111-4111-8111-111111111111"}],
+  "update": {"v2node": {"domain": "hk.example.com", "port": 443, "uuid": "11111111-1111-4111-8111-111111111111"}}
+}`), 0o600)
+
+	v2NFTDir := filepath.Join(dir, "v2nft")
+	_ = os.MkdirAll(v2NFTDir, 0o755)
+	_ = os.WriteFile(filepath.Join(v2NFTDir, "flowtable_eth.sh"), []byte("#!/bin/bash\n"), 0o755)
+	_ = os.WriteFile(filepath.Join(v2NFTDir, "nftables"), []byte("table ip de_GWD {}\n"), 0o644)
+
+	// 1. --cleanup-v2 without --apply is rejected without touching v2 services.
+	execNoApply := &fakeOpsExec{
+		piholeRunning: true,
+		activeSvcs:    map[string]bool{"vtrui": true, "mosdns": true},
+	}
+	var out, errBuf bytes.Buffer
+	code := runMigrateWithExec(store, execNoApply, v2NFTDir, reconcile.ApplyOptions{RootPrefix: root}, []string{
+		"--kind", "v2_client", "--from", zeroConf, "--cleanup-v2",
+	}, &out, &errBuf)
+	if code == 0 || !strings.Contains(errBuf.String(), "--apply") {
+		t.Fatalf("expected --cleanup-v2 without --apply to fail, code=%d err=%q", code, errBuf.String())
+	}
+	if len(execNoApply.stoppedSvcs) != 0 || len(execNoApply.cmds) != 0 {
+		t.Fatalf("expected no v2 cleanup commands when --apply omitted, stopped=%v cmds=%v", execNoApply.stoppedSvcs, execNoApply.cmds)
+	}
+
+	// 2. --cleanup-v2 --apply when Reconcile fails after cleanup restores active v2 services, pihole, and v2 nft rules.
+	execFail := &fakeOpsExec{
+		piholeRunning:  true,
+		failValidation: "nft",
+		activeSvcs: map[string]bool{
+			"vtrui":  true,
+			"mosdns": true,
+		},
+	}
+	baseOpts := reconcile.ApplyOptions{
+		RootPrefix: root,
+		RenderOpts: render.RenderOptions{
+			StateDir:     "/etc/dex",
+			GeneratedDir: "/etc/dex/generated",
+			CertFile:     filepath.Join(stateDir, "ssl", "dex.cer"),
+			KeyFile:      filepath.Join(stateDir, "ssl", "dex.key"),
+		},
+	}
+	out.Reset()
+	errBuf.Reset()
+	code = runMigrateWithExec(store, execFail, v2NFTDir, baseOpts, []string{
+		"--kind", "v2_client", "--from", zeroConf, "--cleanup-v2", "--apply",
+	}, &out, &errBuf)
+	if code == 0 {
+		t.Fatalf("expected migrate --cleanup-v2 --apply to fail on nft preflight failure")
+	}
+
+	for _, svc := range execFail.stoppedSvcs {
+		if svc == "nftables" {
+			t.Fatalf("must never stop system nftables service, stopped=%v", execFail.stoppedSvcs)
+		}
+	}
+
+	findCmdIdx := func(substr string) int {
+		for i, c := range execFail.cmds {
+			if strings.Contains(c, substr) {
+				return i
+			}
+		}
+		return -1
+	}
+	for _, c := range execFail.cmds {
+		if strings.Contains(c, "docker rm") {
+			t.Fatalf("must never run docker rm, cmds=%v", execFail.cmds)
+		}
+	}
+
+	stopPiholeIdx := findCmdIdx("docker stop pihole")
+	delDeGWDIdx := findCmdIdx("nft delete table ip de_GWD")
+	delBypassIdx := findCmdIdx("nft delete table inet bypassflow")
+	delFilterIdx := findCmdIdx("nft delete table inet filter")
+	delRouterIdx := findCmdIdx("nft delete table inet router")
+	nftCheckIdx := findCmdIdx("nft -c -f")
+	startPiholeIdx := findCmdIdx("docker start pihole")
+	reloadFlowIdx := findCmdIdx("flowtable_eth.sh")
+	reloadNFTIdx := findCmdIdx("nft -f " + filepath.Join(v2NFTDir, "nftables"))
+
+	if stopPiholeIdx < 0 || delDeGWDIdx < 0 || delBypassIdx < 0 || delFilterIdx < 0 || delRouterIdx < 0 {
+		t.Fatalf("missing expected v2 cleanup commands, cmds=%v", execFail.cmds)
+	}
+	if nftCheckIdx < 0 || delDeGWDIdx > nftCheckIdx || stopPiholeIdx > nftCheckIdx {
+		t.Fatalf("expected v2 cleanup before formal Reconcile preflight, cmds=%v", execFail.cmds)
+	}
+	if startPiholeIdx < nftCheckIdx || reloadFlowIdx < nftCheckIdx || reloadNFTIdx < nftCheckIdx {
+		t.Fatalf("expected v2 restore (docker start pihole + v2 nft reload) after Reconcile failure, cmds=%v", execFail.cmds)
+	}
+	if !strings.Contains(strings.Join(execFail.startedSvcs, ","), "vtrui") || !strings.Contains(strings.Join(execFail.startedSvcs, ","), "mosdns") {
+		t.Fatalf("expected previously active v2 services restored, startedSvcs=%v", execFail.startedSvcs)
+	}
+}
+
+func TestUpdateRulesRestartsAffectedServices(t *testing.T) {
+	geoip := []byte("geoip-v1")
+	geosite := []byte("geosite-v1")
+	chnCIDRs := "1.0.1.0/24\n1.0.2.0/23\n"
+	chnDomains := "qq.com\nbaidu.com\n"
+	adsDomains := "ads.example.com\ntracker.example.com\n"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/geoip.dat":
+			_, _ = w.Write(geoip)
+		case "/geoip.dat.sha256sum":
+			sum := sha256.Sum256(geoip)
+			fmt.Fprintf(w, "%s  geoip.dat\n", hex.EncodeToString(sum[:]))
+		case "/geosite.dat":
+			_, _ = w.Write(geosite)
+		case "/geosite.dat.sha256sum":
+			sum := sha256.Sum256(geosite)
+			fmt.Fprintf(w, "%s  geosite.dat\n", hex.EncodeToString(sum[:]))
+		case "/cn.txt":
+			_, _ = w.Write([]byte(chnCIDRs))
+		case "/direct.txt":
+			_, _ = w.Write([]byte(chnDomains))
+		case "/reject.txt":
+			_, _ = w.Write([]byte(adsDomains))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	store := state.NewStore(filepath.Join(dir, "dex"))
+	st := state.NewDefaultState(state.RoleRelay)
+	st.System.AutoTuneSysctl = false
+	if err := store.Save(st); err != nil {
+		t.Fatalf("Save state: %v", err)
+	}
+
+	cfg := OpsConfig{
+		Client:          srv.Client(),
+		GeoIPURL:        srv.URL + "/geoip.dat",
+		GeoSiteURL:      srv.URL + "/geosite.dat",
+		ChnRouteURL:     srv.URL + "/cn.txt",
+		DomainsChnURL:   srv.URL + "/direct.txt",
+		DomainsAdsURL:   srv.URL + "/reject.txt",
+		MinChnRouteCIDR: 2,
+		MinChnDomains:   2,
+		MinAdsDomains:   2,
+	}
+
+	exec := &fakeOpsExec{
+		activeSvcs: map[string]bool{"dex-xray": true, "dex-mosdns": true},
+	}
+	var out bytes.Buffer
+
+	// 1. Initial download creates all rule files -> restarts both dex-xray and dex-mosdns.
+	if err := UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
+		t.Fatalf("initial UpdateRules failed: %v", err)
+	}
+	if strings.Join(exec.restarted, ",") != "dex-xray,dex-mosdns" {
+		t.Fatalf("expected both dex-xray and dex-mosdns restarted initially, got %v", exec.restarted)
+	}
+
+	// 2. Unchanged second run -> restarts neither.
+	exec.restarted = nil
+	if err := UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
+		t.Fatalf("unchanged UpdateRules failed: %v", err)
+	}
+	if len(exec.restarted) != 0 {
+		t.Fatalf("expected zero restarts when rules unchanged, got %v", exec.restarted)
+	}
+
+	// 3. Only Domains.chn.txt changed -> restarts only dex-mosdns.
+	exec.restarted = nil
+	chnDomains = "qq.com\nbaidu.com\ntaobao.com\n"
+	if err := UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
+		t.Fatalf("Domains.chn.txt UpdateRules failed: %v", err)
+	}
+	if strings.Join(exec.restarted, ",") != "dex-mosdns" {
+		t.Fatalf("expected only [dex-mosdns] restarted on Domains.chn.txt change, got %v", exec.restarted)
+	}
+
+	// 4. Only geoip.dat changed -> restarts only dex-xray.
+	exec.restarted = nil
+	geoip = []byte("geoip-v2")
+	if err := UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
+		t.Fatalf("geoip.dat UpdateRules failed: %v", err)
+	}
+	if strings.Join(exec.restarted, ",") != "dex-xray" {
+		t.Fatalf("expected only [dex-xray] restarted on geoip.dat change, got %v", exec.restarted)
+	}
+
+	// 5. Only IPchnroute changed -> restarts only dex-mosdns.
+	exec.restarted = nil
+	chnCIDRs = "1.0.1.0/24\n223.5.5.0/24\n"
+	if err := UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
+		t.Fatalf("IPchnroute UpdateRules failed: %v", err)
+	}
+	if strings.Join(exec.restarted, ",") != "dex-mosdns" {
+		t.Fatalf("expected only [dex-mosdns] restarted on IPchnroute change, got %v", exec.restarted)
 	}
 }

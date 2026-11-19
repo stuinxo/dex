@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"flag"
 	"fmt"
@@ -155,14 +156,25 @@ func UpdateRules(ctx context.Context, store *state.Store, exec reconcile.SystemE
 		includeAds = true
 	}
 
+	backups, bakDir, err := backupRulesFiles(rulesDir)
+	if err != nil {
+		return fmt.Errorf("backup existing rules: %w", err)
+	}
+	defer os.RemoveAll(bakDir)
+
+	failWithRestore := func(err error) error {
+		restoreRulesFiles(backups)
+		return err
+	}
+
 	if stdout != nil {
 		fmt.Fprintf(stdout, "[*] Updating geoip.dat & geosite.dat (SHA256 verified)...\n")
 	}
 	if err := DownloadVerifiedFile(ctx, cfg.Client, cfg.GeoIPURL, cfg.GeoIPURL+".sha256sum", filepath.Join(rulesDir, "geoip.dat"), false); err != nil {
-		return fmt.Errorf("update geoip.dat: %w", err)
+		return failWithRestore(fmt.Errorf("update geoip.dat: %w", err))
 	}
 	if err := DownloadVerifiedFile(ctx, cfg.Client, cfg.GeoSiteURL, cfg.GeoSiteURL+".sha256sum", filepath.Join(rulesDir, "geosite.dat"), false); err != nil {
-		return fmt.Errorf("update geosite.dat: %w", err)
+		return failWithRestore(fmt.Errorf("update geosite.dat: %w", err))
 	}
 
 	if stdout != nil {
@@ -171,12 +183,12 @@ func UpdateRules(ctx context.Context, store *state.Store, exec reconcile.SystemE
 	if err := downloadAndValidateTextRule(ctx, cfg.Client, cfg.ChnRouteURL, filepath.Join(rulesDir, "IPchnroute"), func(path string) error {
 		return validateChnRouteFile(path, cfg.MinChnRouteCIDR)
 	}); err != nil {
-		return fmt.Errorf("update IPchnroute: %w", err)
+		return failWithRestore(fmt.Errorf("update IPchnroute: %w", err))
 	}
 	if err := downloadAndValidateTextRule(ctx, cfg.Client, cfg.DomainsChnURL, filepath.Join(rulesDir, "Domains.chn.txt"), func(path string) error {
 		return validateDomainListFile(path, cfg.MinChnDomains)
 	}); err != nil {
-		return fmt.Errorf("update Domains.chn.txt: %w", err)
+		return failWithRestore(fmt.Errorf("update Domains.chn.txt: %w", err))
 	}
 
 	if includeAds {
@@ -186,7 +198,7 @@ func UpdateRules(ctx context.Context, store *state.Store, exec reconcile.SystemE
 		if err := downloadAndValidateTextRule(ctx, cfg.Client, cfg.DomainsAdsURL, filepath.Join(rulesDir, "Domains.ads.txt"), func(path string) error {
 			return validateDomainListFile(path, cfg.MinAdsDomains)
 		}); err != nil {
-			return fmt.Errorf("update Domains.ads.txt: %w", err)
+			return failWithRestore(fmt.Errorf("update Domains.ads.txt: %w", err))
 		}
 	}
 
@@ -195,13 +207,153 @@ func UpdateRules(ctx context.Context, store *state.Store, exec reconcile.SystemE
 	}
 	if !noApply && stErr == nil && st != nil {
 		if _, err := reconcile.Reconcile(ctx, store, exec, reconcile.ApplyOptions{}); err != nil {
-			return fmt.Errorf("reconcile after rules update: %w", err)
+			return failWithRestore(fmt.Errorf("reconcile after rules update: %w", err))
+		}
+		// Restart services that read rule files directly outside RenderBundle:
+		// xray reads geoip.dat / geosite.dat via XRAY_LOCATION_ASSET;
+		// mosdns reads IPchnroute / Domains.chn.txt / Domains.ads.txt.
+		if anyRuleFileChanged(backups, "geoip.dat", "geosite.dat") {
+			restartIfActive(ctx, exec, "dex-xray")
+		}
+		if anyRuleFileChanged(backups, "IPchnroute", "Domains.chn.txt", "Domains.ads.txt") {
+			restartIfActive(ctx, exec, "dex-mosdns")
 		}
 		if stdout != nil {
 			fmt.Fprintln(stdout, "[+] Applied updated rules.")
 		}
 	}
 	return nil
+}
+
+type ruleFileBackup struct {
+	name     string
+	livePath string
+	bakPath  string
+	existed  bool
+	mode     os.FileMode
+}
+
+func fileSHA256(path string) ([sha256.Size]byte, error) {
+	var sum [sha256.Size]byte
+	f, err := os.Open(path)
+	if err != nil {
+		return sum, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return sum, err
+	}
+	copy(sum[:], h.Sum(nil))
+	return sum, nil
+}
+
+func anyRuleFileChanged(backups []ruleFileBackup, names ...string) bool {
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
+	for _, b := range backups {
+		if !want[b.name] {
+			continue
+		}
+		if !b.existed {
+			if _, err := os.Stat(b.livePath); err == nil {
+				return true
+			}
+			continue
+		}
+		oldSum, err1 := fileSHA256(b.bakPath)
+		newSum, err2 := fileSHA256(b.livePath)
+		if err1 != nil || err2 != nil || oldSum != newSum {
+			return true
+		}
+	}
+	return false
+}
+
+func copyFileWithMode(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".rulebak.tmp.*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := io.Copy(tmp, in); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, dst); err != nil {
+		return err
+	}
+	ok = true
+	return nil
+}
+
+func backupRulesFiles(rulesDir string) ([]ruleFileBackup, string, error) {
+	bakDir, err := os.MkdirTemp(rulesDir, ".rules-bak-*")
+	if err != nil {
+		return nil, "", err
+	}
+	names := []string{"geoip.dat", "geosite.dat", "IPchnroute", "Domains.chn.txt", "Domains.ads.txt"}
+	backups := make([]ruleFileBackup, 0, len(names))
+	for _, name := range names {
+		live := filepath.Join(rulesDir, name)
+		info, statErr := os.Stat(live)
+		if os.IsNotExist(statErr) {
+			backups = append(backups, ruleFileBackup{name: name, livePath: live, existed: false})
+			continue
+		}
+		if statErr != nil {
+			_ = os.RemoveAll(bakDir)
+			return nil, "", statErr
+		}
+		if info.IsDir() {
+			continue
+		}
+		bakPath := filepath.Join(bakDir, name)
+		mode := info.Mode().Perm()
+		if err := copyFileWithMode(live, bakPath, mode); err != nil {
+			_ = os.RemoveAll(bakDir)
+			return nil, "", err
+		}
+		backups = append(backups, ruleFileBackup{
+			name:     name,
+			livePath: live,
+			bakPath:  bakPath,
+			existed:  true,
+			mode:     mode,
+		})
+	}
+	return backups, bakDir, nil
+}
+
+func restoreRulesFiles(backups []ruleFileBackup) {
+	for _, b := range backups {
+		if b.existed {
+			_ = copyFileWithMode(b.bakPath, b.livePath, b.mode)
+		} else {
+			_ = os.Remove(b.livePath)
+		}
+	}
 }
 
 func downloadAndValidateTextRule(ctx context.Context, client *http.Client, rawURL, dstPath string, validate func(string) error) error {
@@ -606,20 +758,103 @@ func restartIfActive(ctx context.Context, exec reconcile.SystemExecutor, units .
 	}
 }
 
-func cleanupLegacyV2(ctx context.Context, exec reconcile.SystemExecutor, stdout io.Writer) {
+// legacyV2Services lists systemd units managed by v2 (stuinxo-de_GWD-main).
+// Intentionally excludes system "nftables" service because its ExecStop runs "nft flush ruleset".
+var legacyV2Services = []string{
+	"vtrui",
+	"vtrui1",
+	"smartdns",
+	"coredns",
+	"mosdns",
+	"RproxyC",
+	"RproxyS",
+	"doh-server",
+	"unbound",
+	"php-fpm",
+	"updateGWD",
+}
+
+// legacyV2NFTTables lists the nftables tables created by v2 scripts.
+var legacyV2NFTTables = []struct {
+	family string
+	table  string
+}{
+	{family: "ip", table: "de_GWD"},
+	{family: "inet", table: "bypassflow"},
+	{family: "inet", table: "filter"},
+	{family: "inet", table: "router"},
+}
+
+type v2CleanupSnapshot struct {
+	initSys          string
+	activeServices   []string
+	piholeWasRunning bool
+	nftDir           string
+}
+
+func cleanupLegacyV2(ctx context.Context, exec reconcile.SystemExecutor, stdout io.Writer) *v2CleanupSnapshot {
+	return cleanupLegacyV2WithNFTDir(ctx, exec, "/opt/de_GWD/nftables", stdout)
+}
+
+func cleanupLegacyV2WithNFTDir(ctx context.Context, exec reconcile.SystemExecutor, v2NFTDir string, stdout io.Writer) *v2CleanupSnapshot {
 	initSys := exec.DetectInitSystem()
-	for _, svc := range []string{"vtrui", "smartdns", "coredns", "mosdns", "RproxyC", "RproxyS", "doh-server", "nftables"} {
+	snap := &v2CleanupSnapshot{
+		initSys: initSys,
+		nftDir:  v2NFTDir,
+	}
+	for _, svc := range legacyV2Services {
+		if exec.ServiceIsActive(ctx, initSys, svc) {
+			snap.activeServices = append(snap.activeServices, svc)
+		}
+	}
+	for _, svc := range legacyV2Services {
 		_ = exec.ServiceStopDisable(ctx, initSys, svc)
 	}
 	if exec.HasCommand("docker") {
-		_, _ = exec.RunCommand(ctx, nil, "docker", "rm", "-f", "pihole")
+		if out, err := exec.RunCommand(ctx, nil, "docker", "inspect", "-f", "{{.State.Running}}", "pihole"); err == nil && strings.TrimSpace(out) == "true" {
+			snap.piholeWasRunning = true
+			_, _ = exec.RunCommand(ctx, nil, "docker", "stop", "pihole")
+		}
 	}
 	if exec.HasCommand("nft") {
-		for _, family := range []string{"inet", "ip", "ip6"} {
-			_, _ = exec.RunCommand(ctx, nil, "nft", "delete", "table", family, "de_GWD")
+		for _, t := range legacyV2NFTTables {
+			_, _ = exec.RunCommand(ctx, nil, "nft", "delete", "table", t.family, t.table)
 		}
 	}
 	if stdout != nil {
-		fmt.Fprintln(stdout, "[+] Stopped and cleaned legacy v2 services / pihole container / de_GWD nft tables.")
+		fmt.Fprintln(stdout, "[+] Stopped legacy v2 services, pihole container (if running), and v2 nft tables.")
+	}
+	return snap
+}
+
+func (s *v2CleanupSnapshot) restore(ctx context.Context, exec reconcile.SystemExecutor, stdout io.Writer) {
+	if s == nil {
+		return
+	}
+	for _, svc := range s.activeServices {
+		_ = exec.ServiceEnableStart(ctx, s.initSys, svc)
+	}
+	if s.piholeWasRunning && exec.HasCommand("docker") {
+		_, _ = exec.RunCommand(ctx, nil, "docker", "start", "pihole")
+	}
+	if exec.HasCommand("nft") && s.nftDir != "" {
+		flowScript := filepath.Join(s.nftDir, "flowtable_eth.sh")
+		if _, err := os.Stat(flowScript); err == nil {
+			shell := "sh"
+			if exec.HasCommand("bash") {
+				shell = "bash"
+			}
+			_, _ = exec.RunCommand(ctx, nil, shell, flowScript)
+		}
+		clientNFT := filepath.Join(s.nftDir, "nftables")
+		serverNFT := filepath.Join(s.nftDir, "default.nft")
+		if _, err := os.Stat(clientNFT); err == nil {
+			_, _ = exec.RunCommand(ctx, nil, "nft", "-f", clientNFT)
+		} else if _, err := os.Stat(serverNFT); err == nil {
+			_, _ = exec.RunCommand(ctx, nil, "nft", "-f", serverNFT)
+		}
+	}
+	if stdout != nil {
+		fmt.Fprintln(stdout, "[!] Restored previously active legacy v2 services / pihole / nft rules after apply failure.")
 	}
 }

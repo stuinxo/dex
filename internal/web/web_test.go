@@ -24,6 +24,7 @@ func (stubExec) HasCommand(string) bool                                         
 func (stubExec) DaemonReload(context.Context, string) error                            { return nil }
 func (stubExec) ServiceEnableStart(context.Context, string, string) error              { return nil }
 func (stubExec) ServiceRestart(context.Context, string, string) error                  { return nil }
+func (stubExec) ServiceReload(context.Context, string, string) error                   { return nil }
 func (stubExec) ServiceStopDisable(context.Context, string, string) error              { return nil }
 func (stubExec) ServiceIsActive(context.Context, string, string) bool                  { return true }
 func (stubExec) DetectInitSystem() string                                              { return "systemd" }

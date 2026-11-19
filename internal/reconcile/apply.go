@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 type ApplyOptions struct {
 	Force       bool
 	DryRun      bool
+	RestartAll  bool                 // force restarting all active managed services regardless of file diffs
 	PreserveTxn bool                 // caller already opened BeginTxn before mutating state
 	RootPrefix  string               // optional directory prefix (primarily for isolated tests)
 	RenderOpts  render.RenderOptions // overrides for rendered paths/runtime
@@ -63,12 +65,100 @@ func UpdateAndReconcile(
 
 // ApplyResult summarizes the outcome of Reconcile.
 type ApplyResult struct {
-	Bundle       *render.RenderBundle
-	FilesWritten []string
-	FilesRemoved []string
-	ServicesOn   []string
-	ServicesOff  []string
-	Warnings     []string
+	Bundle            *render.RenderBundle
+	FilesWritten      []string
+	FilesRemoved      []string
+	ServicesOn        []string
+	ServicesRestarted []string
+	ServicesOff       []string
+	Warnings          []string
+}
+
+type changedFile struct {
+	relName    string
+	targetPath string
+}
+
+// servicesForFile maps a rendered or removed managed file to the service(s) affected by it.
+// Returns (nil, true) for files that intentionally do not trigger a service restart (e.g. sysctl,
+// exported WireGuard client peer profiles). Returns (nil, false) for unmapped files so callers can
+// conservatively restart active managed services.
+// Note: if a prior apply crashed after promoting files onto disk but before restarting services,
+// the next apply will see matching file contents and skip restarts unless --restart-all is passed.
+func servicesForFile(relName, targetPath, wgUnit string) ([]string, bool) {
+	switch {
+	case relName == "xray.json" || relName == "systemd/dex-xray.service" || relName == "openrc/dex-xray":
+		return []string{"dex-xray"}, true
+	case relName == "nftables.conf" || relName == "systemd/dex-nft.service" || relName == "openrc/dex-nft":
+		return []string{"dex-nft"}, true
+	case strings.HasPrefix(relName, "mosdns/") || relName == "systemd/dex-mosdns.service":
+		return []string{"dex-mosdns"}, true
+	case relName == "haproxy.cfg":
+		return []string{"haproxy"}, true
+	case relName == "nginx-dex.conf":
+		return []string{"nginx"}, true
+	case relName == "wg0.conf":
+		return []string{wgUnit}, true
+	case strings.HasPrefix(relName, "wg-peers/"):
+		// Client peer profiles are only exported artifacts; wg0.conf drives wg-quick@wg0.
+		return nil, true
+	case relName == "systemd/dex-doh.service" || relName == "openrc/dex-doh":
+		return []string{"dex-doh"}, true
+	case relName == "systemd/dex-daemon.service" || relName == "openrc/dex-daemon":
+		return []string{"dex-daemon"}, true
+	case relName == "systemd/dex-refresh.timer" || relName == "systemd/dex-refresh.service":
+		return []string{"dex-refresh.timer"}, true
+	case relName == "systemd/dex-rules-update.timer" || relName == "systemd/dex-rules-update.service":
+		return []string{"dex-rules-update.timer"}, true
+	case relName == "sysctl-99-dex.conf":
+		return nil, true
+	}
+
+	// Fallback by TargetPath (used primarily for obsolete files removed from prevManifest).
+	base := filepath.Base(targetPath)
+	slash := filepath.ToSlash(targetPath)
+	switch {
+	case base == "xray.json" || base == "dex-xray.service" || targetPath == "/etc/init.d/dex-xray":
+		return []string{"dex-xray"}, true
+	case base == "nftables.conf" || base == "dex-nft.service" || targetPath == "/etc/init.d/dex-nft":
+		return []string{"dex-nft"}, true
+	case strings.Contains(slash, "/mosdns/") || base == "dex-mosdns.service":
+		return []string{"dex-mosdns"}, true
+	case targetPath == "/etc/haproxy/haproxy.cfg":
+		return []string{"haproxy"}, true
+	case targetPath == "/etc/nginx/conf.d/dex-server.conf":
+		return []string{"nginx"}, true
+	case targetPath == "/etc/wireguard/wg0.conf":
+		return []string{wgUnit}, true
+	case strings.Contains(slash, "/wg-peers/"):
+		return nil, true
+	case base == "dex-doh.service" || targetPath == "/etc/init.d/dex-doh":
+		return []string{"dex-doh"}, true
+	case base == "dex-daemon.service" || targetPath == "/etc/init.d/dex-daemon":
+		return []string{"dex-daemon"}, true
+	case base == "dex-refresh.timer" || base == "dex-refresh.service":
+		return []string{"dex-refresh.timer"}, true
+	case base == "dex-rules-update.timer" || base == "dex-rules-update.service":
+		return []string{"dex-rules-update.timer"}, true
+	case targetPath == "/etc/sysctl.d/99-dex.conf":
+		return nil, true
+	default:
+		// Unknown file ownership: conservatively restart active managed services.
+		return nil, false
+	}
+}
+
+func hasNFTTable(bundle *render.RenderBundle, tableName string) bool {
+	if bundle == nil {
+		return false
+	}
+	needle := []byte("table inet " + tableName + " {")
+	for _, f := range bundle.Files {
+		if f.RelName == "nftables.conf" {
+			return bytes.Contains(f.Content, needle)
+		}
+	}
+	return false
 }
 
 type fileBackup struct {
@@ -291,6 +381,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 	ropts, warnings := populateRenderOptions(ctx, st, store, exec, opts)
 
 	// Ensure a self-signed fallback cert exists whenever TLS is referenced before ACME/import.
+	certCreated := false
 	if !opts.DryRun {
 		certTarget := ropts.CertFile
 		keyTarget := ropts.KeyFile
@@ -303,7 +394,9 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 			if cn == "" {
 				cn = st.Auth.ServerName
 			}
-			_ = cert.EnsureSelfSigned(certTarget, keyTarget, cn)
+			if cerr := cert.EnsureSelfSigned(certTarget, keyTarget, cn); cerr == nil {
+				certCreated = true
+			}
 		}
 	}
 
@@ -450,6 +543,21 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		}
 	}
 
+	// Detect changed/added/removed files before promoting staged files onto disk.
+	var changedFiles []changedFile
+	for _, f := range bundle.Files {
+		diskPath := mapTargetPath(opts.RootPrefix, f.TargetPath)
+		diskBytes, rerr := os.ReadFile(diskPath)
+		if rerr != nil || !bytes.Equal(diskBytes, f.Content) {
+			changedFiles = append(changedFiles, changedFile{relName: f.RelName, targetPath: f.TargetPath})
+		}
+	}
+	for oldTarget := range prevManifest.Files {
+		if _, stillNeeded := newTargets[oldTarget]; !stillNeeded {
+			changedFiles = append(changedFiles, changedFile{targetPath: oldTarget})
+		}
+	}
+
 	// Atomically promote staged files into place
 	for _, f := range bundle.Files {
 		diskPath := mapTargetPath(opts.RootPrefix, f.TargetPath)
@@ -498,6 +606,22 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 
 	// Runtime sysctl & service orchestration
 	wasResolvedActive := false
+	type touchedService struct {
+		name      string
+		wasActive bool
+	}
+	var touchedSvcs []touchedService
+	nftWasActive := exec.ServiceIsActive(ctx, ropts.InitSystem, "dex-nft")
+	var prevNFTBytes []byte
+	for _, f := range bundle.Files {
+		if f.RelName == "nftables.conf" {
+			// Read previous nftables.conf backup (if any) before applyServices runs so rollback can
+			// distinguish newly introduced dex_* tables from pre-existing ones.
+			diskNFT := mapTargetPath(opts.RootPrefix, f.TargetPath)
+			prevNFTBytes, _ = os.ReadFile(diskNFT + ".prev")
+			break
+		}
+	}
 	applyServices := func() error {
 		if st.System.AutoTuneSysctl && !ropts.IsContainer {
 			sysctlDisk := mapTargetPath(opts.RootPrefix, "/etc/sysctl.d/99-dex.conf")
@@ -525,6 +649,24 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		if ropts.InitSystem == "openrc" {
 			wgUnit = "wg-quick.wg0"
 		}
+
+		changedServices := make(map[string]bool)
+		restartAllFallback := false
+		for _, cf := range changedFiles {
+			svcs, known := servicesForFile(cf.relName, cf.targetPath, wgUnit)
+			if !known {
+				restartAllFallback = true
+				continue
+			}
+			for _, svc := range svcs {
+				changedServices[svc] = true
+			}
+		}
+		if certCreated {
+			changedServices["dex-xray"] = true
+			changedServices["nginx"] = true
+		}
+
 		specs := []svcSpec{
 			{name: "dex-nft", active: bundle.NFTClientNeeded || bundle.NFTRelayNeeded, probe: bundle.NFTClientNeeded || bundle.NFTRelayNeeded},
 			{name: "dex-mosdns", active: bundle.MosDNSNeeded, probe: bundle.MosDNSNeeded},
@@ -563,32 +705,35 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		}
 
 		for _, sp := range specs {
-			if sp.active {
-				if err := exec.ServiceEnableStart(ctx, ropts.InitSystem, sp.name); err != nil {
-					return err
-				}
-				res.ServicesOn = append(res.ServicesOn, sp.name)
+			if !sp.active {
+				continue
 			}
+			wasActive := exec.ServiceIsActive(ctx, ropts.InitSystem, sp.name)
+			if opts.RestartAll || restartAllFallback || changedServices[sp.name] || !wasActive {
+				touchedSvcs = append(touchedSvcs, touchedService{name: sp.name, wasActive: wasActive})
+				if sp.name == "nginx" && wasActive && !opts.RestartAll {
+					if rerr := exec.ServiceReload(ctx, ropts.InitSystem, sp.name); rerr != nil {
+						if err := exec.ServiceEnableStart(ctx, ropts.InitSystem, sp.name); err != nil {
+							return err
+						}
+					}
+				} else {
+					if err := exec.ServiceEnableStart(ctx, ropts.InitSystem, sp.name); err != nil {
+						return err
+					}
+				}
+				res.ServicesRestarted = append(res.ServicesRestarted, sp.name)
+			}
+			res.ServicesOn = append(res.ServicesOn, sp.name)
 		}
 
-		// Clean up orphaned nftables tables when a unit or table is removed
+		// Clean up orphaned nftables tables when a unit or table is omitted from nftables.conf
 		// (removing unit files before daemon-reload drops ExecStop).
 		if exec.HasCommand("nft") {
-			var dropTables []string
-			if !bundle.NFTRelayNeeded {
-				dropTables = append(dropTables, "dex_relay")
-			}
-			if !bundle.WireGuardNeeded || !bundle.NFTClientNeeded {
-				dropTables = append(dropTables, "dex_nat")
-			}
-			if !bundle.NFTClientNeeded || !st.System.EnableFlowtable {
-				dropTables = append(dropTables, "dex_flow")
-			}
-			if !bundle.NFTClientNeeded {
-				dropTables = append(dropTables, "dex_client", "dex_filter")
-			}
-			for _, tbl := range dropTables {
-				_, _ = exec.RunCommand(ctx, nil, "nft", "delete", "table", "inet", tbl)
+			for _, tbl := range []string{"dex_relay", "dex_nat", "dex_flow", "dex_client", "dex_filter"} {
+				if !hasNFTTable(bundle, tbl) {
+					_, _ = exec.RunCommand(ctx, nil, "nft", "delete", "table", "inet", tbl)
+				}
 			}
 		}
 		if !bundle.NFTClientNeeded && isOS && exec.HasCommand("ip") {
@@ -605,6 +750,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		// Manage dex-daemon carefully: start if inactive, avoid self-restarting when already active (e.g. Web UI apply)
 		if bundle.DaemonNeeded {
 			if !exec.ServiceIsActive(ctx, ropts.InitSystem, "dex-daemon") {
+				touchedSvcs = append(touchedSvcs, touchedService{name: "dex-daemon", wasActive: false})
 				if err := exec.ServiceEnableStart(ctx, ropts.InitSystem, "dex-daemon"); err != nil {
 					return err
 				}
@@ -692,14 +838,39 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 	}
 
 	if err := applyServices(); err != nil {
+		// 1. Stop/disable newly started services in reverse order BEFORE rollbackFiles() removes unit files,
+		// so ExecStop hooks remain intact and newly bound ports (e.g. :53) are released.
+		for i := len(touchedSvcs) - 1; i >= 0; i-- {
+			ts := touchedSvcs[i]
+			if !ts.wasActive {
+				_ = exec.ServiceStopDisable(ctx, ropts.InitSystem, ts.name)
+			}
+		}
+		// Remove any dex_* nftables tables introduced by this failed apply.
+		if exec.HasCommand("nft") {
+			for _, tbl := range []string{"dex_relay", "dex_nat", "dex_flow", "dex_client", "dex_filter"} {
+				if !hasNFTTable(bundle, tbl) {
+					continue
+				}
+				existedBefore := nftWasActive && bytes.Contains(prevNFTBytes, []byte("table inet "+tbl+" {"))
+				if !existedBefore {
+					_, _ = exec.RunCommand(ctx, nil, "nft", "delete", "table", "inet", tbl)
+				}
+			}
+		}
+
+		// 2. Restore backed-up config/unit files and reload init daemon.
 		rollbackFiles()
 		_ = exec.DaemonReload(ctx, ropts.InitSystem)
 		if wasResolvedActive {
 			_ = exec.ServiceEnableStart(ctx, "systemd", "systemd-resolved")
 		}
-		// Best-effort restart previously running services
-		for _, spName := range res.ServicesOn {
-			_ = exec.ServiceRestart(ctx, ropts.InitSystem, spName)
+
+		// 3. Restart only services that were already active before this apply and were restarted.
+		for _, ts := range touchedSvcs {
+			if ts.wasActive {
+				_ = exec.ServiceRestart(ctx, ropts.InitSystem, ts.name)
+			}
 		}
 		_, _ = store.RollbackTxn()
 		return nil, fmt.Errorf("apply services failed (rolled back): %w", err)

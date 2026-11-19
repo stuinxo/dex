@@ -1,11 +1,14 @@
 package state
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestStoreConcurrentLockingAndBackupRecovery(t *testing.T) {
@@ -167,5 +170,44 @@ func TestValidationRules(t *testing.T) {
 	}
 	if err := srv.Validate(); err == nil || !strings.Contains(err.Error(), "duplicate domain") {
 		t.Fatalf("expected duplicate domain error, got %v", err)
+	}
+}
+
+func TestStoreWithApplyLockWaitWarning(t *testing.T) {
+	dir := t.TempDir()
+	st := NewStore(dir)
+
+	var warned atomic.Int32
+	st.OnApplyLockWait = func() {
+		warned.Add(1)
+	}
+
+	holding := make(chan struct{})
+	release := make(chan struct{})
+	done1 := make(chan error, 1)
+	go func() {
+		done1 <- st.WithApplyLock(context.Background(), func() error {
+			close(holding)
+			<-release
+			return nil
+		})
+	}()
+
+	<-holding
+	go func() {
+		time.Sleep(1150 * time.Millisecond)
+		close(release)
+	}()
+
+	if err := st.WithApplyLock(context.Background(), func() error {
+		return nil
+	}); err != nil {
+		t.Fatalf("second WithApplyLock failed: %v", err)
+	}
+	if err := <-done1; err != nil {
+		t.Fatalf("first WithApplyLock failed: %v", err)
+	}
+	if got := warned.Load(); got != 1 {
+		t.Fatalf("expected OnApplyLockWait called once after >1s wait, got %d", got)
 	}
 }

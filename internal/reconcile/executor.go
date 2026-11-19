@@ -21,6 +21,7 @@ type SystemExecutor interface {
 	DaemonReload(ctx context.Context, initSys string) error
 	ServiceEnableStart(ctx context.Context, initSys, name string) error
 	ServiceRestart(ctx context.Context, initSys, name string) error
+	ServiceReload(ctx context.Context, initSys, name string) error
 	ServiceStopDisable(ctx context.Context, initSys, name string) error
 	ServiceIsActive(ctx context.Context, initSys, name string) bool
 	DetectInitSystem() string
@@ -90,6 +91,22 @@ func (e OSExecutor) ServiceRestart(ctx context.Context, initSys, name string) er
 	out, err := e.RunCommand(ctx, nil, "systemctl", "restart", name)
 	if err != nil {
 		return fmt.Errorf("systemctl restart %s: %w (%s)", name, err, strings.TrimSpace(out))
+	}
+	return nil
+}
+
+func (e OSExecutor) ServiceReload(ctx context.Context, initSys, name string) error {
+	if initSys == "openrc" {
+		out, err := e.RunCommand(ctx, nil, "rc-service", name, "reload")
+		if err != nil {
+			return fmt.Errorf("openrc reload %s: %w (%s)", name, err, strings.TrimSpace(out))
+		}
+		return nil
+	}
+	_, _ = e.RunCommand(ctx, nil, "systemctl", "enable", name)
+	out, err := e.RunCommand(ctx, nil, "systemctl", "reload", name)
+	if err != nil {
+		return fmt.Errorf("systemctl reload %s: %w (%s)", name, err, strings.TrimSpace(out))
 	}
 	return nil
 }
