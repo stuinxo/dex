@@ -105,7 +105,7 @@ func TestRenderClientAllSubsystems(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderAll client: %v", err)
 	}
-	if !bundle.XrayNeeded || !bundle.NFTClientNeeded || !bundle.MosDNSNeeded || !bundle.WireGuardNeeded || !bundle.DaemonNeeded {
+	if !bundle.XrayNeeded || !bundle.NFTClientNeeded || !bundle.MosDNSNeeded || !bundle.WireGuardNeeded || !bundle.DaemonNeeded || !bundle.RulesTimerNeeded {
 		t.Fatalf("missing expected active subsystems: %+v", bundle)
 	}
 
@@ -132,6 +132,10 @@ func TestRenderClientAllSubsystems(t *testing.T) {
 	}
 	if freedomCount < 2 { // direct + mapping0
 		t.Fatalf("expected at least 2 freedom outbounds, got %d", freedomCount)
+	}
+	dnsHosts := xcfg["dns"].(map[string]any)["hosts"].(map[string]any)
+	if dnsHosts["tun.example.com"] != "203.0.113.20" {
+		t.Fatalf("expected Rproxy tunnel domain in xray dns.hosts, got %+v", dnsHosts)
 	}
 
 	// Verify nftables QUIC UDP/443 reject + dual-stack sets + WireGuard
@@ -201,6 +205,14 @@ func TestRenderRelayPureNFTZeroXray(t *testing.T) {
 			Proto:      "tcp",
 			Engine:     "haproxy",
 		},
+		{
+			ID:         "r3",
+			ListenPort: 10003,
+			TargetHost: "198.51.100.99",
+			TargetPort: 8443,
+			Proto:      "tcp",
+			Engine:     "haproxy",
+		},
 	}
 	opts := RenderOptions{
 		ResolvedHostIPs: map[string][]netip.Addr{
@@ -222,8 +234,12 @@ func TestRenderRelayPureNFTZeroXray(t *testing.T) {
 		t.Fatalf("expected IPv6 DNAT rule in nftables.conf, got:\n%s", string(nf.Content))
 	}
 	hf, _ := findFile(bundle, "haproxy.cfg")
-	if !strings.Contains(string(hf.Content), "server srv1 ha.example.com:443 check resolvers dex_dns init-addr none") {
-		t.Fatalf("unexpected haproxy.cfg:\n%s", string(hf.Content))
+	hfStr := string(hf.Content)
+	if !strings.Contains(hfStr, "server srv1 ha.example.com:443 check resolvers dex_dns init-addr libc,none") {
+		t.Fatalf("unexpected domain haproxy.cfg:\n%s", hfStr)
+	}
+	if !strings.Contains(hfStr, "server srv1 198.51.100.99:8443 check\n") {
+		t.Fatalf("expected literal IP haproxy rule without resolvers:\n%s", hfStr)
 	}
 }
 

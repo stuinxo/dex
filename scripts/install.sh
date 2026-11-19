@@ -296,6 +296,16 @@ main() {
       say "[+] Ready. Run 'dex init --role $role --domain <dom> --apply' or 'dex' for interactive menu."
       ;;
     relay)
+      say "[*] Installing relay packages (haproxy)..."
+      case "$OS_PKG" in
+        apk)
+          apk add --no-cache haproxy >/dev/null 2>&1 || true
+          ;;
+        apt)
+          wait_apt_lock
+          apt-get install -y -qq --no-install-recommends haproxy >/dev/null 2>&1 || true
+          ;;
+      esac
       say "[+] Ready. Run 'dex init --role relay --apply' or 'dex' for interactive menu."
       ;;
     "")

@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -91,6 +92,12 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return cmdRelay(store, exec, rest, stdout, stderr)
 	case "rproxy":
 		return cmdRproxy(store, exec, rest, stdout, stderr)
+	case "extra":
+		return cmdExtra(store, exec, rest, stdout, stderr)
+	case "rules":
+		return cmdRules(store, exec, rest, stdout, stderr)
+	case "update":
+		return cmdUpdate(store, exec, rest, stdout, stderr)
 	case "migrate":
 		return cmdMigrate(store, exec, rest, stdout, stderr)
 	case "daemon":
@@ -121,8 +128,11 @@ Commands:
   ddns <subcmd>         Manage Cloudflare DDNS (set|sync|disable)
   socks5 <subcmd>       Manage server Option 35 SOCKS5 exits (list|add|del|toggle|test)
   relay <subcmd>        Manage Option 44 port forwards (list|add|del)
-  rproxy <subcmd>       Manage RproxyS reverse proxy (show|set|disable)
-  migrate               Import v2 0conf, v2 server, des, or dexs state
+  rproxy <subcmd>       Manage RproxyS/RproxyC reverse proxy (show|set|map-add|map-del|disable|client-*)
+  extra <subcmd>        Manage Option 55 extra inbounds (list|add-reality|add-socks5|del)
+  rules <subcmd>        Inspect or hot-update GeoIP/Domain rule files (status|update)
+  update                Upgrade dex, xray, mosdns, and/or rule datasets cleanly
+  migrate               Import v2 0conf, v2 server, des, or dexs state (--cleanup-v2)
   daemon                Run embedded Web UI + failover + Cloudflare DDNS loops
   serve-doh             Run standalone RFC 8484 DoH forwarding server
   refresh               Re-resolve dynamic relay targets and re-apply nftables
@@ -242,6 +252,7 @@ func cmdApply(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 	fs := flag.NewFlagSet("apply", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	dryRun := fs.Bool("dry-run", false, "render and validate without modifying system")
+	outDir := fs.String("out-dir", "", "optional directory to write rendered files during --dry-run")
 	force := fs.Bool("force", false, "overwrite manually modified managed files")
 	rootPrefix := fs.String("root-prefix", "", "optional target root directory prefix")
 	if err := fs.Parse(args); err != nil {
@@ -261,6 +272,23 @@ func cmdApply(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 		fmt.Fprintf(stderr, "warning: %s\n", w)
 	}
 	if *dryRun {
+		if *outDir != "" {
+			for _, f := range res.Bundle.Files {
+				rel := f.RelName
+				if rel == "" {
+					rel = strings.TrimPrefix(filepath.Clean(f.TargetPath), string(filepath.Separator))
+				}
+				dst := filepath.Join(*outDir, filepath.Clean(rel))
+				if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+					fmt.Fprintf(stderr, "write rendered %s: %v\n", dst, err)
+					return 1
+				}
+				if err := os.WriteFile(dst, f.Content, f.Mode); err != nil {
+					fmt.Fprintf(stderr, "write rendered %s: %v\n", dst, err)
+					return 1
+				}
+			}
+		}
 		fmt.Fprintf(stdout, "Dry-run OK (%d files rendered):\n", len(res.Bundle.Files))
 		for _, f := range res.Bundle.Files {
 			fmt.Fprintf(stdout, "  - %s (%d bytes, mode %04o)\n", f.TargetPath, len(f.Content), f.Mode)
@@ -1027,6 +1055,33 @@ func cmdRelay(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 	}
 }
 
+func existingRoleOr(store *state.Store, fallback string) string {
+	if st, err := store.Load(); err == nil && st.Role != "" {
+		return st.Role
+	}
+	return fallback
+}
+
+func upsertRproxyServerMapping(list []state.RproxyServerMapping, item state.RproxyServerMapping) []state.RproxyServerMapping {
+	for i := range list {
+		if list[i].Port == item.Port {
+			list[i] = item
+			return list
+		}
+	}
+	return append(list, item)
+}
+
+func upsertRproxyClientMapping(list []state.RproxyClientMapping, item state.RproxyClientMapping) []state.RproxyClientMapping {
+	for i := range list {
+		if list[i].ExtPort == item.ExtPort {
+			list[i] = item
+			return list
+		}
+	}
+	return append(list, item)
+}
+
 func cmdRproxy(store *state.Store, exec reconcile.SystemExecutor, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "show" {
 		st, err := store.Load()
@@ -1036,8 +1091,17 @@ func cmdRproxy(store *state.Store, exec reconcile.SystemExecutor, args []string,
 		}
 		fmt.Fprintf(stdout, "RproxyS: enabled=%v domain=%s port=%d uuids=%v mappings=%d\n",
 			st.RproxyS.Enabled, st.RproxyS.Domain, st.RproxyS.ListenPort, st.RproxyS.UUIDs, len(st.RproxyS.Mappings))
+		for _, m := range st.RproxyS.Mappings {
+			fmt.Fprintf(stdout, "  S-Map :%d (%s)\n", m.Port, m.Proto)
+		}
+		fmt.Fprintf(stdout, "RproxyC: enabled=%v tunnel=%s:%d uuid=%s mappings=%d\n",
+			st.Client.RproxyC.Enabled, st.Client.RproxyC.TunnelAddress, st.Client.RproxyC.TunnelPort, st.Client.RproxyC.TunnelUUID, len(st.Client.RproxyC.Mappings))
+		for _, m := range st.Client.RproxyC.Mappings {
+			fmt.Fprintf(stdout, "  C-Map :%d (%s) -> %s:%d\n", m.ExtPort, m.Proto, m.IntIP, m.IntPort)
+		}
 		return 0
 	}
+	defRole := existingRoleOr(store, state.RoleRelay)
 	switch args[0] {
 	case "set":
 		fs := flag.NewFlagSet("rproxy set", flag.ContinueOnError)
@@ -1054,7 +1118,7 @@ func cmdRproxy(store *state.Store, exec reconcile.SystemExecutor, args []string,
 		if *uuid == "" {
 			*uuid, _ = cryptoext.GenerateUUID()
 		}
-		if err := applyOrSave(store, exec, state.RoleRelay, *doApply, func(cur *state.State) error {
+		if err := applyOrSave(store, exec, defRole, *doApply, func(cur *state.State) error {
 			cur.RproxyS.Enabled = true
 			if *dom != "" {
 				cur.RproxyS.Domain = *dom
@@ -1062,7 +1126,7 @@ func cmdRproxy(store *state.Store, exec reconcile.SystemExecutor, args []string,
 			cur.RproxyS.ListenPort = *port
 			cur.RproxyS.UUIDs = []string{*uuid}
 			if *mapPort > 0 {
-				cur.RproxyS.Mappings = append(cur.RproxyS.Mappings, state.RproxyServerMapping{
+				cur.RproxyS.Mappings = upsertRproxyServerMapping(cur.RproxyS.Mappings, state.RproxyServerMapping{
 					Port:  *mapPort,
 					Proto: *mapProto,
 				})
@@ -1074,9 +1138,63 @@ func cmdRproxy(store *state.Store, exec reconcile.SystemExecutor, args []string,
 		}
 		fmt.Fprintf(stdout, "RproxyS configured on :%d (UUID: %s)\n", *port, *uuid)
 		return 0
+	case "map-add":
+		fs := flag.NewFlagSet("rproxy map-add", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		port := fs.Int("port", 0, "mapped public port")
+		proto := fs.String("proto", "tcp", "tcp|udp|tcp,udp")
+		doApply := fs.Bool("apply", false, "apply immediately")
+		if err := fs.Parse(args[1:]); err != nil {
+			return 2
+		}
+		if *port <= 0 || *port > 65535 {
+			fmt.Fprintln(stderr, "--port must be 1..65535")
+			return 2
+		}
+		if err := applyOrSave(store, exec, defRole, *doApply, func(cur *state.State) error {
+			if !cur.RproxyS.Enabled {
+				return errors.New("enable RproxyS via 'dex rproxy set' first")
+			}
+			cur.RproxyS.Mappings = upsertRproxyServerMapping(cur.RproxyS.Mappings, state.RproxyServerMapping{
+				Port:  *port,
+				Proto: *proto,
+			})
+			return nil
+		}); err != nil {
+			fmt.Fprintf(stderr, "rproxy map-add failed: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Added RproxyS mapping :%d (%s)\n", *port, *proto)
+		return 0
+	case "map-del":
+		if len(args) < 2 {
+			fmt.Fprintln(stderr, "usage: dex rproxy map-del <port> [--apply]")
+			return 2
+		}
+		p, err := strconv.Atoi(args[1])
+		if err != nil || p <= 0 {
+			fmt.Fprintln(stderr, "invalid port")
+			return 2
+		}
+		doApply := len(args) > 2 && args[2] == "--apply"
+		if err := applyOrSave(store, exec, defRole, doApply, func(cur *state.State) error {
+			var next []state.RproxyServerMapping
+			for _, m := range cur.RproxyS.Mappings {
+				if m.Port != p {
+					next = append(next, m)
+				}
+			}
+			cur.RproxyS.Mappings = next
+			return nil
+		}); err != nil {
+			fmt.Fprintf(stderr, "rproxy map-del failed: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Removed RproxyS mapping :%d\n", p)
+		return 0
 	case "disable":
 		doApply := len(args) > 1 && args[1] == "--apply"
-		if err := applyOrSave(store, exec, state.RoleRelay, doApply, func(cur *state.State) error {
+		if err := applyOrSave(store, exec, defRole, doApply, func(cur *state.State) error {
 			cur.RproxyS.Enabled = false
 			return nil
 		}); err != nil {
@@ -1084,8 +1202,314 @@ func cmdRproxy(store *state.Store, exec reconcile.SystemExecutor, args []string,
 			return 1
 		}
 		return 0
+	case "client-set":
+		fs := flag.NewFlagSet("rproxy client-set", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		addr := fs.String("address", "", "tunnel server host/IP")
+		port := fs.Int("port", 20000, "tunnel server port")
+		uuid := fs.String("uuid", "", "tunnel UUID")
+		doApply := fs.Bool("apply", false, "apply immediately")
+		if err := fs.Parse(args[1:]); err != nil {
+			return 2
+		}
+		if strings.TrimSpace(*addr) == "" {
+			fmt.Fprintln(stderr, "--address is required")
+			return 2
+		}
+		if err := applyOrSave(store, exec, state.RoleClient, *doApply, func(cur *state.State) error {
+			u := strings.TrimSpace(*uuid)
+			if u == "" {
+				u = cur.Client.RproxyC.TunnelUUID
+			}
+			if u == "" {
+				return errors.New("--uuid is required")
+			}
+			cur.Client.RproxyC.Enabled = true
+			cur.Client.RproxyC.TunnelAddress = strings.TrimSpace(*addr)
+			cur.Client.RproxyC.TunnelPort = *port
+			cur.Client.RproxyC.TunnelUUID = u
+			return nil
+		}); err != nil {
+			fmt.Fprintf(stderr, "rproxy client-set failed: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "RproxyC tunnel -> %s:%d\n", strings.TrimSpace(*addr), *port)
+		return 0
+	case "client-map-add":
+		fs := flag.NewFlagSet("rproxy client-map-add", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		extPort := fs.Int("ext-port", 0, "remote mapped port")
+		intTarget := fs.String("int", "", "local LAN target ip:port")
+		proto := fs.String("proto", "tcp", "tcp|udp|tcp,udp")
+		doApply := fs.Bool("apply", false, "apply immediately")
+		if err := fs.Parse(args[1:]); err != nil {
+			return 2
+		}
+		if *extPort <= 0 || *extPort > 65535 || strings.TrimSpace(*intTarget) == "" {
+			fmt.Fprintln(stderr, "--ext-port and --int ip:port are required")
+			return 2
+		}
+		intIP, intPortStr, err := net.SplitHostPort(strings.TrimSpace(*intTarget))
+		if err != nil {
+			fmt.Fprintf(stderr, "invalid --int target %q: %v\n", *intTarget, err)
+			return 2
+		}
+		intPort, err := strconv.Atoi(intPortStr)
+		if err != nil || intPort <= 0 || intPort > 65535 {
+			fmt.Fprintf(stderr, "invalid internal port %q\n", intPortStr)
+			return 2
+		}
+		if err := applyOrSave(store, exec, state.RoleClient, *doApply, func(cur *state.State) error {
+			cur.Client.RproxyC.Mappings = upsertRproxyClientMapping(cur.Client.RproxyC.Mappings, state.RproxyClientMapping{
+				ExtPort: *extPort,
+				Proto:   *proto,
+				IntIP:   strings.Trim(intIP, "[]"),
+				IntPort: intPort,
+			})
+			return nil
+		}); err != nil {
+			fmt.Fprintf(stderr, "rproxy client-map-add failed: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Added RproxyC mapping :%d (%s) -> %s:%d\n", *extPort, *proto, strings.Trim(intIP, "[]"), intPort)
+		return 0
+	case "client-map-del":
+		if len(args) < 2 {
+			fmt.Fprintln(stderr, "usage: dex rproxy client-map-del <ext-port> [--apply]")
+			return 2
+		}
+		ep, err := strconv.Atoi(args[1])
+		if err != nil || ep <= 0 {
+			fmt.Fprintln(stderr, "invalid ext-port")
+			return 2
+		}
+		doApply := len(args) > 2 && args[2] == "--apply"
+		if err := applyOrSave(store, exec, state.RoleClient, doApply, func(cur *state.State) error {
+			var next []state.RproxyClientMapping
+			for _, m := range cur.Client.RproxyC.Mappings {
+				if m.ExtPort != ep {
+					next = append(next, m)
+				}
+			}
+			cur.Client.RproxyC.Mappings = next
+			return nil
+		}); err != nil {
+			fmt.Fprintf(stderr, "rproxy client-map-del failed: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Removed RproxyC mapping :%d\n", ep)
+		return 0
+	case "client-disable":
+		doApply := len(args) > 1 && args[1] == "--apply"
+		if err := applyOrSave(store, exec, state.RoleClient, doApply, func(cur *state.State) error {
+			cur.Client.RproxyC.Enabled = false
+			return nil
+		}); err != nil {
+			fmt.Fprintf(stderr, "rproxy client-disable failed: %v\n", err)
+			return 1
+		}
+		return 0
 	default:
 		fmt.Fprintf(stderr, "unknown rproxy subcommand %q\n", args[0])
+		return 2
+	}
+}
+
+func buildExtraShareURI(st *state.State, ex state.ExtraInbound) string {
+	host := strings.TrimSpace(ex.Domain)
+	if host == "" && st != nil {
+		host = st.Server.EffectiveConnectHost()
+	}
+	if host == "" {
+		host = "node.example.com"
+	}
+	return render.BuildNodeURI(state.OutboundNode{
+		Name:           ex.Tag,
+		Protocol:       ex.Protocol,
+		Address:        host,
+		Port:           ex.ListenPort,
+		UUID:           ex.UUID,
+		TLSSNI:         firstNonEmpty(ex.RealitySNI, ex.Domain, host),
+		Path:           ex.Path,
+		RealityPubKey:  ex.RealityPubKey,
+		RealityShortID: ex.RealityShortID,
+		Username:       ex.SocksUser,
+		Password:       ex.SocksPass,
+	})
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func upsertExtraInbound(list []state.ExtraInbound, ex state.ExtraInbound) []state.ExtraInbound {
+	for i := range list {
+		if list[i].Tag == ex.Tag {
+			list[i] = ex
+			return list
+		}
+	}
+	return append(list, ex)
+}
+
+func cmdExtra(store *state.Store, exec reconcile.SystemExecutor, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] == "list" {
+		st, err := store.Load()
+		if err != nil {
+			fmt.Fprintf(stderr, "load state: %v\n", err)
+			return 1
+		}
+		for _, ex := range st.ExtraInbounds {
+			fmt.Fprintf(stdout, "[%s] %-14s :%d via_nginx=%v", ex.Tag, ex.Protocol, ex.ListenPort, ex.ViaNginx)
+			if ex.Protocol == "vless-reality" {
+				fmt.Fprintf(stdout, " sni=%s pbk=%s sid=%s uuid=%s", ex.RealitySNI, ex.RealityPubKey, ex.RealityShortID, ex.UUID)
+			}
+			fmt.Fprintln(stdout)
+			if uri := buildExtraShareURI(st, ex); uri != "" {
+				fmt.Fprintf(stdout, "  URI: %s\n", uri)
+			}
+		}
+		return 0
+	}
+
+	defRole := existingRoleOr(store, state.RoleServer)
+	sub := args[0]
+	rest := args[1:]
+	switch sub {
+	case "add-reality":
+		fs := flag.NewFlagSet("extra add-reality", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		port := fs.Int("port", 0, "listen port")
+		sni := fs.String("sni", "www.apple.com", "Reality SNI")
+		dest := fs.String("dest", "", "Reality dest host:port (defaults to <sni>:443)")
+		uuid := fs.String("uuid", "", "UUID (auto-generated if empty)")
+		tag := fs.String("tag", "", "inbound tag")
+		doApply := fs.Bool("apply", false, "apply immediately")
+		if err := fs.Parse(rest); err != nil {
+			return 2
+		}
+		if *port <= 0 || *port > 65535 {
+			fmt.Fprintln(stderr, "--port must be 1..65535")
+			return 2
+		}
+		priv, pub, err := cryptoext.GenerateRealityKeypair()
+		if err != nil {
+			fmt.Fprintf(stderr, "generate reality keys: %v\n", err)
+			return 1
+		}
+		sid, err := cryptoext.GenerateHexToken(4)
+		if err != nil {
+			fmt.Fprintf(stderr, "generate shortId: %v\n", err)
+			return 1
+		}
+		u := strings.TrimSpace(*uuid)
+		if u == "" {
+			u, _ = cryptoext.GenerateUUID()
+		}
+		t := strings.TrimSpace(*tag)
+		if t == "" {
+			t = fmt.Sprintf("inbound-reality-%d", *port)
+		}
+		d := strings.TrimSpace(*dest)
+		if d == "" {
+			d = strings.TrimSpace(*sni) + ":443"
+		}
+		ex := state.ExtraInbound{
+			Tag:            t,
+			Protocol:       "vless-reality",
+			ListenPort:     *port,
+			UUID:           u,
+			RealitySNI:     strings.TrimSpace(*sni),
+			RealityDest:    d,
+			RealityPrivKey: priv,
+			RealityPubKey:  pub,
+			RealityShortID: sid,
+		}
+		if err := applyOrSave(store, exec, defRole, *doApply, func(cur *state.State) error {
+			cur.ExtraInbounds = upsertExtraInbound(cur.ExtraInbounds, ex)
+			return nil
+		}); err != nil {
+			fmt.Fprintf(stderr, "extra add-reality failed: %v\n", err)
+			return 1
+		}
+		st, _ := store.Load()
+		fmt.Fprintf(stdout, "Added %s (%s :%d)\nUUID: %s\nPBK:  %s\nSID:  %s\nSNI:  %s\nURI:  %s\n",
+			ex.Tag, ex.Protocol, ex.ListenPort, ex.UUID, ex.RealityPubKey, ex.RealityShortID, ex.RealitySNI, buildExtraShareURI(st, ex))
+		return 0
+
+	case "add-socks5":
+		fs := flag.NewFlagSet("extra add-socks5", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		port := fs.Int("port", 0, "listen port")
+		user := fs.String("user", "", "username")
+		pass := fs.String("pass", "", "password")
+		tag := fs.String("tag", "", "inbound tag")
+		doApply := fs.Bool("apply", false, "apply immediately")
+		if err := fs.Parse(rest); err != nil {
+			return 2
+		}
+		if *port <= 0 || *port > 65535 {
+			fmt.Fprintln(stderr, "--port must be 1..65535")
+			return 2
+		}
+		t := strings.TrimSpace(*tag)
+		if t == "" {
+			t = fmt.Sprintf("inbound-socks5-%d", *port)
+		}
+		ex := state.ExtraInbound{
+			Tag:        t,
+			Protocol:   "socks5",
+			ListenPort: *port,
+			SocksUser:  *user,
+			SocksPass:  *pass,
+		}
+		if err := applyOrSave(store, exec, defRole, *doApply, func(cur *state.State) error {
+			cur.ExtraInbounds = upsertExtraInbound(cur.ExtraInbounds, ex)
+			return nil
+		}); err != nil {
+			fmt.Fprintf(stderr, "extra add-socks5 failed: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Added %s (socks5 :%d)\n", ex.Tag, ex.ListenPort)
+		return 0
+
+	case "del":
+		if len(rest) == 0 {
+			fmt.Fprintln(stderr, "usage: dex extra del <tag-or-port> [--apply]")
+			return 2
+		}
+		key := rest[0]
+		doApply := len(rest) > 1 && rest[1] == "--apply"
+		portNum, _ := strconv.Atoi(key)
+		if err := applyOrSave(store, exec, defRole, doApply, func(cur *state.State) error {
+			var next []state.ExtraInbound
+			found := false
+			for _, ex := range cur.ExtraInbounds {
+				if ex.Tag == key || (portNum > 0 && ex.ListenPort == portNum) {
+					found = true
+					continue
+				}
+				next = append(next, ex)
+			}
+			if !found {
+				return fmt.Errorf("extra inbound %q not found", key)
+			}
+			cur.ExtraInbounds = next
+			return nil
+		}); err != nil {
+			fmt.Fprintf(stderr, "extra del failed: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Deleted extra inbound %s\n", key)
+		return 0
+
+	default:
+		fmt.Fprintf(stderr, "unknown extra subcommand %q\n", sub)
 		return 2
 	}
 }
@@ -1096,6 +1520,7 @@ func cmdMigrate(store *state.Store, exec reconcile.SystemExecutor, args []string
 	from := fs.String("from", "/opt/de_GWD/0conf", "source file or root path")
 	kind := fs.String("kind", "v2_client", "v2_client|v2_server|des|dexs")
 	doApply := fs.Bool("apply", false, "apply immediately after migration")
+	cleanupV2 := fs.Bool("cleanup-v2", false, "stop legacy v2 services, pihole container, and de_GWD nft tables")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -1138,6 +1563,9 @@ func cmdMigrate(store *state.Store, exec reconcile.SystemExecutor, args []string
 	fmt.Fprintf(stdout, "Migrated %s -> %s (role=%s)\n", *kind, store.StatePath(), imported.Role)
 	for _, n := range notes {
 		fmt.Fprintf(stdout, "  * %s\n", n)
+	}
+	if *cleanupV2 {
+		cleanupLegacyV2(context.Background(), exec, stdout)
 	}
 	if *doApply {
 		if _, err := reconcile.Reconcile(context.Background(), store, exec, reconcile.ApplyOptions{}); err != nil {

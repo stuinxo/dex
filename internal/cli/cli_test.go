@@ -74,4 +74,44 @@ func TestCLISmokeEndToEnd(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "mosdns.yaml") {
 		t.Fatalf("client --doh apply --dry-run failed: code=%d out=%q err=%q", code, out, errOut)
 	}
+
+	// 6. rproxy client-set + client-map-add + rules status
+	code, out, errOut = run("rproxy", "client-set", "--address", "srv.example.com", "--port", "20000", "--uuid", "11111111-1111-4111-8111-111111111111")
+	if code != 0 {
+		t.Fatalf("rproxy client-set failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	code, out, errOut = run("rproxy", "client-map-add", "--ext-port", "20080", "--int", "10.0.0.10:80", "--proto", "tcp")
+	if code != 0 {
+		t.Fatalf("rproxy client-map-add failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	code, out, errOut = run("rproxy", "show")
+	if code != 0 || !strings.Contains(out, "C-Map :20080 (tcp) -> 10.0.0.10:80") {
+		t.Fatalf("rproxy show mismatch: code=%d out=%q err=%q", code, out, errOut)
+	}
+	code, out, errOut = run("rules", "status")
+	if code != 0 || !strings.Contains(out, "geoip.dat") {
+		t.Fatalf("rules status failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+
+	// 7. server extra add-reality + rproxy set/map-add + del
+	code, out, errOut = run("init", "--role", "server", "--domain", "srv.example.com")
+	if code != 0 {
+		t.Fatalf("init server failed: %q", errOut)
+	}
+	code, out, errOut = run("extra", "add-reality", "--port", "9443", "--sni", "www.apple.com")
+	if code != 0 || !strings.Contains(out, "security=reality") {
+		t.Fatalf("extra add-reality failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	code, out, errOut = run("rproxy", "set", "--port", "20000", "--map-port", "20080", "--map-proto", "tcp")
+	if code != 0 {
+		t.Fatalf("rproxy set failed: %q", errOut)
+	}
+	code, out, errOut = run("apply", "--dry-run")
+	if code != 0 || !strings.Contains(out, "xray.json") {
+		t.Fatalf("server extra+rproxy dry-run failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	code, out, errOut = run("extra", "del", "9443")
+	if code != 0 {
+		t.Fatalf("extra del failed: %q", errOut)
+	}
 }

@@ -275,7 +275,7 @@ ExecStart=%s --state-dir %s refresh
 Description=Refresh DEX Relay DNS every 5 minutes
 
 [Timer]
-OnBootSec=1min
+OnActiveSec=5min
 OnUnitActiveSec=5min
 
 [Install]
@@ -291,6 +291,43 @@ WantedBy=timers.target
 			RenderedFile{
 				RelName:    "systemd/dex-refresh.timer",
 				TargetPath: "/etc/systemd/system/dex-refresh.timer",
+				Content:    []byte(timer),
+				Mode:       0o644,
+			},
+		)
+	}
+
+	if b.RulesTimerNeeded {
+		svc := fmt.Sprintf(`[Unit]
+Description=DEX Weekly GeoIP/Domain Rules Update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%s --state-dir %s rules update
+`, opts.DexBin, opts.StateDir)
+		timer := `[Unit]
+Description=Weekly DEX Rules Update Timer
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target
+`
+		out = append(out,
+			RenderedFile{
+				RelName:    "systemd/dex-rules-update.service",
+				TargetPath: "/etc/systemd/system/dex-rules-update.service",
+				Content:    []byte(svc),
+				Mode:       0o644,
+			},
+			RenderedFile{
+				RelName:    "systemd/dex-rules-update.timer",
+				TargetPath: "/etc/systemd/system/dex-rules-update.timer",
 				Content:    []byte(timer),
 				Mode:       0o644,
 			},

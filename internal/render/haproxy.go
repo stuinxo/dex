@@ -2,6 +2,7 @@ package render
 
 import (
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 
@@ -36,8 +37,8 @@ defaults
   timeout check   10s
 
 resolvers dex_dns
-  nameserver dns1 127.0.0.1:53
-  nameserver dns2 1.1.1.1:53
+  nameserver dns1 1.1.1.1:53
+  nameserver dns2 8.8.8.8:53
   nameserver dns3 223.5.5.5:53
   resolve_retries 3
   timeout retry   3s
@@ -45,12 +46,19 @@ resolvers dex_dns
 `)
 
 	for _, r := range rules {
-		host := strings.TrimSpace(r.TargetHost)
+		rawHost := strings.TrimSpace(r.TargetHost)
+		unbracketed := strings.Trim(rawHost, "[]")
+		host := rawHost
 		if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
 			host = "[" + host + "]"
 		}
-		fmt.Fprintf(&b, "\nfrontend ft_%d\n  bind :%d\n  default_backend bk_%d\n\nbackend bk_%d\n  server srv1 %s:%d check resolvers dex_dns init-addr none\n",
-			r.ListenPort, r.ListenPort, r.ListenPort, r.ListenPort, host, r.TargetPort)
+		if _, err := netip.ParseAddr(unbracketed); err == nil {
+			fmt.Fprintf(&b, "\nfrontend ft_%d\n  bind :%d\n  default_backend bk_%d\n\nbackend bk_%d\n  server srv1 %s:%d check\n",
+				r.ListenPort, r.ListenPort, r.ListenPort, r.ListenPort, host, r.TargetPort)
+		} else {
+			fmt.Fprintf(&b, "\nfrontend ft_%d\n  bind :%d\n  default_backend bk_%d\n\nbackend bk_%d\n  server srv1 %s:%d check resolvers dex_dns init-addr libc,none\n",
+				r.ListenPort, r.ListenPort, r.ListenPort, r.ListenPort, host, r.TargetPort)
+		}
 	}
 	return []byte(b.String()), true, nil
 }

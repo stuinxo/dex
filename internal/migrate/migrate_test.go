@@ -15,21 +15,21 @@ func TestImportV2ClientAndRender(t *testing.T) {
 	pwHash := cryptoext.LegacyV2Digest("oldV2Secret!")
 
 	zeroConf := `{
-  "address": {
-    "alias": "home-gw",
-    "localIP": "192.168.50.2",
-    "serverName": "gw.example.com",
-    "webUIport": "8443",
-    "PWD": "` + pwHash + `"
-  },
-  "dns": {
-    "china": "223.5.5.5 119.29.29.29",
-    "doh": ["https://dns.google/dns-query", "https://dns.google/dns-query"],
-    "hosts": {"nas.lan": "192.168.50.10"},
-    "listB": ["openai.com"],
-    "listW": ["cn.bing.com"],
-    "adlists": ["https://example.com/hosts"]
-  },
+    "address": {
+      "alias": "home-gw",
+      "localIP": "192.168.50.2",
+      "serverName": "gw.example.com",
+      "webUIport": "443",
+      "PWD": "` + pwHash + `"
+    },
+    "dns": {
+      "china": "223.5.5.5 119.29.29.29",
+      "doh": ["hk.example.com/dq", "hk.example.com/dq", "https://dns.google/dns-query"],
+      "hosts": {"nas.lan": "192.168.50.10"},
+      "listB": ["openai.com"],
+      "listW": ["cn.bing.com"],
+      "adlists": ["https://example.com/hosts"]
+    },
   "v2node": [
     {"domain": "hk.example.com:443", "name": "HK", "uuid": "11111111-1111-4111-8111-111111111111", "path": "/11111111", "tls": "hk.example.com"},
     {"domain": "jp.example.com:20443", "name": "JP", "uuid": "22222222-2222-4222-8222-222222222222", "path": "/22222222", "tls": "jp.example.com"}
@@ -47,13 +47,13 @@ func TestImportV2ClientAndRender(t *testing.T) {
   "FORWARD": {
     "domain": "gw.example.com",
     "token": "cf-tok-123",
-    "FWD0": {"status": "on", "port": 2443, "path": "/fwd0", "uuid": [{"FWD0uuid": "44444444-4444-4444-8444-444444444444"}]},
+    "FWD0": {"status": "on", "port": "443", "path": "/fwd0", "uuid": [{"FWD0uuid": "44444444-4444-4444-8444-444444444444"}]},
     "FWD1": {"status": "on", "port": 3443, "path": "/fwd1", "upstream": "hk.example.com:443", "uuid": [{"FWD1uuid": "55555555-5555-4555-8555-555555555555"}]},
-    "Rproxy": {"client": {"status": "on", "tunnel": {"address": "rp.example.com:9443", "uuid": "66666666-6666-4666-8666-666666666666"}, "mapping": [{"extPort": 18080, "extProtocol": "tcp", "intIP": "192.168.50.10", "intPort": 8080}]}}
+    "Rproxy": {"client": {"status": "on", "mappingStatus": "on", "tunnel": {"address": "rp.example.com:9443", "uuid": "66666666-6666-4666-8666-666666666666"}, "mapping": [{"extPort": "18080", "extProtocol": "tcp", "intIP": "192.168.50.10", "intPort": "8080"}, {"extPort": "", "extProtocol": "tcp", "intIP": "", "intPort": ""}]}}
   },
   "wireguard": {
     "server": {"WGaddress": "home.example.com", "WGport": "51820", "sprivatekey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "spublickey": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="},
-    "clients": [{"cprivatekey": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=", "cpublickey": "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD="}]
+    "clients": [{"cprivatekey": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=", "cpublickey": "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD=", "mark": "iphone 16"}]
   },
   "ddns": {
     "ddns3322": {"domain": "ignored"},
@@ -89,6 +89,18 @@ func TestImportV2ClientAndRender(t *testing.T) {
 	}
 	if !st.Client.WireGuard.Enabled || len(st.Client.WireGuard.Peers) != 1 || !st.Client.DDNS.Enabled {
 		t.Fatalf("unexpected WG/DDNS migration")
+	}
+	if st.Client.WireGuard.Peers[0].Name != "iphone_16" {
+		t.Fatalf("expected sanitized peer name from mark, got %q", st.Client.WireGuard.Peers[0].Name)
+	}
+	if st.Auth.ListenAddr != ":8443" {
+		t.Fatalf("expected Web UI shifted to :8443 away from FWD0 :443, got %q", st.Auth.ListenAddr)
+	}
+	if len(st.Client.DNS.DoHServers) != 2 || st.Client.DNS.DoHServers[0] != "https://hk.example.com/dq" {
+		t.Fatalf("unexpected normalized DoH list: %v", st.Client.DNS.DoHServers)
+	}
+	if len(st.Client.RproxyC.Mappings) != 1 || st.Client.RproxyC.Mappings[0].ExtPort != 18080 {
+		t.Fatalf("expected valid filtered RproxyC mappings, got %+v", st.Client.RproxyC.Mappings)
 	}
 
 	if _, err := render.RenderAll(st, render.RenderOptions{

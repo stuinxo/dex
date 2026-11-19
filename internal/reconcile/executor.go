@@ -100,7 +100,9 @@ func (e OSExecutor) ServiceStopDisable(ctx context.Context, initSys, name string
 		_, _ = e.RunCommand(ctx, nil, "rc-update", "del", name, "default")
 		return nil
 	}
-	_, _ = e.RunCommand(ctx, nil, "systemctl", "disable", "--now", name)
+	_, _ = e.RunCommand(ctx, nil, "systemctl", "stop", name)
+	_, _ = e.RunCommand(ctx, nil, "systemctl", "disable", name)
+	_, _ = e.RunCommand(ctx, nil, "systemctl", "reset-failed", name)
 	return nil
 }
 

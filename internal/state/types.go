@@ -36,6 +36,7 @@ type SystemConfig struct {
 	EnableIPv6      bool   `json:"enable_ipv6"`
 	EnableFlowtable bool   `json:"enable_flowtable"`
 	AutoTuneSysctl  bool   `json:"auto_tune_sysctl"`
+	AutoUpdateRules bool   `json:"auto_update_rules"`
 }
 
 type AuthConfig struct {
@@ -264,6 +265,7 @@ func NewDefaultState(role string) *State {
 		System: SystemConfig{
 			AutoTuneSysctl:  true,
 			EnableFlowtable: true,
+			AutoUpdateRules: role == RoleClient,
 		},
 		Auth: AuthConfig{
 			ListenAddr: listen,

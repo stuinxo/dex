@@ -55,14 +55,19 @@ dex migrate --kind dexs --from /etc/vless-lite/state.json
 dex                                # 打开交互式编号菜单
 dex init --role landing --domain land.example.com --port 20001 --apply
 dex status                         # 查看角色、服务状态与内存
-dex apply [--dry-run] [--force]    # 校验、渲染并原子对账系统配置
+dex apply [--dry-run [--out-dir <dir>]] [--force]    # 校验、渲染并原子对账系统配置
 dex node list | add | select | show
 dex cert inspect | self-sign | import <cer> <key> | issue --domain <d> --cf-token <tok>
 dex wg enable | disable | peer-add <name> | peer-del <name> | show [name]
 dex ddns set --domain <d> --token <tok> | sync
 dex socks5 list | add | del | toggle | test
 dex relay list | add | del
-dex rproxy show | set | disable
+dex rproxy show | set | map-add | map-del | disable
+dex rproxy client-set | client-map-add | client-map-del | client-disable
+dex extra list | add-reality | add-socks5 | del
+dex rules status | update          # 查看/更新 geodata 与分流规则列表
+dex update [--component all|dex|xray|mosdns|rules]
+dex migrate --kind ... --from ... [--cleanup-v2]
 dex daemon                         # 启动内嵌 HTTPS Web 控制台、故障转移与 DDNS 协程
 dex serve-doh                      # 启动 RFC 8484 /dq DoH 服务
 ```

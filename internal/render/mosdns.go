@@ -31,11 +31,10 @@ func RenderMosDNS(s *state.State, opts RenderOptions) ([]RenderedFile, bool, err
 
 	seenDoHDomain := make(map[string]struct{})
 	for _, rawURL := range s.Client.DNS.DoHServers {
-		parsed, err := url.Parse(rawURL)
-		if err != nil || parsed.Hostname() == "" {
+		dom := ExtractDoHHost(rawURL)
+		if dom == "" {
 			continue
 		}
-		dom := parsed.Hostname()
 		if _, err := netip.ParseAddr(dom); err == nil {
 			continue
 		}

@@ -79,6 +79,7 @@ func RenderAll(s *state.State, opts RenderOptions) (*RenderBundle, error) {
 		bundle.DoHNeeded = true
 	}
 	bundle.DaemonNeeded = s.Role == state.RoleClient || s.Role == state.RoleServer
+	bundle.RulesTimerNeeded = s.Role == state.RoleClient && s.System.AutoUpdateRules
 
 	if wgFiles, needed, err := RenderWireGuard(s, opts); err != nil {
 		return nil, fmt.Errorf("render wireguard: %w", err)

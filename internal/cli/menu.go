@@ -53,6 +53,8 @@ func runInteractiveMenu(store *state.Store, exec reconcile.SystemExecutor, stdin
 66. WireGuard 回家管理
 77. Cloudflare DDNS 设置与同步
 88. 从 v2 (0conf/server) / des / dexs 导入迁移
+90. 路由与分流规则库热更新 (rules)
+99. 核心组件在线更新 (dex/xray/mosdns)
  0. 应用配置 (Apply) 并查看状态
  q. 退出
 ====================================================
@@ -234,6 +236,12 @@ func runInteractiveMenu(store *state.Store, exec reconcile.SystemExecutor, stdin
 			k := ask("Source kind (v2_client/v2_server/des/dexs)", "v2_client")
 			p := ask("Source path", "/opt/de_GWD/0conf")
 			cmdMigrate(store, exec, []string{"--kind", k, "--from", p}, stdout, stderr)
+		case "90":
+			cmdRules(store, exec, []string{"update"}, stdout, stderr)
+		case "99":
+			comp := ask("Component (all/dex/xray/mosdns/rules)", "all")
+			ver := ask("Version tag", "latest")
+			cmdUpdate(store, exec, []string{"--component", comp, "--version", ver}, stdout, stderr)
 		case "0":
 			cmdApply(store, exec, nil, stdout, stderr)
 			cmdStatus(store, exec, stdout, stderr)

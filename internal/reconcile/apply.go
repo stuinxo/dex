@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,16 +36,25 @@ func UpdateAndReconcile(
 	opts ApplyOptions,
 	mutator func(*state.State) error,
 ) (*state.State, *ApplyResult, error) {
-	if err := store.BeginTxn(); err != nil {
-		return nil, nil, fmt.Errorf("begin txn: %w", err)
-	}
-	updated, err := store.Update(defaultRole, mutator)
-	if err != nil {
-		_, _ = store.RollbackTxn()
-		return nil, nil, err
-	}
-	opts.PreserveTxn = true
-	res, err := Reconcile(ctx, store, exec, opts)
+	var (
+		updated *state.State
+		res     *ApplyResult
+	)
+	err := store.WithApplyLock(ctx, func() error {
+		if err := store.BeginTxn(); err != nil {
+			return fmt.Errorf("begin txn: %w", err)
+		}
+		var uerr error
+		updated, uerr = store.Update(defaultRole, mutator)
+		if uerr != nil {
+			_, _ = store.RollbackTxn()
+			return uerr
+		}
+		opts.PreserveTxn = true
+		var rerr error
+		res, rerr = reconcileUnlocked(ctx, store, exec, opts)
+		return rerr
+	})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -162,8 +170,8 @@ func populateRenderOptions(ctx context.Context, st *state.State, store *state.St
 			resolveHost(st.Client.RproxyC.TunnelAddress)
 		}
 		for _, rawDoH := range st.Client.DNS.DoHServers {
-			if u, err := url.Parse(rawDoH); err == nil && u.Hostname() != "" {
-				resolveHost(u.Hostname())
+			if host := render.ExtractDoHHost(rawDoH); host != "" {
+				resolveHost(host)
 			}
 		}
 	}
@@ -253,6 +261,22 @@ func preflightValidate(ctx context.Context, exec SystemExecutor, ropts render.Re
 // Reconcile executes the full declarative transaction:
 // BeginTxn -> Resolve -> Render -> CheckManifest -> Stage & PreFlight -> Backup & AtomicSwap -> Sysctl & Services -> Probe -> Commit/Rollback.
 func Reconcile(ctx context.Context, store *state.Store, exec SystemExecutor, opts ApplyOptions) (*ApplyResult, error) {
+	if opts.DryRun || opts.PreserveTxn {
+		return reconcileUnlocked(ctx, store, exec, opts)
+	}
+	var res *ApplyResult
+	err := store.WithApplyLock(ctx, func() error {
+		var rerr error
+		res, rerr = reconcileUnlocked(ctx, store, exec, opts)
+		return rerr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecutor, opts ApplyOptions) (*ApplyResult, error) {
 	if exec == nil {
 		exec = OSExecutor{}
 	}
@@ -334,6 +358,24 @@ func Reconcile(ctx context.Context, store *state.Store, exec SystemExecutor, opt
 			return nil, fmt.Errorf("stage %s: %w", f.TargetPath, err)
 		}
 		stagedPaths[f.TargetPath] = staged
+	}
+
+	_, isOS := exec.(OSExecutor)
+
+	// Install haproxy automatically on real OS before pre-flight if a relay rule needs it.
+	if bundle.HAProxyNeeded && isOS && !exec.HasCommand("haproxy") {
+		var ierr error
+		var out string
+		if exec.HasCommand("apt-get") {
+			out, ierr = exec.RunCommand(ctx, []string{"DEBIAN_FRONTEND=noninteractive"}, "sh", "-c", "apt-get update -qq && apt-get install -y -qq --no-install-recommends haproxy")
+		} else if exec.HasCommand("apk") {
+			out, ierr = exec.RunCommand(ctx, nil, "apk", "add", "--no-cache", "haproxy")
+		}
+		if ierr != nil {
+			cleanupStaged()
+			_, _ = store.RollbackTxn()
+			return nil, fmt.Errorf("auto-install haproxy failed: %w (%s)", ierr, strings.TrimSpace(out))
+		}
 	}
 
 	// Pre-flight validation before replacing any live files
@@ -419,8 +461,13 @@ func Reconcile(ctx context.Context, store *state.Store, exec SystemExecutor, opt
 		}
 		res.FilesWritten = append(res.FilesWritten, f.TargetPath)
 	}
+	var obsoleteUnitPaths []string
 	for oldTarget := range prevManifest.Files {
 		if _, stillNeeded := newTargets[oldTarget]; stillNeeded {
+			continue
+		}
+		if strings.HasPrefix(oldTarget, "/etc/systemd/system/") || strings.HasPrefix(oldTarget, "/etc/init.d/") {
+			obsoleteUnitPaths = append(obsoleteUnitPaths, oldTarget)
 			continue
 		}
 		diskPath := mapTargetPath(opts.RootPrefix, oldTarget)
@@ -429,7 +476,6 @@ func Reconcile(ctx context.Context, store *state.Store, exec SystemExecutor, opt
 	}
 
 	// Ensure Nginx camouflage root index exists on real OS before nginx validation/start
-	_, isOS := exec.(OSExecutor)
 	if bundle.NginxNeeded && isOS {
 		webRoot := strings.TrimSpace(st.Server.CamouflageDir)
 		if webRoot == "" {
@@ -469,10 +515,6 @@ func Reconcile(ctx context.Context, store *state.Store, exec SystemExecutor, opt
 			}
 		}
 
-		if err := exec.DaemonReload(ctx, ropts.InitSystem); err != nil {
-			return fmt.Errorf("daemon reload: %w", err)
-		}
-
 		// Determine desired states of managed services
 		type svcSpec struct {
 			name   string
@@ -493,7 +535,31 @@ func Reconcile(ctx context.Context, store *state.Store, exec SystemExecutor, opt
 			{name: wgUnit, active: bundle.WireGuardNeeded, probe: bundle.WireGuardNeeded},
 		}
 		if ropts.InitSystem == "systemd" {
-			specs = append(specs, svcSpec{name: "dex-refresh.timer", active: bundle.NFTRelayNeeded, probe: false})
+			specs = append(specs,
+				svcSpec{name: "dex-refresh.timer", active: bundle.NFTRelayNeeded, probe: false},
+				svcSpec{name: "dex-rules-update.timer", active: bundle.RulesTimerNeeded, probe: false},
+			)
+		}
+
+		// Stop/disable unneeded units (timers first) BEFORE deleting obsolete unit
+		// files or running daemon-reload, avoiding vanished-trigger failures
+		// and dropped ExecStop hooks.
+		for i := len(specs) - 1; i >= 0; i-- {
+			sp := specs[i]
+			if !sp.active {
+				_ = exec.ServiceStopDisable(ctx, ropts.InitSystem, sp.name)
+				res.ServicesOff = append(res.ServicesOff, sp.name)
+			}
+		}
+
+		for _, oldUnit := range obsoleteUnitPaths {
+			diskPath := mapTargetPath(opts.RootPrefix, oldUnit)
+			_ = os.Remove(diskPath)
+			res.FilesRemoved = append(res.FilesRemoved, oldUnit)
+		}
+
+		if err := exec.DaemonReload(ctx, ropts.InitSystem); err != nil {
+			return fmt.Errorf("daemon reload: %w", err)
 		}
 
 		for _, sp := range specs {
@@ -502,9 +568,37 @@ func Reconcile(ctx context.Context, store *state.Store, exec SystemExecutor, opt
 					return err
 				}
 				res.ServicesOn = append(res.ServicesOn, sp.name)
-			} else {
-				_ = exec.ServiceStopDisable(ctx, ropts.InitSystem, sp.name)
-				res.ServicesOff = append(res.ServicesOff, sp.name)
+			}
+		}
+
+		// Clean up orphaned nftables tables when a unit or table is removed
+		// (removing unit files before daemon-reload drops ExecStop).
+		if exec.HasCommand("nft") {
+			var dropTables []string
+			if !bundle.NFTRelayNeeded {
+				dropTables = append(dropTables, "dex_relay")
+			}
+			if !bundle.WireGuardNeeded || !bundle.NFTClientNeeded {
+				dropTables = append(dropTables, "dex_nat")
+			}
+			if !bundle.NFTClientNeeded || !st.System.EnableFlowtable {
+				dropTables = append(dropTables, "dex_flow")
+			}
+			if !bundle.NFTClientNeeded {
+				dropTables = append(dropTables, "dex_client", "dex_filter")
+			}
+			for _, tbl := range dropTables {
+				_, _ = exec.RunCommand(ctx, nil, "nft", "delete", "table", "inet", tbl)
+			}
+		}
+		if !bundle.NFTClientNeeded && isOS && exec.HasCommand("ip") {
+			for _, family := range []string{"-4", "-6"} {
+				for i := 0; i < 4; i++ {
+					if _, err := exec.RunCommand(ctx, nil, "ip", family, "rule", "del", "fwmark", "0x9", "table", "220"); err != nil {
+						break
+					}
+				}
+				_, _ = exec.RunCommand(ctx, nil, "ip", family, "route", "flush", "table", "220")
 			}
 		}
 

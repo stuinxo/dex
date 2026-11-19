@@ -489,10 +489,10 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 	case state.RoleClient:
 		needed = true
 		const clientMark = 255
-		// Pre-populate DNS hosts for configured node domains if resolved at apply time
+		// Pre-populate DNS hosts for configured node domains and Rproxy tunnel if resolved at apply time
 		hostsMap := make(map[string]any)
-		for _, n := range s.Client.Nodes {
-			if ips := opts.ResolvedHostIPs[n.Address]; len(ips) > 0 {
+		addHostEntry := func(addr string) {
+			if ips := opts.ResolvedHostIPs[addr]; len(ips) > 0 {
 				var strs []string
 				for _, ip := range ips {
 					if ip.Is4() || s.System.EnableIPv6 {
@@ -500,11 +500,17 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 					}
 				}
 				if len(strs) == 1 {
-					hostsMap[n.Address] = strs[0]
+					hostsMap[addr] = strs[0]
 				} else if len(strs) > 1 {
-					hostsMap[n.Address] = strs
+					hostsMap[addr] = strs
 				}
 			}
+		}
+		for _, n := range s.Client.Nodes {
+			addHostEntry(n.Address)
+		}
+		if s.Client.RproxyC.Enabled && s.Client.RproxyC.TunnelAddress != "" {
+			addHostEntry(s.Client.RproxyC.TunnelAddress)
 		}
 		if len(hostsMap) > 0 {
 			dnsCfg["hosts"] = hostsMap

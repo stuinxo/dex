@@ -3,7 +3,6 @@ package render
 import (
 	"fmt"
 	"net/netip"
-	"net/url"
 	"sort"
 	"strings"
 
@@ -137,9 +136,9 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 		}
 		var globalDNSRaw []string
 		for _, u := range s.Client.DNS.DoHServers {
-			host := u
-			if parsed, perr := url.Parse(u); perr == nil && parsed.Hostname() != "" {
-				host = parsed.Hostname()
+			host := ExtractDoHHost(u)
+			if host == "" {
+				host = u
 			}
 			if ip, ipErr := netip.ParseAddr(host); ipErr == nil {
 				sIP := ip.String()

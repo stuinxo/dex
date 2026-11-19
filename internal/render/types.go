@@ -102,16 +102,32 @@ type RenderedFile struct {
 
 // RenderBundle holds all rendered files and active subsystem flags for reconciliation.
 type RenderBundle struct {
-	Files           []RenderedFile
-	XrayNeeded      bool
-	NFTClientNeeded bool
-	NFTRelayNeeded  bool
-	MosDNSNeeded    bool
-	HAProxyNeeded   bool
-	NginxNeeded     bool
-	DoHNeeded       bool
-	WireGuardNeeded bool
-	DaemonNeeded    bool
+	Files            []RenderedFile
+	XrayNeeded       bool
+	NFTClientNeeded  bool
+	NFTRelayNeeded   bool
+	MosDNSNeeded     bool
+	HAProxyNeeded    bool
+	NginxNeeded      bool
+	DoHNeeded        bool
+	WireGuardNeeded  bool
+	DaemonNeeded     bool
+	RulesTimerNeeded bool
+}
+
+// ExtractDoHHost extracts a hostname or IP from a DoH endpoint (with or without scheme).
+func ExtractDoHHost(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	if parsed, err := url.Parse(raw); err == nil && parsed.Hostname() != "" {
+		return parsed.Hostname()
+	}
+	return ""
 }
 
 // NormalizePath ensures path starts with "/" and defaults from UUID if empty.

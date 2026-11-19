@@ -271,10 +271,14 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 			st.Client.DNS.ChinaServers = ch
 		}
 		if doh := strSliceVal(dnsObj["doh"]); len(doh) > 0 {
-			// Deduplicate legacy repeated [doh1, doh1]
+			// Deduplicate legacy repeated [doh1, doh1] and normalize scheme/default /dq path
 			seen := make(map[string]struct{})
 			var clean []string
 			for _, d := range doh {
+				d = normalizeDoHURL(d)
+				if d == "" {
+					continue
+				}
 				if _, ok := seen[d]; !ok {
 					seen[d] = struct{}{}
 					clean = append(clean, d)
@@ -307,11 +311,11 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 		}
 		if tok := strVal(fwd["token"]); tok != "" {
 			st.Cert.CFToken = tok
-			st.Cert.Mode = "acme_cf"
+			st.Cert.Mode = "acme"
 			st.Cert.AutoRenew = true
 		} else if key := strVal(fwd["APIkey"]); key != "" {
 			st.Cert.CFToken = key
-			st.Cert.Mode = "acme_cf"
+			st.Cert.Mode = "acme"
 		}
 		if f0, ok := fwd["FWD0"].(map[string]any); ok {
 			var uuids []string
@@ -331,6 +335,14 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 				Port:    intVal(f0["port"], 0),
 				Path:    strVal(f0["path"]),
 				UUIDs:   uuids,
+			}
+			if st.Client.FWD0.Enabled && st.Client.FWD0.Port > 0 && st.Auth.ListenAddr == fmt.Sprintf(":%d", st.Client.FWD0.Port) {
+				nextPort := 8443
+				if st.Client.FWD0.Port == 8443 {
+					nextPort = 8444
+				}
+				st.Auth.ListenAddr = fmt.Sprintf(":%d", nextPort)
+				notes = append(notes, fmt.Sprintf("Shifted Web UI port to :%d to avoid conflict with FWD0 port %d", nextPort, st.Client.FWD0.Port))
 			}
 		}
 		if f1, ok := fwd["FWD1"].(map[string]any); ok {
@@ -358,19 +370,28 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 			if rc, ok := rp["client"].(map[string]any); ok {
 				tun, _ := rc["tunnel"].(map[string]any)
 				tAddr, tPort := splitHostPort(strVal(tun["address"]), 443)
+				mapStatus := strings.ToLower(strVal(rc["mappingStatus"]))
 				var maps []state.RproxyClientMapping
-				if arr, ok := rc["mapping"].([]any); ok {
-					for _, item := range arr {
-						m, ok := item.(map[string]any)
-						if !ok {
-							continue
+				if mapStatus != "off" {
+					if arr, ok := rc["mapping"].([]any); ok {
+						for _, item := range arr {
+							m, ok := item.(map[string]any)
+							if !ok {
+								continue
+							}
+							extP := intVal(m["extPort"], 0)
+							intP := intVal(m["intPort"], 0)
+							intIP := strVal(m["intIP"])
+							if extP <= 0 || intP <= 0 || intIP == "" {
+								continue
+							}
+							maps = append(maps, state.RproxyClientMapping{
+								ExtPort: extP,
+								Proto:   normalizeProto(strVal(m["extProtocol"])),
+								IntIP:   intIP,
+								IntPort: intP,
+							})
 						}
-						maps = append(maps, state.RproxyClientMapping{
-							ExtPort: intVal(m["extPort"], 0),
-							Proto:   normalizeProto(strVal(m["extProtocol"])),
-							IntIP:   strVal(m["intIP"]),
-							IntPort: intVal(m["intPort"], 0),
-						})
 					}
 				}
 				st.Client.RproxyC = state.RproxyCConfig{
@@ -392,6 +413,7 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 		spriv := strVal(srv["sprivatekey"])
 		spub := strVal(srv["spublickey"])
 		var peers []state.WGPeer
+		seenPeerNames := make(map[string]struct{})
 		if arr, ok := wgObj["clients"].([]any); ok {
 			for i, item := range arr {
 				m, ok := item.(map[string]any)
@@ -403,8 +425,20 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 				if cp == "" || cpu == "" {
 					continue
 				}
+				pName := sanitizePeerName(strVal(m["mark"]))
+				if pName == "" {
+					pName = fmt.Sprintf("client%d", i+1)
+				}
+				baseName := pName
+				for suffix := 2; ; suffix++ {
+					if _, dup := seenPeerNames[pName]; !dup {
+						seenPeerNames[pName] = struct{}{}
+						break
+					}
+					pName = fmt.Sprintf("%s-%d", baseName, suffix)
+				}
 				peers = append(peers, state.WGPeer{
-					Name:       fmt.Sprintf("client%d", i+1),
+					Name:       pName,
 					IP:         fmt.Sprintf("172.16.66.%d", i+11),
 					PrivateKey: cp,
 					PublicKey:  cpu,
@@ -457,6 +491,34 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 	}
 
 	return st, notes, nil
+}
+
+func normalizeDoHURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if strings.Contains(raw, "://") {
+		return raw
+	}
+	if !strings.Contains(raw, "/") {
+		return "https://" + raw + "/dq"
+	}
+	return "https://" + raw
+}
+
+func sanitizePeerName(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	cleaned := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, raw)
+	return strings.Trim(cleaned, "_")
 }
 
 func normalizeProto(p string) string {

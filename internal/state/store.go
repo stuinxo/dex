@@ -1,12 +1,14 @@
 package state
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 )
 
 var ErrNotFound = errors.New("state file not found")
@@ -28,6 +30,41 @@ func (s *Store) StatePath() string     { return filepath.Join(s.Dir, "state.json
 func (s *Store) BackupPath() string    { return filepath.Join(s.Dir, "state.json.bak") }
 func (s *Store) TxnPath() string       { return filepath.Join(s.Dir, "state.json.txn") }
 func (s *Store) LockPath() string      { return filepath.Join(s.Dir, "state.lock") }
+func (s *Store) ApplyLockPath() string { return filepath.Join(s.Dir, "apply.lock") }
+
+// WithApplyLock serializes full UpdateAndReconcile / Reconcile transactions across processes
+// and goroutines. Lock ordering invariant: apply.lock is strictly outer to state.lock.
+func (s *Store) WithApplyLock(ctx context.Context, fn func() error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := s.ensureDir(); err != nil {
+		return err
+	}
+	lockFile, err := os.OpenFile(s.ApplyLockPath(), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("open apply lock file: %w", err)
+	}
+	defer lockFile.Close()
+
+	for {
+		err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			return fmt.Errorf("apply flock: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	defer func() { _ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN) }()
+
+	return fn()
+}
 func (s *Store) GeneratedDir() string  { return filepath.Join(s.Dir, "generated") }
 func (s *Store) ManifestPath() string  { return filepath.Join(s.Dir, "generated", "manifest.json") }
 func (s *Store) CertDir() string       { return filepath.Join(s.Dir, "ssl") }
