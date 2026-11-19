@@ -1,0 +1,38 @@
+# Build outputs
+/dex
+/dex-*
+/dist/
+/bin/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Archives and external runtime binaries/data (never commit to v3)
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.xz
+*.dat
+IPchnroute*
+Domains.*.txt
+xray
+mosdns
+coredns
+smartdns
+
+# Runtime secrets, certs, and local state
+*.key
+*.cer
+*.pem
+*.crt
+state.json*
+manifest.json
+.0conf*
+
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,186 @@
+package migrate
+
+import (
+	"net/netip"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stuinxo/de_GWD/v3/internal/cryptoext"
+	"github.com/stuinxo/de_GWD/v3/internal/render"
+)
+
+func TestImportV2ClientAndRender(t *testing.T) {
+	dir := t.TempDir()
+	pwHash := cryptoext.LegacyV2Digest("oldV2Secret!")
+
+	zeroConf := `{
+  "address": {
+    "alias": "home-gw",
+    "localIP": "192.168.50.2",
+    "serverName": "gw.example.com",
+    "webUIport": "8443",
+    "PWD": "` + pwHash + `"
+  },
+  "dns": {
+    "china": "223.5.5.5 119.29.29.29",
+    "doh": ["https://dns.google/dns-query", "https://dns.google/dns-query"],
+    "hosts": {"nas.lan": "192.168.50.10"},
+    "listB": ["openai.com"],
+    "listW": ["cn.bing.com"],
+    "adlists": ["https://example.com/hosts"]
+  },
+  "v2node": [
+    {"domain": "hk.example.com:443", "name": "HK", "uuid": "11111111-1111-4111-8111-111111111111", "path": "/11111111", "tls": "hk.example.com"},
+    {"domain": "jp.example.com:20443", "name": "JP", "uuid": "22222222-2222-4222-8222-222222222222", "path": "/22222222", "tls": "jp.example.com"}
+  ],
+  "update": {
+    "v2node": {"domain": "jp.example.com", "port": 20443, "uuid": "22222222-2222-4222-8222-222222222222", "tls": "jp.example.com", "path": "/22222222"}
+  },
+  "v2nodeDIV": {
+    "failover": {"status": "on"},
+    "ss": {"status": "off", "ssAddress": "198.51.100.5", "ssPort": "443", "ssUUID": "33333333-3333-4333-8333-333333333333", "ssSNI": "www.apple.com", "ssPBK": "pub1234567890", "ssSID": "abcd"},
+    "nodeDT": {"status": "on", "address": "hk.example.com:443", "CHNlistProxyIP": ["192.168.50.30"], "globalProxyIP": ["192.168.50.31"], "directProxyIP": ["192.168.50.32"]},
+    "nodeCU": {"status": "on", "address": "jp.example.com:20443", "rulesDomain": ["geosite:github"], "rulesIP": ["8.8.4.4/32"]},
+    "nodeSM": {"status": "on", "openai": "jp.example.com:20443", "apple": "hk.example.com:443", "steam": "proxy"}
+  },
+  "FORWARD": {
+    "domain": "gw.example.com",
+    "token": "cf-tok-123",
+    "FWD0": {"status": "on", "port": 2443, "path": "/fwd0", "uuid": [{"FWD0uuid": "44444444-4444-4444-8444-444444444444"}]},
+    "FWD1": {"status": "on", "port": 3443, "path": "/fwd1", "upstream": "hk.example.com:443", "uuid": [{"FWD1uuid": "55555555-5555-4555-8555-555555555555"}]},
+    "Rproxy": {"client": {"status": "on", "tunnel": {"address": "rp.example.com:9443", "uuid": "66666666-6666-4666-8666-666666666666"}, "mapping": [{"extPort": 18080, "extProtocol": "tcp", "intIP": "192.168.50.10", "intPort": 8080}]}}
+  },
+  "wireguard": {
+    "server": {"WGaddress": "home.example.com", "WGport": "51820", "sprivatekey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "spublickey": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="},
+    "clients": [{"cprivatekey": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=", "cpublickey": "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD="}]
+  },
+  "ddns": {
+    "ddns3322": {"domain": "ignored"},
+    "ddnsCF": {"cfDomain": "home.example.com", "cfToken": "ddns-tok"}
+  },
+  "app": {"jellyfin": "installed"}
+}`
+
+	confPath := filepath.Join(dir, "0conf")
+	if err := os.WriteFile(confPath, []byte(zeroConf), 0o600); err != nil {
+		t.Fatalf("write 0conf: %v", err)
+	}
+
+	st, notes, err := ImportV2Client(confPath, "")
+	if err != nil {
+		t.Fatalf("ImportV2Client: %v", err)
+	}
+	if len(notes) < 3 {
+		t.Fatalf("expected migration notes, got %v", notes)
+	}
+	if err := st.Validate(); err != nil {
+		t.Fatalf("migrated state failed validation: %v", err)
+	}
+	ok, needsRehash := cryptoext.VerifyPassword(st.Auth.PasswordHash, "oldV2Secret!")
+	if !ok || !needsRehash {
+		t.Fatalf("expected legacy v2 password to verify with needsRehash=true")
+	}
+	if st.Client.ActiveNodeID != "v2node-2" {
+		t.Fatalf("expected active node v2node-2, got %q", st.Client.ActiveNodeID)
+	}
+	if st.Client.Routing.ServiceMap["openai"] != "v2node-2" || !st.Client.Routing.SteamProxy {
+		t.Fatalf("unexpected NodeSM migration: %+v", st.Client.Routing)
+	}
+	if !st.Client.WireGuard.Enabled || len(st.Client.WireGuard.Peers) != 1 || !st.Client.DDNS.Enabled {
+		t.Fatalf("unexpected WG/DDNS migration")
+	}
+
+	if _, err := render.RenderAll(st, render.RenderOptions{
+		ResolvedHostIPs: map[string][]netip.Addr{
+			"hk.example.com": {netip.MustParseAddr("203.0.113.1")},
+			"jp.example.com": {netip.MustParseAddr("203.0.113.2")},
+			"rp.example.com": {netip.MustParseAddr("203.0.113.3")},
+			"dns.google":     {netip.MustParseAddr("8.8.8.8")},
+		},
+	}); err != nil {
+		t.Fatalf("RenderAll migrated client failed: %v", err)
+	}
+}
+
+func TestImportV2ServerDESAndDEXS(t *testing.T) {
+	// 1. v2 server fixture
+	root := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(root, "etc", "nginx", "conf.d"), 0o755)
+	_ = os.MkdirAll(filepath.Join(root, "opt", "de_GWD", "vtrui"), 0o755)
+	_ = os.MkdirAll(filepath.Join(root, "opt", "de_GWD", "RproxyS"), 0o755)
+	_ = os.MkdirAll(filepath.Join(root, "etc", "haproxy"), 0o755)
+	_ = os.MkdirAll(filepath.Join(root, "var", "www", "ssl"), 0o755)
+
+	_ = os.WriteFile(filepath.Join(root, "etc", "nginx", "conf.d", "default.conf"), []byte(`
+server {
+  listen 443 default ssl fastopen=500 reuseport;
+  server_name srv.example.com;
+  location /dq { proxy_pass http://127.0.0.1:9853/dq; }
+}
+`), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "opt", "de_GWD", "vtrui", "config.json"), []byte(`{
+  "inbounds": [{"port": 9890, "protocol": "vless", "settings": {"clients": [{"id": "11111111-1111-4111-8111-111111111111"}]}, "streamSettings": {"xhttpSettings": {"path": "/11111111"}}}]
+}`), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "opt", "de_GWD", "socks5-outbound.json"), []byte(`{
+  "enabled": true,
+  "server": {"address": "198.51.100.1", "port": 1080, "username": "u", "password": "p"},
+  "domains": ["geosite:netflix"]
+}`), 0o600)
+	_ = os.WriteFile(filepath.Join(root, "opt", "de_GWD", "RproxyS", "settings.json"), []byte(`{
+  "port": 20000,
+  "uuid": "22222222-2222-4222-8222-222222222222",
+  "mapping": [{"port": 18080, "protocol": "tcp"}]
+}`), 0o600)
+	_ = os.WriteFile(filepath.Join(root, "etc", "haproxy", "haproxy.cfg"), []byte(`
+frontend ft_10001
+  bind :10001
+  default_backend bk_10001
+backend bk_10001
+  server srv1 203.0.113.5:443 check
+`), 0o644)
+
+	srvState, _, err := ImportV2Server(root)
+	if err != nil {
+		t.Fatalf("ImportV2Server: %v", err)
+	}
+	if err := srvState.Validate(); err != nil {
+		t.Fatalf("ImportV2Server Validate: %v", err)
+	}
+	if _, err := render.RenderAll(srvState, render.RenderOptions{}); err != nil {
+		t.Fatalf("RenderAll imported v2 server: %v", err)
+	}
+
+	// 2. des landing fixture
+	desPath := filepath.Join(root, "des-state.json")
+	_ = os.WriteFile(desPath, []byte(`{
+  "version": 1, "role": "landing", "domain": "land.example.com", "public_host": "198.51.100.9",
+  "landing": {"listen_port": 20001, "public_port": 30001, "uuids": ["11111111-1111-4111-8111-111111111111"], "path": "/11111111"},
+  "extras": {"socks": {"listen_port": 20002, "public_port": 30002, "user": "u1", "pass": "p1"}}
+}`), 0o600)
+	desState, _, err := ImportDES(desPath)
+	if err != nil {
+		t.Fatalf("ImportDES: %v", err)
+	}
+	if err := desState.Validate(); err != nil {
+		t.Fatalf("ImportDES Validate: %v", err)
+	}
+
+	// 3. dexs fixture
+	dexsPath := filepath.Join(root, "dexs-state.json")
+	_ = os.WriteFile(dexsPath, []byte(`{
+  "version": 1, "domain": "lite.example.com",
+  "nodes": [{"name": "main", "port": 2096, "uuid": "00000000-0000-4000-8000-000000123456"}],
+  "relays": [{"name": "transit", "port": 33346, "host": "target.example.com", "target_port": 33344, "network": "tcp,udp"}]
+}`), 0o600)
+	dexsState, _, err := ImportDEXS(dexsPath)
+	if err != nil {
+		t.Fatalf("ImportDEXS: %v", err)
+	}
+	if err := dexsState.Validate(); err != nil {
+		t.Fatalf("ImportDEXS Validate: %v", err)
+	}
+	if _, err := render.RenderAll(dexsState, render.RenderOptions{}); err != nil {
+		t.Fatalf("RenderAll dexsState: %v", err)
+	}
+}

@@ -1,0 +1,84 @@
+# DEX v3（寒月）
+
+双端自建透明代理旁路网关与轻量落地/中转统一控制面。**v3 基于零依赖 Go 单二进制（`dex`）彻底重写**，保留并升格了 `des` 的声明式事务引擎与 `de_GWD v2.2` 的全部核心协议/安全不变量。
+
+## 核心变化（相比 v2）
+
+- **单二进制控制面（`CGO_ENABLED=0`）**：彻底取代 11,000+ 行巨石 Bash、80 个 `ui-script`、PHP-FPM + 75 个 `act/*.php`、`sudoers` 白名单与 `ttyd`。
+- **统一声明式状态 + 事务回滚**：唯一状态源 `/etc/dex/state.json`（`flock` 排他锁 + `.bak`/`.txn`）；所有配置由纯函数渲染至 `/etc/dex/generated/`，经 `xray run -test` / `nft -c` / `haproxy -c` / `nginx -t` 预检通过后原子替换，失败自动回滚；支持托管文件 SHA256 防误覆盖检查。
+- **单核收敛**：
+  - **Client 旁路网关**：单一 `dex-xray` 进程承载 TPROXY 主代理、NodeSM（16 项服务 + Apple/Steam）、NodeDT、NodeCU、FWD0/FWD1 与 RproxyC；单一 `dex-mosdns` 完成 `resp_ip` `chnroute` 防污染分流（移除 Docker Pi-hole 与 78 MB CoreDNS）；保留内置 **WireGuard 回家**（纯 Go X25519 密钥与二维码配置）与 **Cloudflare DDNS**；内置支持 **TLS SNI** 的节点探测与故障转移/切回。
+  - **Server / Landing / Relay**：支持同端口 Nginx 反代模式（内置纯 Go RFC 8484 `/dq` DoH 服务，移除 14 MB `doh-server`）与直连 TLS 模式（适配 128 MiB LXC）；完整保留 Option 35 多 Profile SOCKS5 出站分流（含防自环与冲突拦截）、Option 44 三引擎转发（`nft` / `haproxy` / `xray`）、Option 22 RproxyS 与 Option 55 附加协议。
+- **零二进制大包进 Git**：仓库仅保留纯源码，运行核心按架构按需拉取（支持离线包优先与 SHA256 + ELF 校验）。
+
+## 快速安装
+
+支持 **Debian 12/13 / Ubuntu**（`apt + systemd`）与 **Alpine 3.x**（`apk + OpenRC`），`amd64` / `arm64`：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/stuinxo/de_GWD/v3/scripts/install.sh -o install.sh
+sh install.sh
+```
+
+离线部署可将预先编译或下载的 `dex-linux-amd64`（或 `DEX_BIN=/path/to/dex`）及 `Xray-linux-64.zip` 置于 `/root/` 后直接运行 `sh install.sh [client|server|landing|relay]`。
+
+## 四种运行角色
+
+| 角色 (`role`) | 适用场景 | 核心组件 |
+| :--- | :--- | :--- |
+| `client` | 局域网旁路透明代理网关 | `dex-daemon` + `dex-xray` + `dex-mosdns` + `dex-nft` + 可选 `wg0` |
+| `server` | 完整服务端（含 `/dq` DoH 与伪装站） | `dex-daemon` + `dex-xray` + `dex-doh` + `nginx` |
+| `landing` | 128 MiB LXC 极简直连 TLS 落地 | `dex-xray`（直连 TLS，零 nginx/DoH 开销） |
+| `relay` | 纯中转节点（三引擎端口转发 + RproxyS） | `dex-nft` / `haproxy` / `dex-xray` |
+
+## 从旧版平滑迁移
+
+支持一键无损导入 `v2` Client（`/opt/de_GWD/0conf`）、`v2` Server、`des` 与 `dexs` 配置：
+
+```sh
+# 从 v2 Client 迁移并预览生成结果
+dex migrate --kind v2_client --from /opt/de_GWD/0conf
+dex apply --dry-run
+dex apply
+
+# 从 v2 Server / des / dexs 迁移
+dex migrate --kind v2_server --from /
+dex migrate --kind des --from /etc/des/state.json
+dex migrate --kind dexs --from /etc/vless-lite/state.json
+```
+
+> 迁移 `v2` `0conf` 时会保留旧版 Web 登录口令，并在首次通过 Web 控制台成功登录后自动升级为 `PBKDF2-HMAC-SHA256`。
+
+## 常用 CLI 速查
+
+```sh
+dex                                # 打开交互式编号菜单
+dex init --role landing --domain land.example.com --port 20001 --apply
+dex status                         # 查看角色、服务状态与内存
+dex apply [--dry-run] [--force]    # 校验、渲染并原子对账系统配置
+dex node list | add | select | show
+dex cert inspect | self-sign | import <cer> <key> | issue --domain <d> --cf-token <tok>
+dex wg enable | disable | peer-add <name> | peer-del <name> | show [name]
+dex ddns set --domain <d> --token <tok> | sync
+dex socks5 list | add | del | toggle | test
+dex relay list | add | del
+dex rproxy show | set | disable
+dex daemon                         # 启动内嵌 HTTPS Web 控制台、故障转移与 DDNS 协程
+dex serve-doh                      # 启动 RFC 8484 /dq DoH 服务
+```
+
+## 内嵌 Web 控制台安全特性
+
+- Fail-closed 会话认证（`HttpOnly`, `SameSite=Lax`, HTTPS 下自动 `Secure`）
+- 按客户端 IP 滑动窗口防爆破限流（60s 内连续失败 10 次触发 `429` + `Retry-After: 60`）
+- 所有状态变更接口强制 `X-CSRF-Token` 校验，API 响应自动脱敏密码哈希与 Token
+- 原生 SSE 实时日志流（`/api/v1/logs/stream`）与零外链离线 SVG 二维码生成
+
+## 本地开发与交叉编译
+
+```sh
+go vet ./...
+go test -race -count=1 ./...
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/dex-linux-amd64 ./cmd/dex
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o dist/dex-linux-arm64 ./cmd/dex
+```

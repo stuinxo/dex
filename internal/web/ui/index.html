@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DEX v3 Console</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="login-view" class="login-shell">
+    <form id="login-form" class="card login-card">
+      <h1>DEX v3</h1>
+      <p class="muted">旁路网关与节点统一控制台</p>
+      <label class="field">
+        <span>管理密码</span>
+        <input id="login-password" type="password" autocomplete="current-password" required>
+      </label>
+      <div id="login-error" class="error-banner hidden"></div>
+      <button type="submit" class="btn primary full">登录</button>
+    </form>
+  </div>
+
+  <div id="app-view" class="app-shell hidden">
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">DEX</span>
+        <span id="badge-version" class="badge">v3</span>
+        <span id="badge-role" class="badge accent">client</span>
+        <span id="header-host" class="muted"></span>
+      </div>
+      <div class="top-actions">
+        <button id="btn-apply" class="btn primary">保存并应用 (Apply)</button>
+        <button id="btn-logout" class="btn">退出</button>
+      </div>
+    </header>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <nav class="tabs" id="nav-tabs">
+      <button class="tab active" data-tab="overview">概览</button>
+      <button class="tab" data-tab="nodes">节点与分流</button>
+      <button class="tab" data-tab="dns">DNS 与名单</button>
+      <button class="tab" data-tab="forward">转发与穿透</button>
+      <button class="tab" data-tab="wg">WireGuard 与 DDNS</button>
+      <button class="tab" data-tab="system">证书、迁移与日志</button>
+    </nav>
+
+    <main class="content">
+      <section id="tab-overview" class="tab-panel active">
+        <div class="grid-2">
+          <div class="card">
+            <h2>服务状态</h2>
+            <div id="services-grid" class="services-grid"></div>
+          </div>
+          <div class="card">
+            <h2>主线出口与系统信息</h2>
+            <div id="system-summary" class="kv-list"></div>
+            <div class="row-gap">
+              <button id="btn-probe-all" class="btn">探测全部节点延迟</button>
+              <button id="btn-refresh-status" class="btn">刷新状态</button>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <h2>快速切换主节点</h2>
+          <div id="quick-nodes" class="node-cards"></div>
+        </div>
+      </section>
+
+      <section id="tab-nodes" class="tab-panel">
+        <div class="card">
+          <div class="card-head">
+            <h2>出站节点列表</h2>
+            <div class="row-gap">
+              <label class="inline-check">
+                <input id="chk-failover" type="checkbox"> 自动故障转移 / 切回
+              </label>
+              <button id="btn-add-node" class="btn primary">+ 添加节点</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>名称</th><th>协议</th><th>地址:端口</th><th>SNI</th><th>操作</th></tr>
+              </thead>
+              <tbody id="nodes-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="grid-2">
+          <div class="card">
+            <h2>NodeSM 服务分流</h2>
+            <div id="nodesm-grid" class="nodesm-grid"></div>
+          </div>
+          <div class="card">
+            <h2>NodeDT 内网源分流与 NodeCU 自定义</h2>
+            <label class="inline-check"><input id="chk-nodedt" type="checkbox"> 启用 NodeDT 内网设备分流</label>
+            <label class="field"><span>NodeDT 目标节点</span><select id="sel-nodedt-node"></select></label>
+            <label class="field"><span>全球代理内网 IP（每行一个）</span><textarea id="txt-nodedt-global" rows="2"></textarea></label>
+            <label class="field"><span>强制直连内网 IP（每行一个）</span><textarea id="txt-nodedt-direct" rows="2"></textarea></label>
+            <hr>
+            <label class="inline-check"><input id="chk-nodecu" type="checkbox"> 启用 NodeCU 自定义规则</label>
+            <label class="field"><span>NodeCU 目标节点</span><select id="sel-nodecu-node"></select></label>
+            <label class="field"><span>自定义域名规则（geosite:/domain:）</span><textarea id="txt-nodecu-domains" rows="3"></textarea></label>
+            <label class="field"><span>自定义 IP/CIDR 规则</span><textarea id="txt-nodecu-ips" rows="2"></textarea></label>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-dns" class="tab-panel">
+        <div class="grid-2">
+          <div class="card">
+            <h2>MosDNS 单核分流配置</h2>
+            <label class="inline-check"><input id="chk-block-ads" type="checkbox"> 启用去广告域名过滤</label>
+            <label class="inline-check"><input id="chk-enable-ipv6" type="checkbox"> 启用 IPv6 双栈代理与解析</label>
+            <label class="field"><span>国内上游 DNS（每行一个）</span><textarea id="txt-dns-china" rows="4"></textarea></label>
+            <label class="field"><span>境外 DoH 上游（每行一个）</span><textarea id="txt-dns-doh" rows="3"></textarea></label>
+            <label class="field"><span>自定义 Hosts（格式：域名 IP，每行一条）</span><textarea id="txt-dns-hosts" rows="4"></textarea></label>
+          </div>
+          <div class="card">
+            <h2>黑白名单（域名与 IP）</h2>
+            <label class="field"><span>域名黑名单（强制走境外）</span><textarea id="txt-list-b-dom" rows="4"></textarea></label>
+            <label class="field"><span>域名白名单（强制走国内）</span><textarea id="txt-list-w-dom" rows="4"></textarea></label>
+            <label class="field"><span>IP/CIDR 黑名单（强制走代理）</span><textarea id="txt-list-b-ip" rows="3"></textarea></label>
+            <label class="field"><span>IP/CIDR 白名单（强制直连）</span><textarea id="txt-list-w-ip" rows="3"></textarea></label>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-forward" class="tab-panel">
+        <div class="grid-2">
+          <div class="card">
+            <h2>FWD0 / FWD1 中继入站</h2>
+            <label class="inline-check"><input id="chk-fwd0" type="checkbox"> 启用 FWD0（并入主规则分流）</label>
+            <div class="grid-2">
+              <label class="field"><span>FWD0 端口</span><input id="inp-fwd0-port" type="number"></label>
+              <label class="field"><span>FWD0 Path</span><input id="inp-fwd0-path" type="text"></label>
+            </div>
+            <label class="field"><span>FWD0 UUID 列表（每行一个）</span><textarea id="txt-fwd0-uuids" rows="2"></textarea></label>
+            <hr>
+            <label class="inline-check"><input id="chk-fwd1" type="checkbox"> 启用 FWD1（指定上游节点透传）</label>
+            <div class="grid-2">
+              <label class="field"><span>FWD1 端口</span><input id="inp-fwd1-port" type="number"></label>
+              <label class="field"><span>FWD1 上游节点</span><select id="sel-fwd1-node"></select></label>
+            </div>
+            <label class="field"><span>FWD1 Path</span><input id="inp-fwd1-path" type="text"></label>
+            <label class="field"><span>FWD1 UUID 列表（每行一个）</span><textarea id="txt-fwd1-uuids" rows="2"></textarea></label>
+          </div>
+
+          <div class="card">
+            <h2>RproxyC 内网穿透隧道</h2>
+            <label class="inline-check"><input id="chk-rproxyc" type="checkbox"> 启用 RproxyC（合入单进程 Xray）</label>
+            <div class="grid-2">
+              <label class="field"><span>隧道域名</span><input id="inp-rpc-addr" type="text"></label>
+              <label class="field"><span>隧道端口</span><input id="inp-rpc-port" type="number"></label>
+            </div>
+            <label class="field"><span>隧道 UUID</span><input id="inp-rpc-uuid" type="text"></label>
+            <label class="field"><span>映射列表（每行：extPort proto intIP:intPort）</span><textarea id="txt-rpc-maps" rows="4" placeholder="18080 tcp 192.168.1.10:80"></textarea></label>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>44 端口转发规则（nft / haproxy / xray）</h2>
+            <button id="btn-add-relay" class="btn">+ 添加转发</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>监听端口</th><th>目标地址:端口</th><th>协议</th><th>引擎</th><th>操作</th></tr></thead>
+              <tbody id="relay-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-wg" class="tab-panel">
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-head">
+              <h2>WireGuard 回家</h2>
+              <button id="btn-add-wg-peer" class="btn primary">+ 新增客户端 Peer</button>
+            </div>
+            <label class="inline-check"><input id="chk-wg-enabled" type="checkbox"> 启用 WireGuard 服务端</label>
+            <div class="grid-2">
+              <label class="field"><span>公网 Endpoint 域名/IP</span><input id="inp-wg-host" type="text"></label>
+              <label class="field"><span>监听 UDP 端口</span><input id="inp-wg-port" type="number"></label>
+            </div>
+            <label class="field"><span>内网子网 CIDR</span><input id="inp-wg-subnet" type="text"></label>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>名称</th><th>隧道 IP</th><th>操作</th></tr></thead>
+                <tbody id="wg-peers-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>Cloudflare DDNS</h2>
+            <label class="inline-check"><input id="chk-ddns-enabled" type="checkbox"> 启用 Cloudflare DDNS 自动更新</label>
+            <label class="inline-check"><input id="chk-ddns-v6" type="checkbox"> 同步更新 IPv6 (AAAA)</label>
+            <label class="field"><span>域名</span><input id="inp-ddns-domain" type="text"></label>
+            <label class="field"><span>Cloudflare API Token（留空或星号保持原值）</span><input id="inp-ddns-token" type="password"></label>
+            <button id="btn-ddns-sync" class="btn">立即同步 DDNS</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-system" class="tab-panel">
+        <div class="grid-2">
+          <div class="card">
+            <h2>修改 Web 登录密码</h2>
+            <label class="field"><span>当前密码</span><input id="inp-pw-cur" type="password"></label>
+            <label class="field"><span>新密码（至少 6 位）</span><input id="inp-pw-new" type="password"></label>
+            <button id="btn-change-pw" class="btn primary">更新密码</button>
+            <hr>
+            <h2>证书信息</h2>
+            <div id="cert-info" class="kv-list"></div>
+          </div>
+
+          <div class="card">
+            <h2>从 v2 / des / dexs 导入迁移</h2>
+            <label class="field">
+              <span>源格式</span>
+              <select id="sel-mig-kind">
+                <option value="v2_client">v2 Client (/opt/de_GWD/0conf)</option>
+                <option value="v2_server">v2 Server (本机路径)</option>
+                <option value="des">des (state.json)</option>
+                <option value="dexs">dexs (state.json)</option>
+              </select>
+            </label>
+            <label class="field"><span>本机文件路径（可选）</span><input id="inp-mig-path" type="text" placeholder="/opt/de_GWD/0conf"></label>
+            <label class="field"><span>或直接粘贴 JSON 内容</span><textarea id="txt-mig-json" rows="5"></textarea></label>
+            <div class="row-gap">
+              <button id="btn-mig-import" class="btn primary">导入（仅保存配置）</button>
+              <button id="btn-mig-apply" class="btn">导入并立即 Apply</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>实时运行日志 (SSE)</h2>
+            <button id="btn-clear-logs" class="btn">清空视图</button>
+          </div>
+          <pre id="log-stream" class="log-box"></pre>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="modal-backdrop" class="modal-backdrop hidden">
+    <div class="card modal-card">
+      <div class="card-head">
+        <h3 id="modal-title">详情</h3>
+        <button id="modal-close" class="btn">关闭</button>
+      </div>
+      <div id="modal-body"></div>
+    </div>
+  </div>
+
+  <script src="/qrcode.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

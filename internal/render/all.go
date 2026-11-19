@@ -1,0 +1,95 @@
+package render
+
+import (
+	"fmt"
+	"path/filepath"
+
+	"github.com/stuinxo/de_GWD/v3/internal/state"
+)
+
+// RenderAll deterministically compiles State into the full set of target config files and service flags.
+func RenderAll(s *state.State, opts RenderOptions) (*RenderBundle, error) {
+	if err := s.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid state: %w", err)
+	}
+	opts = opts.WithDefaults()
+	bundle := &RenderBundle{}
+
+	if xrayBytes, needed, err := RenderXray(s, opts); err != nil {
+		return nil, fmt.Errorf("render xray: %w", err)
+	} else if needed {
+		bundle.XrayNeeded = true
+		bundle.Files = append(bundle.Files, RenderedFile{
+			RelName:      "xray.json",
+			TargetPath:   filepath.Join(opts.GeneratedDir, "xray.json"),
+			Content:      xrayBytes,
+			Mode:         0o640,
+			ValidateKind: "xray",
+		})
+	}
+
+	if nftBytes, cNeed, rNeed, err := RenderNFTables(s, opts); err != nil {
+		return nil, fmt.Errorf("render nftables: %w", err)
+	} else if cNeed || rNeed {
+		bundle.NFTClientNeeded = cNeed
+		bundle.NFTRelayNeeded = rNeed
+		bundle.Files = append(bundle.Files, RenderedFile{
+			RelName:      "nftables.conf",
+			TargetPath:   filepath.Join(opts.GeneratedDir, "nftables.conf"),
+			Content:      nftBytes,
+			Mode:         0o644,
+			ValidateKind: "nft",
+		})
+	}
+
+	if mosFiles, needed, err := RenderMosDNS(s, opts); err != nil {
+		return nil, fmt.Errorf("render mosdns: %w", err)
+	} else if needed {
+		bundle.MosDNSNeeded = true
+		bundle.Files = append(bundle.Files, mosFiles...)
+	}
+
+	if hapBytes, needed, err := RenderHAProxy(s); err != nil {
+		return nil, fmt.Errorf("render haproxy: %w", err)
+	} else if needed {
+		bundle.HAProxyNeeded = true
+		bundle.Files = append(bundle.Files, RenderedFile{
+			RelName:      "haproxy.cfg",
+			TargetPath:   "/etc/haproxy/haproxy.cfg",
+			Content:      hapBytes,
+			Mode:         0o644,
+			ValidateKind: "haproxy",
+		})
+	}
+
+	if ngBytes, needed, err := RenderNginx(s, opts); err != nil {
+		return nil, fmt.Errorf("render nginx: %w", err)
+	} else if needed {
+		bundle.NginxNeeded = true
+		bundle.Files = append(bundle.Files, RenderedFile{
+			RelName:      "nginx-dex.conf",
+			TargetPath:   "/etc/nginx/conf.d/dex-server.conf",
+			Content:      ngBytes,
+			Mode:         0o644,
+			ValidateKind: "nginx",
+		})
+	}
+
+	if s.Role == state.RoleServer && s.Server.TLSMode == "nginx" && s.Server.EnableDoH {
+		bundle.DoHNeeded = true
+	}
+
+	if wgFiles, needed, err := RenderWireGuard(s, opts); err != nil {
+		return nil, fmt.Errorf("render wireguard: %w", err)
+	} else if needed {
+		bundle.WireGuardNeeded = true
+		bundle.Files = append(bundle.Files, wgFiles...)
+	}
+
+	if sysctlFile, needed := RenderSysctl(s, opts); needed {
+		bundle.Files = append(bundle.Files, sysctlFile)
+	}
+
+	bundle.Files = append(bundle.Files, RenderUnits(s, opts, bundle)...)
+	return bundle, nil
+}
