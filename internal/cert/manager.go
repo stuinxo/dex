@@ -205,6 +205,21 @@ func IssueCloudflareACME(ctx context.Context, runner ACMERunner, cfg ACMEConfig)
 		return nil, err
 	}
 
+	if _, isOS := runner.(osACMERunner); isOS {
+		if _, statErr := os.Stat(cfg.AcmeBin); os.IsNotExist(statErr) {
+			out, ierr := runner.Run(ctx, nil, "sh", "-c",
+				`curl -fsSL https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh | sh -s -- --install-online --force --home "$1" --email "$2"`,
+				"sh", cfg.AcmeHome, "admin@"+mainDomain,
+			)
+			if ierr != nil {
+				return nil, fmt.Errorf("auto-install acme.sh failed: %w (%s)", ierr, strings.TrimSpace(string(out)))
+			}
+			if _, postErr := os.Stat(cfg.AcmeBin); postErr != nil {
+				return nil, fmt.Errorf("acme.sh binary missing after install at %s: %w (%s)", cfg.AcmeBin, postErr, strings.TrimSpace(string(out)))
+			}
+		}
+	}
+
 	accountConf := filepath.Join(cfg.AcmeHome, "account.conf")
 	scrubLegacyKeys(accountConf)
 

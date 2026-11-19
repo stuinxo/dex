@@ -202,6 +202,19 @@ func (OSExecutor) DetectPhysicalNICs() []string {
 	return out
 }
 
+func lookupDNSWithServer(ctx context.Context, dnsAddr, host string) ([]netip.Addr, error) {
+	r := &net.Resolver{
+		PreferGo: true,
+		Dial: func(dctx context.Context, network, address string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(dctx, "udp", dnsAddr)
+		},
+	}
+	cctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	return r.LookupNetIP(cctx, "ip", host)
+}
+
 func (OSExecutor) ResolveHostIPs(ctx context.Context, host string) ([]netip.Addr, error) {
 	host = strings.Trim(strings.TrimSpace(host), "[]")
 	if host == "" {
@@ -213,6 +226,14 @@ func (OSExecutor) ResolveHostIPs(ctx context.Context, host string) ([]netip.Addr
 	cctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
 	ips, err := net.DefaultResolver.LookupNetIP(cctx, "ip", host)
+	if err == nil && len(ips) > 0 {
+		return ips, nil
+	}
+	for _, fallbackDNS := range []string{"223.5.5.5:53", "1.1.1.1:53"} {
+		if fips, ferr := lookupDNSWithServer(ctx, fallbackDNS, host); ferr == nil && len(fips) > 0 {
+			return fips, nil
+		}
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -84,12 +84,18 @@ func TestRenderClientAllSubsystems(t *testing.T) {
 		}},
 	}
 
+	s.Client.DNS.DoHServers = []string{
+		"https://vtw.example.com/dq",
+		"https://dns.google/dns-query",
+	}
+
 	opts := RenderOptions{
 		StateDir:     "/tmp/dex-test",
 		PhysicalNICs: []string{"eth0"},
 		ResolvedHostIPs: map[string][]netip.Addr{
 			"hk.example.com":  {netip.MustParseAddr("203.0.113.10")},
 			"tun.example.com": {netip.MustParseAddr("203.0.113.20")},
+			"vtw.example.com": {netip.MustParseAddr("203.0.113.30")},
 			"dns.google":      {netip.MustParseAddr("8.8.8.8")},
 		},
 		ChnRouteCIDRs: []string{"1.0.1.0/24"},
@@ -99,7 +105,7 @@ func TestRenderClientAllSubsystems(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderAll client: %v", err)
 	}
-	if !bundle.XrayNeeded || !bundle.NFTClientNeeded || !bundle.MosDNSNeeded || !bundle.WireGuardNeeded {
+	if !bundle.XrayNeeded || !bundle.NFTClientNeeded || !bundle.MosDNSNeeded || !bundle.WireGuardNeeded || !bundle.DaemonNeeded {
 		t.Fatalf("missing expected active subsystems: %+v", bundle)
 	}
 
@@ -135,9 +141,11 @@ func TestRenderClientAllSubsystems(t *testing.T) {
 	}
 	nftStr := string(nf.Content)
 	for _, needle := range []string{
-		"table inet dex_client",
+		"table inet dex_client {}",
+		"table inet dex_client {",
 		"meta mark 0x8 meta l4proto udp th dport 443 counter reject",
 		"203.0.113.10",
+		"203.0.113.30",
 		"1.0.1.0/24",
 		"tproxy ip to 127.0.0.1:9896 meta mark set 0x9",
 		"tproxy ip6 to [::1]:9896 meta mark set 0x9",
@@ -147,16 +155,23 @@ func TestRenderClientAllSubsystems(t *testing.T) {
 			t.Errorf("nftables.conf missing %q", needle)
 		}
 	}
+	if strings.Contains(nftStr, "8.8.8.8") {
+		t.Errorf("expected blocked public Anycast DoH IP 8.8.8.8 excluded when nodes exist")
+	}
 
 	// Verify MosDNS config
 	mf, ok := findFile(bundle, "mosdns/mosdns.yaml")
-	if !ok || !strings.Contains(string(mf.Content), "resp_ip") {
-		t.Fatalf("mosdns.yaml invalid or missing resp_ip fallback")
+	if !ok || !strings.Contains(string(mf.Content), "resp_ip &/tmp/dex-test/rules/IPchnroute") {
+		t.Fatalf("mosdns.yaml invalid or missing unquoted resp_ip path: %v", ok)
 	}
 
-	// Verify WireGuard peer config
+	// Verify WireGuard server & peer config
+	wg0, ok := findFile(bundle, "wg0.conf")
+	if !ok || !strings.Contains(string(wg0.Content), "Address = 172.16.66.1/24") || strings.Contains(string(wg0.Content), "DNS =") {
+		t.Fatalf("unexpected wg0.conf:\n%s", string(wg0.Content))
+	}
 	wgf, ok := findFile(bundle, "wg-peers/peer-laptop.conf")
-	if !ok || !strings.Contains(string(wgf.Content), "Endpoint = home.example.com:51820") {
+	if !ok || !strings.Contains(string(wgf.Content), "Endpoint = home.example.com:51820") || !strings.Contains(string(wgf.Content), "DNS = 172.16.66.1") {
 		t.Fatalf("missing or malformed wireguard peer config")
 	}
 
@@ -243,8 +258,8 @@ func TestRenderServerSocks5AndNginx(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderAll server: %v", err)
 	}
-	if !bundle.XrayNeeded || !bundle.NginxNeeded || !bundle.DoHNeeded {
-		t.Fatalf("expected Xray+Nginx+DoH needed: %+v", bundle)
+	if !bundle.XrayNeeded || !bundle.NginxNeeded || !bundle.DoHNeeded || !bundle.DaemonNeeded {
+		t.Fatalf("expected Xray+Nginx+DoH+Daemon needed: %+v", bundle)
 	}
 	xf, _ := findFile(bundle, "xray.json")
 	var xcfg map[string]any
@@ -259,7 +274,7 @@ func TestRenderServerSocks5AndNginx(t *testing.T) {
 
 	ng, _ := findFile(bundle, "nginx-dex.conf")
 	ngStr := string(ng.Content)
-	if !strings.Contains(ngStr, "location /dq") || !strings.Contains(ngStr, "location /11111111") {
+	if !strings.Contains(ngStr, "listen 80;") || !strings.Contains(ngStr, "listen 443 ssl;") || !strings.Contains(ngStr, "location /dq") || !strings.Contains(ngStr, "location /11111111") {
 		t.Fatalf("unexpected nginx-dex.conf:\n%s", ngStr)
 	}
 }

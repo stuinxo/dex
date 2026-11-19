@@ -78,6 +78,7 @@ func RenderAll(s *state.State, opts RenderOptions) (*RenderBundle, error) {
 	if s.Role == state.RoleServer && s.Server.TLSMode == "nginx" && s.Server.EnableDoH {
 		bundle.DoHNeeded = true
 	}
+	bundle.DaemonNeeded = s.Role == state.RoleClient || s.Role == state.RoleServer
 
 	if wgFiles, needed, err := RenderWireGuard(s, opts); err != nil {
 		return nil, fmt.Errorf("render wireguard: %w", err)

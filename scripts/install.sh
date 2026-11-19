@@ -64,7 +64,7 @@ install_base_pkgs() {
   case "$OS_PKG" in
     apk)
       apk update >/dev/null 2>&1 || true
-      apk add --no-cache ca-certificates curl unzip iproute2 nftables >/dev/null 2>&1 \
+      apk add --no-cache ca-certificates curl openssl unzip iproute2 nftables >/dev/null 2>&1 \
         || die "Failed to install base Alpine packages."
       apk add --no-cache libqrencode-tools >/dev/null 2>&1 || true
       ;;
@@ -73,7 +73,7 @@ install_base_pkgs() {
       wait_apt_lock
       apt-get update -qq >/dev/null 2>&1 || true
       wait_apt_lock
-      apt-get install -y -qq --no-install-recommends ca-certificates curl unzip iproute2 nftables procps psmisc >/dev/null 2>&1 \
+      apt-get install -y -qq --no-install-recommends ca-certificates curl openssl unzip iproute2 nftables procps psmisc >/dev/null 2>&1 \
         || die "Failed to install base Debian/Ubuntu packages."
       apt-get install -y -qq --no-install-recommends qrencode >/dev/null 2>&1 || true
       ;;
@@ -163,6 +163,10 @@ install_dex_binary() {
   say "[+] Installed dex to $INSTALL_BIN"
 }
 
+parse_xray_dgst() {
+  awk '/^(SHA2-256|SHA256)=/ {sub(/^(SHA2-256|SHA256)=[[:space:]]*/, ""); print tolower($1); exit}' "$1"
+}
+
 install_xray_core() {
   [ -x "$XRAY_BIN" ] && return 0
   zip_name="Xray-linux-${XRAY_ARCH}.zip"
@@ -185,7 +189,7 @@ install_xray_core() {
     say "[*] Installing Xray from local archive: $local_zip"
     cp -f "$local_zip" "$work_dir/${zip_name}"
     if [ -f "${local_zip}.dgst" ]; then
-      expected=$(awk '/^SHA256=/ {sub(/^SHA256=/, ""); print tolower($1); exit}' "${local_zip}.dgst")
+      expected=$(parse_xray_dgst "${local_zip}.dgst")
       [ -n "$expected" ] && [ "$(sha256_of "$work_dir/${zip_name}")" = "$expected" ] || die "Xray offline SHA256 mismatch"
     fi
   else
@@ -193,7 +197,7 @@ install_xray_core() {
     say "[*] Downloading Xray-core (${XRAY_ARCH})..."
     gh_fetch "$url" "$work_dir/${zip_name}" || die "Failed to download Xray"
     if gh_fetch "${url}.dgst" "$work_dir/${zip_name}.dgst"; then
-      expected=$(awk '/^SHA256=/ {sub(/^SHA256=/, ""); print tolower($1); exit}' "$work_dir/${zip_name}.dgst")
+      expected=$(parse_xray_dgst "$work_dir/${zip_name}.dgst")
       [ -n "$expected" ] && [ "$(sha256_of "$work_dir/${zip_name}")" = "$expected" ] || die "Xray SHA256 verification failed"
     fi
   fi
@@ -262,11 +266,32 @@ main() {
   role="${1:-}"
   case "$role" in
     client)
+      case "$OS_PKG" in
+        apk) apk add --no-cache wireguard-tools >/dev/null 2>&1 || true ;;
+        apt)
+          wait_apt_lock
+          apt-get install -y -qq --no-install-recommends wireguard-tools >/dev/null 2>&1 || true
+          ;;
+      esac
       install_xray_core
       install_mosdns_and_rules
       "$INSTALL_BIN" init --role client --apply
       ;;
     server|landing)
+      if [ "$role" = "server" ]; then
+        say "[*] Installing server packages (nginx, socat, wireguard-tools)..."
+        case "$OS_PKG" in
+          apk)
+            apk add --no-cache nginx socat wireguard-tools >/dev/null 2>&1 \
+              || die "Failed to install server Alpine packages."
+            ;;
+          apt)
+            wait_apt_lock
+            apt-get install -y -qq --no-install-recommends nginx socat wireguard-tools >/dev/null 2>&1 \
+              || die "Failed to install server Debian/Ubuntu packages."
+            ;;
+        esac
+      fi
       install_xray_core
       say "[+] Ready. Run 'dex init --role $role --domain <dom> --apply' or 'dex' for interactive menu."
       ;;

@@ -120,18 +120,38 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 		}
 		reserved4, reserved6 := splitIPsByFamily(append(reserved4, baseReservedIPv6...))
 
-		// Collect GlobalDNS IPs from DoH URLs
+		// Collect GlobalDNS IPs from DoH URLs; when client proxy nodes exist, exclude public Anycast DoH IPs
+		// blocked in mainland China so fallback DoH and client probes to 1.1.1.1/8.8.8.8 traverse Xray instead.
+		hasNodes := len(s.Client.Nodes) > 0
+		blockedPublicDoHIPs := map[string]struct{}{
+			"1.1.1.1":              {},
+			"1.0.0.1":              {},
+			"8.8.8.8":              {},
+			"8.8.4.4":              {},
+			"9.9.9.9":              {},
+			"2606:4700:4700::1111": {},
+			"2606:4700:4700::1001": {},
+			"2001:4860:4860::8888": {},
+			"2001:4860:4860::8844": {},
+			"2620:fe::fe":          {},
+		}
 		var globalDNSRaw []string
 		for _, u := range s.Client.DNS.DoHServers {
 			host := u
 			if parsed, perr := url.Parse(u); perr == nil && parsed.Hostname() != "" {
 				host = parsed.Hostname()
 			}
-			if _, ipErr := netip.ParseAddr(host); ipErr == nil {
-				globalDNSRaw = append(globalDNSRaw, host)
+			if ip, ipErr := netip.ParseAddr(host); ipErr == nil {
+				sIP := ip.String()
+				if _, blocked := blockedPublicDoHIPs[sIP]; !hasNodes || !blocked {
+					globalDNSRaw = append(globalDNSRaw, sIP)
+				}
 			} else if ips := opts.ResolvedHostIPs[host]; len(ips) > 0 {
 				for _, ip := range ips {
-					globalDNSRaw = append(globalDNSRaw, ip.String())
+					sIP := ip.String()
+					if _, blocked := blockedPublicDoHIPs[sIP]; !hasNodes || !blocked {
+						globalDNSRaw = append(globalDNSRaw, sIP)
+					}
 				}
 			}
 		}
@@ -182,7 +202,7 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 				}
 			}
 			if len(nics) > 0 {
-				b.WriteString("table inet dex_flow\ndelete table inet dex_flow\ntable inet dex_flow {\n")
+				b.WriteString("table inet dex_flow {}\ndelete table inet dex_flow\ntable inet dex_flow {\n")
 				fmt.Fprintf(&b, "    flowtable acceleration {\n        hook ingress priority filter; devices = { %s };\n    }\n", strings.Join(nics, ", "))
 				b.WriteString("    chain forward {\n        type filter hook forward priority filter; policy accept;\n")
 				if s.Client.WireGuard.Enabled {
@@ -194,7 +214,7 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 		}
 
 		// Filter + NAT table for WireGuard, MSS clamping, and QUIC UDP/443 rejection
-		b.WriteString("table inet dex_filter\ndelete table inet dex_filter\ntable inet dex_filter {\n")
+		b.WriteString("table inet dex_filter {}\ndelete table inet dex_filter\ntable inet dex_filter {\n")
 		b.WriteString("    chain input {\n        type filter hook input priority 0; policy accept;\n")
 		b.WriteString("        iifname \"lo\" accept\n")
 		if s.Client.WireGuard.Enabled {
@@ -220,15 +240,19 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 		b.WriteString("    }\n")
 		b.WriteString("}\n\n")
 
-		if s.Client.WireGuard.Enabled && s.System.LANInterface != "" {
-			b.WriteString("table inet dex_nat\ndelete table inet dex_nat\ntable inet dex_nat {\n")
+		lanIf := strings.TrimSpace(s.System.LANInterface)
+		if lanIf == "" && len(opts.PhysicalNICs) > 0 {
+			lanIf = strings.TrimSpace(opts.PhysicalNICs[0])
+		}
+		if s.Client.WireGuard.Enabled && lanIf != "" {
+			b.WriteString("table inet dex_nat {}\ndelete table inet dex_nat\ntable inet dex_nat {\n")
 			b.WriteString("    chain postrouting {\n        type nat hook postrouting priority srcnat; policy accept;\n")
-			fmt.Fprintf(&b, "        oifname %q ip saddr 172.16.66.0/24 masquerade\n", s.System.LANInterface)
+			fmt.Fprintf(&b, "        oifname %q ip saddr 172.16.66.0/24 masquerade\n", lanIf)
 			b.WriteString("    }\n}\n\n")
 		}
 
 		// Main TPROXY routing table (dual-stack inet)
-		b.WriteString("table inet dex_client\ndelete table inet dex_client\ntable inet dex_client {\n")
+		b.WriteString("table inet dex_client {}\ndelete table inet dex_client\ntable inet dex_client {\n")
 		writeNFTSet(&b, "reserved_v4", "ipv4_addr", reserved4, true)
 		writeNFTSet(&b, "reserved_v6", "ipv6_addr", reserved6, true)
 		writeNFTSet(&b, "global_dns_v4", "ipv4_addr", globalDNS4, true)
@@ -357,7 +381,7 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 
 	if len(preRules) > 0 {
 		relayNeeded = true
-		b.WriteString("table inet dex_relay\ndelete table inet dex_relay\ntable inet dex_relay {\n")
+		b.WriteString("table inet dex_relay {}\ndelete table inet dex_relay\ntable inet dex_relay {\n")
 		b.WriteString("    chain prerouting {\n        type nat hook prerouting priority -100; policy accept;\n")
 		for _, r := range preRules {
 			b.WriteString(r + "\n")

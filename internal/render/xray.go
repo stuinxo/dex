@@ -382,11 +382,15 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 		rules     []map[string]any
 	)
 	domainStrategy := "AsIs"
+	dnsServers := []string{"1.1.1.1", "8.8.8.8", "localhost"}
+	if s.Role == state.RoleClient {
+		dnsServers = []string{"tcp+local://127.0.0.1:53"}
+	}
 	dnsCfg := map[string]any{
 		"tag":           "dnsflow",
 		"queryStrategy": "UseIP",
 		"disableCache":  true,
-		"servers":       []string{"tcp+local://127.0.0.1:53"},
+		"servers":       dnsServers,
 	}
 
 	addCommonRelayAndExtra := func(mark int) {

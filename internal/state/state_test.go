@@ -121,7 +121,7 @@ func TestValidationRules(t *testing.T) {
 	c := NewDefaultState(RoleClient)
 	c.Client.FWD0 = FWD0Config{
 		Enabled: true,
-		Port:    443, // conflicts with client web-ui :443
+		Port:    8443, // conflicts with client web-ui :8443
 		UUIDs:   []string{"11111111-1111-4111-8111-111111111111"},
 	}
 	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "port conflict") {

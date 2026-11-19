@@ -150,7 +150,7 @@ func RenderMosDNS(s *state.State, opts RenderOptions) ([]RenderedFile, bool, err
 
 	yaml.WriteString("\n  - tag: chn_sequence\n    type: sequence\n    args:\n")
 	yaml.WriteString("      - exec: $forward_chn\n")
-	fmt.Fprintf(&yaml, "      - matches: resp_ip &%q\n", opts.ChnRoutePath)
+	fmt.Fprintf(&yaml, "      - matches: resp_ip &%s\n", opts.ChnRoutePath)
 	yaml.WriteString("        exec: accept\n")
 	yaml.WriteString("      - exec: drop_resp\n\n")
 
@@ -176,12 +176,12 @@ func RenderMosDNS(s *state.State, opts RenderOptions) ([]RenderedFile, bool, err
 	yaml.WriteString("      - exec: $cache\n      - exec: jump has_resp_sequence\n")
 	if s.Client.DNS.BlockAds {
 		adsPath := filepath.Join(opts.StateDir, "rules", "Domains.ads.txt")
-		fmt.Fprintf(&yaml, "      - matches: qname &%q\n        exec: reject 3\n", adsPath)
+		fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: reject 3\n", adsPath)
 	}
-	fmt.Fprintf(&yaml, "      - matches: qname &%q\n        exec: goto global_sequence\n", blackPath)
-	fmt.Fprintf(&yaml, "      - matches: qname &%q\n        exec: $forward_chn\n      - exec: jump has_resp_sequence\n", whitePath)
-	fmt.Fprintf(&yaml, "      - matches: qname &%q\n        exec: goto global_sequence\n", nodesPath)
-	fmt.Fprintf(&yaml, "      - matches: qname &%q\n        exec: $fallback\n      - exec: jump has_resp_sequence\n", opts.DomainsChnPath)
+	fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: goto global_sequence\n", blackPath)
+	fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: $forward_chn\n      - exec: jump has_resp_sequence\n", whitePath)
+	fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: goto global_sequence\n", nodesPath)
+	fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: $fallback\n      - exec: jump has_resp_sequence\n", opts.DomainsChnPath)
 	yaml.WriteString("      - exec: goto global_sequence\n\n")
 
 	yaml.WriteString("  - type: udp_server\n    args:\n      entry: main_sequence\n      listen: 0.0.0.0:53\n\n")

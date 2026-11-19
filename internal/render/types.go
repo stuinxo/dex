@@ -111,6 +111,7 @@ type RenderBundle struct {
 	NginxNeeded     bool
 	DoHNeeded       bool
 	WireGuardNeeded bool
+	DaemonNeeded    bool
 }
 
 // NormalizePath ensures path starts with "/" and defaults from UUID if empty.

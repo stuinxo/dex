@@ -141,6 +141,7 @@ func cmdInit(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 	tlsMode := fs.String("tls-mode", "", "server tls_mode: nginx|direct")
 	pw := fs.String("password", "", "web UI password (random 16-char if omitted)")
 	uuid := fs.String("uuid", "", "primary UUID (auto-generated if omitted)")
+	doh := fs.String("doh", "", "custom DoH URL(s), comma-separated (client role)")
 	doApply := fs.Bool("apply", false, "apply configuration immediately")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -195,6 +196,18 @@ func cmdInit(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 		}
 		if *domain != "" {
 			st.Auth.ServerName = *domain
+		}
+		if strings.TrimSpace(*doh) != "" {
+			var list []string
+			for _, u := range strings.Split(*doh, ",") {
+				u = strings.TrimSpace(u)
+				if u != "" {
+					list = append(list, u)
+				}
+			}
+			if len(list) > 0 {
+				st.Client.DNS.DoHServers = list
+			}
 		}
 	}
 
@@ -539,6 +552,19 @@ func cmdCert(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 		if err != nil {
 			fmt.Fprintf(stderr, "acme issue failed: %v\n", err)
 			return 1
+		}
+		if st != nil {
+			_, _ = store.Update(st.Role, func(cur *state.State) error {
+				cur.Cert.Mode = "acme"
+				cur.Cert.Domain = *dom
+				cur.Cert.AutoRenew = *renew
+				if *renew {
+					cur.Cert.CFToken = *tok
+				} else {
+					cur.Cert.CFToken = ""
+				}
+				return nil
+			})
 		}
 		fmt.Fprintf(stdout, "Certificate issued for %s (expires %s)\n", strings.Join(rep.SANs, ", "), rep.NotAfter.Format("2006-01-02"))
 		return 0
@@ -1125,10 +1151,14 @@ func cmdMigrate(store *state.Store, exec reconcile.SystemExecutor, args []string
 func cmdDaemon(store *state.Store, exec reconcile.SystemExecutor, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	stateDirFlag := fs.String("state-dir", "", "override state directory")
 	listen := fs.String("listen", "", "override Web UI listen address")
 	httpOnly := fs.Bool("http", false, "serve plain HTTP (e.g. behind local proxy)")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	if strings.TrimSpace(*stateDirFlag) != "" {
+		store = state.NewStore(strings.TrimSpace(*stateDirFlag))
 	}
 
 	st, err := store.Load()
@@ -1199,7 +1229,7 @@ func cmdServeDoH(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("serve-doh", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	listen := fs.String("listen", "127.0.0.1:9853", "listen addr")
-	upstream := fs.String("upstream", "127.0.0.1:53", "comma-separated DNS upstreams")
+	upstream := fs.String("upstream", "1.1.1.1:53,8.8.8.8:53,127.0.0.53:53,127.0.0.1:53", "comma-separated DNS upstreams")
 	path := fs.String("path", "/dq", "HTTP DoH path")
 	if err := fs.Parse(args); err != nil {
 		return 2

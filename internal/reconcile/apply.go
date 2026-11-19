@@ -3,7 +3,9 @@ package reconcile
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"net"
 	"net/netip"
 	"net/url"
 	"os"
@@ -184,6 +186,42 @@ func writeBytesExact(path string, data []byte, mode os.FileMode) error {
 	return os.Chmod(path, mode)
 }
 
+func probeLocalDNS(ctx context.Context, addr string) error {
+	// Minimal DNS A query for "localhost." with TXID 0x4458 ("DX")
+	var pkt []byte
+	pkt = binary.BigEndian.AppendUint16(pkt, 0x4458)
+	pkt = binary.BigEndian.AppendUint16(pkt, 0x0100) // RD=1
+	pkt = binary.BigEndian.AppendUint16(pkt, 1)      // QDCOUNT=1
+	pkt = append(pkt, 0, 0, 0, 0, 0, 0)
+	pkt = append(pkt, 9)
+	pkt = append(pkt, []byte("localhost")...)
+	pkt = append(pkt, 0, 0, 1, 0, 1) // QTYPE=A, QCLASS=IN
+
+	dctx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer cancel()
+	var d net.Dialer
+	conn, err := d.DialContext(dctx, "udp", addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if dl, ok := dctx.Deadline(); ok {
+		_ = conn.SetDeadline(dl)
+	}
+	if _, err := conn.Write(pkt); err != nil {
+		return err
+	}
+	buf := make([]byte, 512)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return err
+	}
+	if n < 12 || binary.BigEndian.Uint16(buf[:2]) != 0x4458 {
+		return fmt.Errorf("invalid DNS probe reply (%d bytes)", n)
+	}
+	return nil
+}
+
 func preflightValidate(ctx context.Context, exec SystemExecutor, ropts render.RenderOptions, stagedPaths map[string]string, files []render.RenderedFile) error {
 	for _, f := range files {
 		staged := stagedPaths[f.TargetPath]
@@ -191,7 +229,7 @@ func preflightValidate(ctx context.Context, exec SystemExecutor, ropts render.Re
 		case "xray":
 			if exec.HasCommand(ropts.XrayBin) {
 				env := []string{"XRAY_LOCATION_ASSET=" + filepath.Join(ropts.StateDir, "rules")}
-				if out, err := exec.RunCommand(ctx, env, ropts.XrayBin, "run", "-test", "-c", staged); err != nil {
+				if out, err := exec.RunCommand(ctx, env, ropts.XrayBin, "run", "-test", "-format", "json", "-c", staged); err != nil {
 					return fmt.Errorf("xray config validation failed: %w (%s)", err, strings.TrimSpace(out))
 				}
 			}
@@ -287,6 +325,9 @@ func Reconcile(ctx context.Context, store *state.Store, exec SystemExecutor, opt
 	for _, f := range bundle.Files {
 		diskTarget := mapTargetPath(opts.RootPrefix, f.TargetPath)
 		staged := diskTarget + ".new"
+		if strings.HasSuffix(diskTarget, ".json") {
+			staged = strings.TrimSuffix(diskTarget, ".json") + ".new.json"
+		}
 		if err := writeBytesExact(staged, f.Content, f.Mode); err != nil {
 			cleanupStaged()
 			_, _ = store.RollbackTxn()
@@ -387,6 +428,19 @@ func Reconcile(ctx context.Context, store *state.Store, exec SystemExecutor, opt
 		res.FilesRemoved = append(res.FilesRemoved, oldTarget)
 	}
 
+	// Ensure Nginx camouflage root index exists on real OS before nginx validation/start
+	_, isOS := exec.(OSExecutor)
+	if bundle.NginxNeeded && isOS {
+		webRoot := strings.TrimSpace(st.Server.CamouflageDir)
+		if webRoot == "" {
+			webRoot = "/var/www/html"
+		}
+		indexDisk := mapTargetPath(opts.RootPrefix, filepath.Join(webRoot, "index.html"))
+		if _, statErr := os.Stat(indexDisk); os.IsNotExist(statErr) {
+			_ = writeBytesExact(indexDisk, []byte("<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>Welcome</title></head><body><h1>Welcome</h1></body></html>\n"), 0o644)
+		}
+	}
+
 	// Validate nginx globally once dex-server.conf is in conf.d
 	if bundle.NginxNeeded && exec.HasCommand("nginx") {
 		if out, err := exec.RunCommand(ctx, nil, "nginx", "-t"); err != nil {
@@ -397,6 +451,7 @@ func Reconcile(ctx context.Context, store *state.Store, exec SystemExecutor, opt
 	}
 
 	// Runtime sysctl & service orchestration
+	wasResolvedActive := false
 	applyServices := func() error {
 		if st.System.AutoTuneSysctl && !ropts.IsContainer {
 			sysctlDisk := mapTargetPath(opts.RootPrefix, "/etc/sysctl.d/99-dex.conf")
@@ -404,6 +459,16 @@ func Reconcile(ctx context.Context, store *state.Store, exec SystemExecutor, opt
 				_, _ = exec.RunCommand(ctx, nil, "sysctl", "-p", sysctlDisk)
 			}
 		}
+
+		// Stop/disable systemd-resolved on systemd hosts so it neither holds :53 nor bypasses /etc/resolv.conf via nss-resolve
+		if isOS && bundle.MosDNSNeeded && ropts.InitSystem == "systemd" {
+			_ = os.Remove(mapTargetPath(opts.RootPrefix, "/etc/systemd/resolved.conf.d/99-dex.conf"))
+			if exec.ServiceIsActive(ctx, "systemd", "systemd-resolved") {
+				wasResolvedActive = true
+				_ = exec.ServiceStopDisable(ctx, "systemd", "systemd-resolved")
+			}
+		}
+
 		if err := exec.DaemonReload(ctx, ropts.InitSystem); err != nil {
 			return fmt.Errorf("daemon reload: %w", err)
 		}
@@ -443,15 +508,90 @@ func Reconcile(ctx context.Context, store *state.Store, exec SystemExecutor, opt
 			}
 		}
 
-		// Give newly started daemons a moment if running real OS binaries, then probe
-		if _, isOS := exec.(OSExecutor); isOS {
-			time.Sleep(500 * time.Millisecond)
-		}
-		for _, sp := range specs {
-			if sp.active && sp.probe {
-				if !exec.ServiceIsActive(ctx, ropts.InitSystem, sp.name) {
-					return fmt.Errorf("service %s failed health check after start", sp.name)
+		// Manage dex-daemon carefully: start if inactive, avoid self-restarting when already active (e.g. Web UI apply)
+		if bundle.DaemonNeeded {
+			if !exec.ServiceIsActive(ctx, ropts.InitSystem, "dex-daemon") {
+				if err := exec.ServiceEnableStart(ctx, ropts.InitSystem, "dex-daemon"); err != nil {
+					return err
 				}
+			}
+			res.ServicesOn = append(res.ServicesOn, "dex-daemon")
+		} else {
+			_ = exec.ServiceStopDisable(ctx, ropts.InitSystem, "dex-daemon")
+			res.ServicesOff = append(res.ServicesOff, "dex-daemon")
+		}
+
+		// Poll health after start (up to 2s on real OS) to confirm services stay stable
+		checkAllActive := func() error {
+			for _, sp := range specs {
+				if sp.active && sp.probe {
+					if !exec.ServiceIsActive(ctx, ropts.InitSystem, sp.name) {
+						return fmt.Errorf("service %s failed health check after start", sp.name)
+					}
+				}
+			}
+			if bundle.DaemonNeeded && !exec.ServiceIsActive(ctx, ropts.InitSystem, "dex-daemon") {
+				return fmt.Errorf("service dex-daemon failed health check after start")
+			}
+			return nil
+		}
+
+		if isOS {
+			deadline := time.Now().Add(2 * time.Second)
+			time.Sleep(500 * time.Millisecond)
+			for {
+				if err := checkAllActive(); err == nil {
+					// Wait another 500ms and re-verify to catch fast crash loops
+					time.Sleep(500 * time.Millisecond)
+					if err2 := checkAllActive(); err2 != nil {
+						return err2
+					}
+					break
+				} else if !time.Now().Before(deadline) {
+					return err
+				}
+				time.Sleep(300 * time.Millisecond)
+			}
+		} else {
+			if err := checkAllActive(); err != nil {
+				return err
+			}
+		}
+
+		// Verify MosDNS responds on 127.0.0.1:53 before backing up & switching /etc/resolv.conf
+		if isOS && bundle.MosDNSNeeded {
+			var probeErr error
+			for attempt := 0; attempt < 4; attempt++ {
+				if probeErr = probeLocalDNS(ctx, "127.0.0.1:53"); probeErr == nil {
+					break
+				}
+				time.Sleep(250 * time.Millisecond)
+			}
+			if probeErr != nil {
+				return fmt.Errorf("local DNS 127.0.0.1:53 readiness probe failed: %w", probeErr)
+			}
+
+			resolvPath := mapTargetPath(opts.RootPrefix, "/etc/resolv.conf")
+			origPath := filepath.Join(store.Dir, "resolv.conf.orig")
+			curResolvBytes, readResolvErr := os.ReadFile(resolvPath)
+			curResolvLink, linkErr := os.Readlink(resolvPath)
+			if _, statOrigErr := os.Stat(origPath); os.IsNotExist(statOrigErr) {
+				if readResolvErr == nil && strings.TrimSpace(string(curResolvBytes)) != "nameserver 127.0.0.1" {
+					_ = writeBytesExact(origPath, curResolvBytes, 0o644)
+				}
+			}
+			if linkErr == nil {
+				_ = os.Remove(resolvPath)
+			}
+			if werr := writeBytesExact(resolvPath, []byte("nameserver 127.0.0.1\n"), 0o644); werr != nil {
+				// Best-effort restore before returning failure
+				if linkErr == nil && curResolvLink != "" {
+					_ = os.Remove(resolvPath)
+					_ = os.Symlink(curResolvLink, resolvPath)
+				} else if readResolvErr == nil {
+					_ = writeBytesExact(resolvPath, curResolvBytes, 0o644)
+				}
+				return fmt.Errorf("update /etc/resolv.conf: %w", werr)
 			}
 		}
 		return nil
@@ -460,6 +600,9 @@ func Reconcile(ctx context.Context, store *state.Store, exec SystemExecutor, opt
 	if err := applyServices(); err != nil {
 		rollbackFiles()
 		_ = exec.DaemonReload(ctx, ropts.InitSystem)
+		if wasResolvedActive {
+			_ = exec.ServiceEnableStart(ctx, "systemd", "systemd-resolved")
+		}
 		// Best-effort restart previously running services
 		for _, spName := range res.ServicesOn {
 			_ = exec.ServiceRestart(ctx, ropts.InitSystem, spName)

@@ -84,7 +84,7 @@ stop() {
 			script := fmt.Sprintf(`#!/sbin/openrc-run
 description="DEX RFC 8484 DoH Server"
 command="%s"
-command_args="serve-doh --listen 127.0.0.1:9853 --upstream 127.0.0.1:53 --path /dq"
+command_args="serve-doh --listen 127.0.0.1:9853 --upstream 1.1.1.1:53,8.8.8.8:53,127.0.0.53:53,127.0.0.1:53 --path /dq"
 command_background=true
 pidfile="/run/dex-doh.pid"
 depend() { need net; }
@@ -101,7 +101,7 @@ depend() { need net; }
 			script := fmt.Sprintf(`#!/sbin/openrc-run
 description="DEX Control Plane Daemon"
 command="%s"
-command_args="daemon --state-dir %s"
+command_args="--state-dir %s daemon"
 command_background=true
 pidfile="/run/dex-daemon.pid"
 output_log="/var/log/dex-daemon.log"
@@ -225,7 +225,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=%s serve-doh --listen 127.0.0.1:9853 --upstream 127.0.0.1:53 --path /dq
+ExecStart=%s serve-doh --listen 127.0.0.1:9853 --upstream 1.1.1.1:53,8.8.8.8:53,127.0.0.53:53,127.0.0.1:53 --path /dq
 Restart=always
 RestartSec=2
 
@@ -248,7 +248,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%s daemon --state-dir %s
+ExecStart=%s --state-dir %s daemon
 Restart=always
 RestartSec=2
 
@@ -269,7 +269,7 @@ Description=DEX Relay Dynamic DNS Refresh
 
 [Service]
 Type=oneshot
-ExecStart=%s refresh --state-dir %s
+ExecStart=%s --state-dir %s refresh
 `, opts.DexBin, opts.StateDir)
 		timer := `[Unit]
 Description=Refresh DEX Relay DNS every 5 minutes

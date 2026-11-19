@@ -42,7 +42,7 @@ func NewHandler(cfg Config) *Handler {
 	}
 	ups := cfg.Upstreams
 	if len(ups) == 0 {
-		ups = []string{"127.0.0.1:53"}
+		ups = []string{"1.1.1.1:53", "8.8.8.8:53", "127.0.0.53:53", "127.0.0.1:53"}
 	}
 	timeout := cfg.Timeout
 	if timeout <= 0 {

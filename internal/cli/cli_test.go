@@ -60,4 +60,18 @@ func TestCLISmokeEndToEnd(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "mosdns.yaml") || !strings.Contains(out, "wg0.conf") {
 		t.Fatalf("client apply --dry-run failed: code=%d out=%q err=%q", code, out, errOut)
 	}
+
+	// 5. init client --doh writes custom DoH and dry-run renders it
+	code, out, errOut = run("init", "--role", "client", "--doh", "https://vtw.example.com/dq")
+	if code != 0 || !strings.Contains(out, "Initialized client state") {
+		t.Fatalf("init client --doh failed: code=%d out=%q err=%q", code, out, errOut)
+	}
+	stateRaw, err := os.ReadFile(filepath.Join(stateDir, "state.json"))
+	if err != nil || !strings.Contains(string(stateRaw), "https://vtw.example.com/dq") {
+		t.Fatalf("expected custom DoH saved in state.json: err=%v data=%q", err, string(stateRaw))
+	}
+	code, out, errOut = run("apply", "--dry-run")
+	if code != 0 || !strings.Contains(out, "mosdns.yaml") {
+		t.Fatalf("client --doh apply --dry-run failed: code=%d out=%q err=%q", code, out, errOut)
+	}
 }

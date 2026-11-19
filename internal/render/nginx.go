@@ -43,7 +43,7 @@ func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, 
 
 		if port == 443 {
 			fmt.Fprintf(&b, `server {
-  listen 80 reuseport;
+  listen 80;
   server_name %s;
   return 301 https://$server_name$request_uri;
 }
@@ -58,15 +58,13 @@ func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, 
 
 `)
 		fmt.Fprintf(&b, `server {
-  listen %d default quic reuseport;
-  listen %d default ssl fastopen=500 reuseport;
+  listen %d ssl;
   http2 on;
   server_name %s;
   root %s;
   index index.html index.htm;
   error_page 497 https://$host:%d$request_uri;
 
-  add_header Alt-Svc 'h3=":%d"; ma=86400';
   add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
   add_header X-Frame-Options "SAMEORIGIN" always;
   add_header X-Content-Type-Options "nosniff" always;
@@ -83,7 +81,7 @@ func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, 
   ssl_buffer_size 4k;
   ssl_early_data on;
 
-`, port, port, domain, webRoot, port, port, opts.CertFile, opts.KeyFile)
+`, port, domain, webRoot, port, opts.CertFile, opts.KeyFile)
 
 		if s.Server.EnableDoH {
 			b.WriteString(`  location /dq {

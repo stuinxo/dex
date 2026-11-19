@@ -54,6 +54,14 @@ PersistentKeepalive = 15
 `, peer.PrivateKey, normalizePeerAllowedIP(peer.IP), srvIP, wg.ServerPublicKey, endpoint, wg.ListenPort)
 }
 
+func wireGuardServerAddr(wg state.WireGuardConfig) string {
+	raw := strings.TrimSpace(wg.SubnetCIDR)
+	if _, err := netip.ParsePrefix(raw); err == nil {
+		return raw
+	}
+	return wireGuardServerIP(wg) + "/24"
+}
+
 // RenderWireGuard renders /etc/wireguard/wg0.conf and per-peer config files.
 func RenderWireGuard(s *state.State, opts RenderOptions) ([]RenderedFile, bool, error) {
 	opts = opts.WithDefaults()
@@ -61,16 +69,15 @@ func RenderWireGuard(s *state.State, opts RenderOptions) ([]RenderedFile, bool, 
 		return nil, false, nil
 	}
 	wg := s.Client.WireGuard
-	srvIP := wireGuardServerIP(wg)
+	srvAddr := wireGuardServerAddr(wg)
 
 	var b strings.Builder
 	fmt.Fprintf(&b, `[Interface]
 PrivateKey = %s
-Address = %s/32
+Address = %s
 ListenPort = %d
-DNS = 127.0.0.1
 MTU = 1420
-`, wg.ServerPrivateKey, srvIP, wg.ListenPort)
+`, wg.ServerPrivateKey, srvAddr, wg.ListenPort)
 
 	files := make([]RenderedFile, 0, 1+len(wg.Peers))
 	for i, peer := range wg.Peers {
