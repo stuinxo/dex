@@ -100,6 +100,13 @@ func (s *State) Validate() error {
 				if n.Path != "" && !pathRe.MatchString(n.Path) {
 					return fmt.Errorf("client node %q: invalid path %q", n.ID, n.Path)
 				}
+			case "vmess-tcp":
+				if !uuidRe.MatchString(n.UUID) {
+					return fmt.Errorf("client node %q: invalid UUID %q", n.ID, n.UUID)
+				}
+				if n.Path != "" && !pathRe.MatchString(n.Path) {
+					return fmt.Errorf("client node %q: invalid path %q", n.ID, n.Path)
+				}
 			case "vless-reality":
 				if !uuidRe.MatchString(n.UUID) {
 					return fmt.Errorf("client node %q: invalid UUID %q", n.ID, n.UUID)
@@ -177,7 +184,7 @@ func (s *State) Validate() error {
 		}
 
 		for dom, ipStr := range s.Client.DNS.Hosts {
-			if !socks5out.IsValidAddress(dom) {
+			if !isValidHostsKey(dom) {
 				return fmt.Errorf("client.dns.hosts: invalid host %q", dom)
 			}
 			if _, err := netip.ParseAddr(ipStr); err != nil {
@@ -199,6 +206,14 @@ func (s *State) Validate() error {
 			if err := claimPort("tcp", s.Client.FWD0.Port, "client.fwd0"); err != nil {
 				return err
 			}
+			switch s.Client.FWD0.Protocol {
+			case "", "vless-xhttp", "vmess-tcp":
+			default:
+				return fmt.Errorf("client.fwd0.protocol must be vless-xhttp or vmess-tcp, got %q", s.Client.FWD0.Protocol)
+			}
+			if s.Client.FWD0.Path != "" && !pathRe.MatchString(s.Client.FWD0.Path) {
+				return fmt.Errorf("client.fwd0.path: invalid %q", s.Client.FWD0.Path)
+			}
 			if len(s.Client.FWD0.UUIDs) == 0 {
 				return errors.New("client.fwd0: at least one UUID is required when enabled")
 			}
@@ -211,6 +226,14 @@ func (s *State) Validate() error {
 		if s.Client.FWD1.Enabled {
 			if err := claimPort("tcp", s.Client.FWD1.Port, "client.fwd1"); err != nil {
 				return err
+			}
+			switch s.Client.FWD1.Protocol {
+			case "", "vless-xhttp", "vmess-tcp":
+			default:
+				return fmt.Errorf("client.fwd1.protocol must be vless-xhttp or vmess-tcp, got %q", s.Client.FWD1.Protocol)
+			}
+			if s.Client.FWD1.Path != "" && !pathRe.MatchString(s.Client.FWD1.Path) {
+				return fmt.Errorf("client.fwd1.path: invalid %q", s.Client.FWD1.Path)
 			}
 			if len(s.Client.FWD1.UUIDs) == 0 {
 				return errors.New("client.fwd1: at least one UUID is required when enabled")
@@ -236,6 +259,17 @@ func (s *State) Validate() error {
 			}
 			if !uuidRe.MatchString(s.Client.RproxyC.TunnelUUID) {
 				return fmt.Errorf("client.rproxyc.tunnel_uuid: invalid %q", s.Client.RproxyC.TunnelUUID)
+			}
+			switch s.Client.RproxyC.Security {
+			case "", "tls", "none":
+			default:
+				return fmt.Errorf("client.rproxyc.security must be tls or none, got %q", s.Client.RproxyC.Security)
+			}
+			if s.Client.RproxyC.ServerName != "" && !socks5out.IsValidAddress(s.Client.RproxyC.ServerName) {
+				return fmt.Errorf("client.rproxyc.server_name: invalid %q", s.Client.RproxyC.ServerName)
+			}
+			if hasControlChar(s.Client.RproxyC.PinnedPeerCertSha256) {
+				return errors.New("client.rproxyc.pinned_peer_cert_sha256: invalid control character")
 			}
 			for i, m := range s.Client.RproxyC.Mappings {
 				if m.ExtPort < 1 || m.ExtPort > 65535 || m.IntPort < 1 || m.IntPort > 65535 {
@@ -284,6 +318,11 @@ func (s *State) Validate() error {
 
 	// Server / Landing main inbound checks
 	if s.Role == RoleServer || s.Role == RoleLanding {
+		switch s.Server.Protocol {
+		case "", "vless-xhttp", "vmess-ws", "vless-ws":
+		default:
+			return fmt.Errorf("server.protocol must be vless-xhttp, vmess-ws, or vless-ws, got %q", s.Server.Protocol)
+		}
 		if s.Server.TLSMode != "direct" && s.Server.TLSMode != "nginx" {
 			return fmt.Errorf("server.tls_mode must be direct or nginx, got %q", s.Server.TLSMode)
 		}
@@ -352,12 +391,22 @@ func (s *State) Validate() error {
 		if err := claimPort("tcp", s.RproxyS.ListenPort, "rproxys.tunnel"); err != nil {
 			return err
 		}
+		switch s.RproxyS.Security {
+		case "", "tls", "none":
+		default:
+			return fmt.Errorf("rproxys.security must be tls or none, got %q", s.RproxyS.Security)
+		}
 		if len(s.RproxyS.UUIDs) == 0 {
 			return errors.New("rproxys.uuids: at least one UUID is required")
 		}
 		for _, u := range s.RproxyS.UUIDs {
 			if !uuidRe.MatchString(u) {
 				return fmt.Errorf("rproxys.uuids: invalid UUID %q", u)
+			}
+		}
+		for _, u := range s.RproxyS.InUUIDs {
+			if !uuidRe.MatchString(u) {
+				return fmt.Errorf("rproxys.in_uuids: invalid UUID %q", u)
 			}
 		}
 		for i, m := range s.RproxyS.Mappings {
@@ -519,6 +568,22 @@ func isLoopbackOrZero(lowerAddr string) bool {
 		return false
 	}
 	return ip.IsLoopback() || ip.IsUnspecified()
+}
+
+func isValidHostsKey(dom string) bool {
+	if dom == "" {
+		return false
+	}
+	if rest, ok := strings.CutPrefix(dom, "domain:"); ok {
+		return socks5out.IsValidAddress(rest)
+	}
+	if rest, ok := strings.CutPrefix(dom, "full:"); ok {
+		return socks5out.IsValidAddress(rest)
+	}
+	if rest, ok := strings.CutPrefix(dom, "*."); ok {
+		return rest != "" && socks5out.IsValidAddress(rest)
+	}
+	return socks5out.IsValidAddress(dom)
 }
 
 func isValidNetProto(proto string) bool {

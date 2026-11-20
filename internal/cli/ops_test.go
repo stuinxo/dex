@@ -130,6 +130,10 @@ func TestUpdateRulesAndHTMLRejection(t *testing.T) {
 			_, _ = w.Write([]byte(chnCIDRs))
 		case "/direct.txt":
 			_, _ = w.Write([]byte(chnDomains))
+		case "/apple.txt":
+			_, _ = w.Write([]byte("apple.com\nicloud.com\n"))
+		case "/games.txt":
+			_, _ = w.Write([]byte("steampowered.com\nsteamcontent.com\n"))
 		case "/reject.txt":
 			_, _ = w.Write([]byte("ads.example.com\ntracker.example.com\n"))
 		default:
@@ -146,9 +150,13 @@ func TestUpdateRulesAndHTMLRejection(t *testing.T) {
 		GeoSiteURL:      srv.URL + "/geosite.dat",
 		ChnRouteURL:     srv.URL + "/cn.txt",
 		DomainsChnURL:   srv.URL + "/direct.txt",
+		DomainsAppleURL: srv.URL + "/apple.txt",
+		DomainsGamesURL: srv.URL + "/games.txt",
 		DomainsAdsURL:   srv.URL + "/reject.txt",
 		MinChnRouteCIDR: 2,
 		MinChnDomains:   2,
+		MinAppleDomains: 2,
+		MinGamesDomains: 2,
 		MinAdsDomains:   2,
 	}
 
@@ -300,6 +308,10 @@ func TestUpdateRulesRestoresBackupOnReconcileFailure(t *testing.T) {
 			} else {
 				_, _ = w.Write([]byte(v1Dom))
 			}
+		case "/apple.txt":
+			_, _ = w.Write([]byte("apple.com\nicloud.com\n"))
+		case "/games.txt":
+			_, _ = w.Write([]byte("steampowered.com\nsteamcontent.com\n"))
 		case "/reject.txt":
 			_, _ = w.Write([]byte("ads.example.com\ntracker.example.com\n"))
 		default:
@@ -329,9 +341,13 @@ func TestUpdateRulesRestoresBackupOnReconcileFailure(t *testing.T) {
 		GeoSiteURL:      srv.URL + "/geosite.dat",
 		ChnRouteURL:     srv.URL + "/cn.txt",
 		DomainsChnURL:   srv.URL + "/direct.txt",
+		DomainsAppleURL: srv.URL + "/apple.txt",
+		DomainsGamesURL: srv.URL + "/games.txt",
 		DomainsAdsURL:   srv.URL + "/reject.txt",
 		MinChnRouteCIDR: 2,
 		MinChnDomains:   2,
+		MinAppleDomains: 2,
+		MinGamesDomains: 2,
 		MinAdsDomains:   2,
 	}
 
@@ -379,6 +395,15 @@ func TestMigrateCleanupV2OrderSafetyAndRestore(t *testing.T) {
 	_ = os.MkdirAll(v2NFTDir, 0o755)
 	_ = os.WriteFile(filepath.Join(v2NFTDir, "flowtable_eth.sh"), []byte("#!/bin/bash\n"), 0o755)
 	_ = os.WriteFile(filepath.Join(v2NFTDir, "nftables"), []byte("table ip de_GWD {}\n"), 0o644)
+
+	nginxConfDir := filepath.Join(root, "etc", "nginx", "conf.d")
+	_ = os.MkdirAll(nginxConfDir, 0o755)
+	legacyDefault := filepath.Join(nginxConfDir, "default.conf")
+	legacy80 := filepath.Join(nginxConfDir, "80.conf")
+	unrelatedNginx := filepath.Join(nginxConfDir, "other.conf")
+	_ = os.WriteFile(legacyDefault, []byte("server { location /dq { proxy_pass http://127.0.0.1:9853; } }\n"), 0o644)
+	_ = os.WriteFile(legacy80, []byte("# de_GWD 80 redirect\nserver { listen 80; }\n"), 0o644)
+	_ = os.WriteFile(unrelatedNginx, []byte("server { listen 8088; }\n"), 0o644)
 
 	// 1. --cleanup-v2 without --apply is rejected without touching v2 services.
 	execNoApply := &fakeOpsExec{
@@ -465,6 +490,35 @@ func TestMigrateCleanupV2OrderSafetyAndRestore(t *testing.T) {
 	if !strings.Contains(strings.Join(execFail.startedSvcs, ","), "vtrui") || !strings.Contains(strings.Join(execFail.startedSvcs, ","), "mosdns") {
 		t.Fatalf("expected previously active v2 services restored, startedSvcs=%v", execFail.startedSvcs)
 	}
+	if b, err := os.ReadFile(legacyDefault); err != nil || !strings.Contains(string(b), "/dq") {
+		t.Fatalf("expected legacy default.conf restored on Reconcile failure, err=%v", err)
+	}
+	if b, err := os.ReadFile(legacy80); err != nil || !strings.Contains(string(b), "de_GWD") {
+		t.Fatalf("expected legacy 80.conf restored on Reconcile failure, err=%v", err)
+	}
+	if b, err := os.ReadFile(unrelatedNginx); err != nil || !strings.Contains(string(b), "8088") {
+		t.Fatalf("expected unrelated nginx config untouched, err=%v", err)
+	}
+
+	// 3. Direct cleanupLegacyV2WithPaths removes legacy nginx files, keeps unrelated ones, and restore reloads active nginx
+	snapExec := &fakeOpsExec{activeSvcs: map[string]bool{"nginx": true}}
+	snap := cleanupLegacyV2WithPaths(context.Background(), snapExec, v2NFTDir, nginxConfDir, &out)
+	if _, err := os.Stat(legacyDefault); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy default.conf removed during cleanup")
+	}
+	if _, err := os.Stat(legacy80); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy 80.conf removed during cleanup")
+	}
+	if _, err := os.Stat(unrelatedNginx); err != nil {
+		t.Fatalf("expected unrelated nginx conf preserved during cleanup, err=%v", err)
+	}
+	snap.restore(context.Background(), snapExec, &out)
+	if _, err := os.Stat(legacyDefault); err != nil {
+		t.Fatalf("expected legacy default.conf restored by snap.restore, err=%v", err)
+	}
+	if strings.Join(snapExec.reloaded, ",") != "nginx" {
+		t.Fatalf("expected active nginx reloaded after restoring legacy nginx configs, got %v", snapExec.reloaded)
+	}
 }
 
 func TestUpdateRulesRestartsAffectedServices(t *testing.T) {
@@ -472,6 +526,8 @@ func TestUpdateRulesRestartsAffectedServices(t *testing.T) {
 	geosite := []byte("geosite-v1")
 	chnCIDRs := "1.0.1.0/24\n1.0.2.0/23\n"
 	chnDomains := "qq.com\nbaidu.com\n"
+	appleDomains := "apple.com\nicloud.com\n"
+	gamesDomains := "steampowered.com\nsteamcontent.com\n"
 	adsDomains := "ads.example.com\ntracker.example.com\n"
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -490,6 +546,10 @@ func TestUpdateRulesRestartsAffectedServices(t *testing.T) {
 			_, _ = w.Write([]byte(chnCIDRs))
 		case "/direct.txt":
 			_, _ = w.Write([]byte(chnDomains))
+		case "/apple.txt":
+			_, _ = w.Write([]byte(appleDomains))
+		case "/games.txt":
+			_, _ = w.Write([]byte(gamesDomains))
 		case "/reject.txt":
 			_, _ = w.Write([]byte(adsDomains))
 		default:
@@ -512,9 +572,13 @@ func TestUpdateRulesRestartsAffectedServices(t *testing.T) {
 		GeoSiteURL:      srv.URL + "/geosite.dat",
 		ChnRouteURL:     srv.URL + "/cn.txt",
 		DomainsChnURL:   srv.URL + "/direct.txt",
+		DomainsAppleURL: srv.URL + "/apple.txt",
+		DomainsGamesURL: srv.URL + "/games.txt",
 		DomainsAdsURL:   srv.URL + "/reject.txt",
 		MinChnRouteCIDR: 2,
 		MinChnDomains:   2,
+		MinAppleDomains: 2,
+		MinGamesDomains: 2,
 		MinAdsDomains:   2,
 	}
 
@@ -550,7 +614,27 @@ func TestUpdateRulesRestartsAffectedServices(t *testing.T) {
 		t.Fatalf("expected only [dex-mosdns] restarted on Domains.chn.txt change, got %v", exec.restarted)
 	}
 
-	// 4. Only geoip.dat changed -> restarts only dex-xray.
+	// 4. Only Domains.apple.txt changed -> restarts only dex-mosdns.
+	exec.restarted = nil
+	appleDomains = "apple.com\nicloud.com\nmzstatic.com\n"
+	if err := UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
+		t.Fatalf("Domains.apple.txt UpdateRules failed: %v", err)
+	}
+	if strings.Join(exec.restarted, ",") != "dex-mosdns" {
+		t.Fatalf("expected only [dex-mosdns] restarted on Domains.apple.txt change, got %v", exec.restarted)
+	}
+
+	// 5. Only Domains.games.txt changed -> restarts only dex-mosdns.
+	exec.restarted = nil
+	gamesDomains = "steampowered.com\nsteamcontent.com\nvalvesoftware.com\n"
+	if err := UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
+		t.Fatalf("Domains.games.txt UpdateRules failed: %v", err)
+	}
+	if strings.Join(exec.restarted, ",") != "dex-mosdns" {
+		t.Fatalf("expected only [dex-mosdns] restarted on Domains.games.txt change, got %v", exec.restarted)
+	}
+
+	// 6. Only geoip.dat changed -> restarts only dex-xray.
 	exec.restarted = nil
 	geoip = []byte("geoip-v2")
 	if err := UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
@@ -560,7 +644,7 @@ func TestUpdateRulesRestartsAffectedServices(t *testing.T) {
 		t.Fatalf("expected only [dex-xray] restarted on geoip.dat change, got %v", exec.restarted)
 	}
 
-	// 5. Only IPchnroute changed -> restarts only dex-mosdns.
+	// 7. Only IPchnroute changed -> restarts only dex-mosdns.
 	exec.restarted = nil
 	chnCIDRs = "1.0.1.0/24\n223.5.5.0/24\n"
 	if err := UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
@@ -568,5 +652,29 @@ func TestUpdateRulesRestartsAffectedServices(t *testing.T) {
 	}
 	if strings.Join(exec.restarted, ",") != "dex-mosdns" {
 		t.Fatalf("expected only [dex-mosdns] restarted on IPchnroute change, got %v", exec.restarted)
+	}
+}
+
+func TestMenuOption8RestartsDaemon(t *testing.T) {
+	dir := t.TempDir()
+	store := state.NewStore(dir)
+	st := state.NewDefaultState(state.RoleClient)
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	exec := &fakeOpsExec{
+		activeSvcs: map[string]bool{"dex-daemon": true},
+	}
+	var out, errBuf bytes.Buffer
+	code := runInteractiveMenu(store, exec, strings.NewReader("8\n9443\nq\n"), &out, &errBuf)
+	if code != 0 {
+		t.Fatalf("menu exited %d: %s", code, errBuf.String())
+	}
+	loaded, _ := store.Load()
+	if loaded.Auth.ListenAddr != ":9443" {
+		t.Fatalf("expected ListenAddr :9443, got %q", loaded.Auth.ListenAddr)
+	}
+	if strings.Join(exec.restarted, ",") != "dex-daemon" {
+		t.Fatalf("expected dex-daemon restarted after option 8 port change, got %v", exec.restarted)
 	}
 }

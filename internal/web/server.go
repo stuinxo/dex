@@ -34,10 +34,10 @@ import (
 var embeddedUI embed.FS
 
 const (
-	sessionCookieName = "dex_session"
-	sessionTTL        = 12 * time.Hour
-	rateLimitWindow   = 60 * time.Second
-	rateLimitMaxFails = 10
+	sessionCookieName  = "dex_session"
+	sessionTTL         = 12 * time.Hour
+	rateLimitWindow    = 60 * time.Second
+	rateLimitMaxFails  = 10
 	secretKeepSentinel = "********"
 )
 
@@ -762,7 +762,7 @@ func (s *Server) handleDDNSSync(w http.ResponseWriter, r *http.Request, _ *sessi
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	res, err := s.DDNS.SyncOnce(r.Context(), st.Client.DDNS.Domain, st.Client.DDNS.CFToken, st.Client.DDNS.EnableIPv6, true)
+	res, err := s.DDNS.SyncOnceWithEmail(r.Context(), st.Client.DDNS.Domain, st.Client.DDNS.CFToken, st.Client.DDNS.CFEmail, st.Client.DDNS.EnableIPv6, true)
 	if err != nil {
 		s.Hub.Log("ERROR", "ddns", err.Error())
 		writeJSONError(w, http.StatusBadGateway, err.Error())

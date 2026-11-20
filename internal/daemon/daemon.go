@@ -66,7 +66,7 @@ func (r *Runner) RunLoops(ctx context.Context) {
 			if err != nil || st.Role != state.RoleClient || !st.Client.DDNS.Enabled {
 				continue
 			}
-			if _, err := r.DDNS.SyncOnce(ctx, st.Client.DDNS.Domain, st.Client.DDNS.CFToken, st.Client.DDNS.EnableIPv6, false); err != nil {
+			if _, err := r.DDNS.SyncOnceWithEmail(ctx, st.Client.DDNS.Domain, st.Client.DDNS.CFToken, st.Client.DDNS.CFEmail, st.Client.DDNS.EnableIPv6, false); err != nil {
 				r.Hub.Log("WARN", "ddns", fmt.Sprintf("sync failed: %v", err))
 			}
 		}

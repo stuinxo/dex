@@ -211,3 +211,86 @@ func TestStoreWithApplyLockWaitWarning(t *testing.T) {
 		t.Fatalf("expected OnApplyLockWait called once after >1s wait, got %d", got)
 	}
 }
+
+func TestWave1StateValidationAdditions(t *testing.T) {
+	// vmess-tcp node allowed without path
+	c := NewDefaultState(RoleClient)
+	c.Client.Nodes = []OutboundNode{{
+		ID:       "v2-tcp",
+		Name:     "LegacyTCP",
+		Protocol: "vmess-tcp",
+		Address:  "node.example.com",
+		Port:     10443,
+		UUID:     "11111111-1111-4111-8111-111111111111",
+	}}
+	c.Client.ActiveNodeID = "v2-tcp"
+	c.Client.DNS.Hosts["*.lan.home"] = "192.168.10.2"
+	c.Client.DNS.Hosts["domain:corp.internal"] = "10.0.0.5"
+	c.Client.DNS.Hosts["full:exact.home"] = "192.168.10.3"
+	c.Client.DNS.BlockExternal53 = true
+	c.Client.FWD0 = FWD0Config{
+		Enabled:  true,
+		Protocol: "vmess-tcp",
+		Port:     1443,
+		UUIDs:    []string{"22222222-2222-4222-8222-222222222222"},
+	}
+	c.Client.FWD1 = FWD1Config{
+		Enabled:        true,
+		Protocol:       "vmess-tcp",
+		Port:           2443,
+		UUIDs:          []string{"33333333-3333-4333-8333-333333333333"},
+		UpstreamNodeID: "v2-tcp",
+	}
+	c.Client.RproxyC = RproxyCConfig{
+		Enabled:              true,
+		TunnelAddress:        "198.51.100.2",
+		TunnelPort:           20000,
+		TunnelUUID:           "44444444-4444-4444-8444-444444444444",
+		Security:             "tls",
+		ServerName:           "tun.example.com",
+		PinnedPeerCertSha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		OutDirect:            true,
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("expected valid Wave 1 client state, got %v", err)
+	}
+
+	cBadHost := NewDefaultState(RoleClient)
+	cBadHost.Client.DNS.Hosts["*bad.example.com"] = "1.2.3.4"
+	if err := cBadHost.Validate(); err == nil {
+		t.Fatalf("expected invalid wildcard host rejected")
+	}
+
+	cBadSec := NewDefaultState(RoleClient)
+	cBadSec.Client.RproxyC = RproxyCConfig{
+		Enabled:       true,
+		TunnelAddress: "198.51.100.2",
+		TunnelPort:    20000,
+		TunnelUUID:    "44444444-4444-4444-8444-444444444444",
+		Security:      "xtls",
+	}
+	if err := cBadSec.Validate(); err == nil {
+		t.Fatalf("expected invalid rproxyc.security rejected")
+	}
+
+	// Server protocols: vmess-ws / vless-ws + RproxyS InUUIDs & Security
+	srv := NewDefaultState(RoleServer)
+	srv.Server.Protocol = "vmess-ws"
+	srv.Server.Domain = "srv.example.com"
+	srv.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	srv.RproxyS = RproxySConfig{
+		Enabled:    true,
+		ListenPort: 20000,
+		Security:   "none",
+		UUIDs:      []string{"22222222-2222-4222-8222-222222222222"},
+		InUUIDs:    []string{"33333333-3333-4333-8333-333333333333"},
+	}
+	if err := srv.Validate(); err != nil {
+		t.Fatalf("expected valid server vmess-ws + rproxys state, got %v", err)
+	}
+
+	srv.Server.Protocol = "vmess-tcp"
+	if err := srv.Validate(); err == nil {
+		t.Fatalf("expected unsupported server.protocol rejected")
+	}
+}

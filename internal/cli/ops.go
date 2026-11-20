@@ -3,6 +3,7 @@ package cli
 import (
 	"archive/zip"
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -29,6 +30,8 @@ type OpsConfig struct {
 	ChnRouteURL     string
 	DomainsChnURL   string
 	DomainsAdsURL   string
+	DomainsAppleURL string
+	DomainsGamesURL string
 	DexRepo         string
 	DexReleaseBase  string // optional override base URL instead of GitHub repo releases
 	XrayReleaseBase string
@@ -40,6 +43,8 @@ type OpsConfig struct {
 	MinChnRouteCIDR int
 	MinChnDomains   int
 	MinAdsDomains   int
+	MinAppleDomains int
+	MinGamesDomains int
 }
 
 func (c OpsConfig) withDefaults(versionTag string) OpsConfig {
@@ -60,6 +65,12 @@ func (c OpsConfig) withDefaults(versionTag string) OpsConfig {
 	}
 	if c.DomainsAdsURL == "" {
 		c.DomainsAdsURL = "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/reject-list.txt"
+	}
+	if c.DomainsAppleURL == "" {
+		c.DomainsAppleURL = "https://raw.githubusercontent.com/stuinxo/de_GWD/main/resource/chnroute/mosdns_chnlist/Domains.apple.txt"
+	}
+	if c.DomainsGamesURL == "" {
+		c.DomainsGamesURL = "https://raw.githubusercontent.com/stuinxo/de_GWD/main/resource/chnroute/mosdns_chnlist/Domains.games.txt"
 	}
 	if c.DexRepo == "" {
 		c.DexRepo = strings.TrimSpace(os.Getenv("DEX_REPO"))
@@ -101,6 +112,12 @@ func (c OpsConfig) withDefaults(versionTag string) OpsConfig {
 	if c.MinAdsDomains <= 0 {
 		c.MinAdsDomains = 1000
 	}
+	if c.MinAppleDomains <= 0 {
+		c.MinAppleDomains = 100
+	}
+	if c.MinGamesDomains <= 0 {
+		c.MinGamesDomains = 100
+	}
 	return c
 }
 
@@ -131,14 +148,14 @@ func cmdRules(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 func printRulesStatus(store *state.Store, stdout io.Writer) int {
 	rulesDir := filepath.Join(store.Dir, "rules")
 	fmt.Fprintf(stdout, "Rules Directory: %s\n", rulesDir)
-	for _, name := range []string{"geoip.dat", "geosite.dat", "IPchnroute", "Domains.chn.txt", "Domains.ads.txt"} {
+	for _, name := range []string{"geoip.dat", "geosite.dat", "IPchnroute", "Domains.chn.txt", "Domains.apple.txt", "Domains.games.txt", "Domains.ads.txt"} {
 		p := filepath.Join(rulesDir, name)
 		info, err := os.Stat(p)
 		if err != nil {
-			fmt.Fprintf(stdout, "  %-16s missing\n", name)
+			fmt.Fprintf(stdout, "  %-18s missing\n", name)
 			continue
 		}
-		fmt.Fprintf(stdout, "  %-16s %8d KB  (%s)\n", name, info.Size()/1024, info.ModTime().Format(time.RFC3339))
+		fmt.Fprintf(stdout, "  %-18s %8d KB  (%s)\n", name, info.Size()/1024, info.ModTime().Format(time.RFC3339))
 	}
 	return 0
 }
@@ -191,6 +208,20 @@ func UpdateRules(ctx context.Context, store *state.Store, exec reconcile.SystemE
 		return failWithRestore(fmt.Errorf("update Domains.chn.txt: %w", err))
 	}
 
+	if stdout != nil {
+		fmt.Fprintf(stdout, "[*] Updating Domains.apple.txt & Domains.games.txt...\n")
+	}
+	if err := downloadAndValidateTextRule(ctx, cfg.Client, cfg.DomainsAppleURL, filepath.Join(rulesDir, "Domains.apple.txt"), func(path string) error {
+		return validateDomainListFile(path, cfg.MinAppleDomains)
+	}); err != nil {
+		return failWithRestore(fmt.Errorf("update Domains.apple.txt: %w", err))
+	}
+	if err := downloadAndValidateTextRule(ctx, cfg.Client, cfg.DomainsGamesURL, filepath.Join(rulesDir, "Domains.games.txt"), func(path string) error {
+		return validateDomainListFile(path, cfg.MinGamesDomains)
+	}); err != nil {
+		return failWithRestore(fmt.Errorf("update Domains.games.txt: %w", err))
+	}
+
 	if includeAds {
 		if stdout != nil {
 			fmt.Fprintf(stdout, "[*] Updating Domains.ads.txt...\n")
@@ -211,11 +242,11 @@ func UpdateRules(ctx context.Context, store *state.Store, exec reconcile.SystemE
 		}
 		// Restart services that read rule files directly outside RenderBundle:
 		// xray reads geoip.dat / geosite.dat via XRAY_LOCATION_ASSET;
-		// mosdns reads IPchnroute / Domains.chn.txt / Domains.ads.txt.
+		// mosdns reads IPchnroute / Domains.chn.txt / Domains.apple.txt / Domains.games.txt / Domains.ads.txt.
 		if anyRuleFileChanged(backups, "geoip.dat", "geosite.dat") {
 			restartIfActive(ctx, exec, "dex-xray")
 		}
-		if anyRuleFileChanged(backups, "IPchnroute", "Domains.chn.txt", "Domains.ads.txt") {
+		if anyRuleFileChanged(backups, "IPchnroute", "Domains.chn.txt", "Domains.apple.txt", "Domains.games.txt", "Domains.ads.txt") {
 			restartIfActive(ctx, exec, "dex-mosdns")
 		}
 		if stdout != nil {
@@ -313,7 +344,7 @@ func backupRulesFiles(rulesDir string) ([]ruleFileBackup, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	names := []string{"geoip.dat", "geosite.dat", "IPchnroute", "Domains.chn.txt", "Domains.ads.txt"}
+	names := []string{"geoip.dat", "geosite.dat", "IPchnroute", "Domains.chn.txt", "Domains.apple.txt", "Domains.games.txt", "Domains.ads.txt"}
 	backups := make([]ruleFileBackup, 0, len(names))
 	for _, name := range names {
 		live := filepath.Join(rulesDir, name)
@@ -785,18 +816,29 @@ var legacyV2NFTTables = []struct {
 	{family: "inet", table: "router"},
 }
 
+type nginxFileBackup struct {
+	path    string
+	content []byte
+	mode    os.FileMode
+}
+
 type v2CleanupSnapshot struct {
 	initSys          string
 	activeServices   []string
 	piholeWasRunning bool
 	nftDir           string
+	nginxBackups     []nginxFileBackup
 }
 
 func cleanupLegacyV2(ctx context.Context, exec reconcile.SystemExecutor, stdout io.Writer) *v2CleanupSnapshot {
-	return cleanupLegacyV2WithNFTDir(ctx, exec, "/opt/de_GWD/nftables", stdout)
+	return cleanupLegacyV2WithPaths(ctx, exec, "/opt/de_GWD/nftables", "/etc/nginx/conf.d", stdout)
 }
 
 func cleanupLegacyV2WithNFTDir(ctx context.Context, exec reconcile.SystemExecutor, v2NFTDir string, stdout io.Writer) *v2CleanupSnapshot {
+	return cleanupLegacyV2WithPaths(ctx, exec, v2NFTDir, "/etc/nginx/conf.d", stdout)
+}
+
+func cleanupLegacyV2WithPaths(ctx context.Context, exec reconcile.SystemExecutor, v2NFTDir, nginxConfDir string, stdout io.Writer) *v2CleanupSnapshot {
 	initSys := exec.DetectInitSystem()
 	snap := &v2CleanupSnapshot{
 		initSys: initSys,
@@ -821,8 +863,29 @@ func cleanupLegacyV2WithNFTDir(ctx context.Context, exec reconcile.SystemExecuto
 			_, _ = exec.RunCommand(ctx, nil, "nft", "delete", "table", t.family, t.table)
 		}
 	}
+	if nginxConfDir != "" {
+		for _, name := range []string{"default.conf", "80.conf"} {
+			p := filepath.Join(nginxConfDir, name)
+			info, err := os.Stat(p)
+			if err != nil || info.IsDir() {
+				continue
+			}
+			b, rerr := os.ReadFile(p)
+			if rerr != nil {
+				continue
+			}
+			if bytes.Contains(b, []byte("de_GWD")) || bytes.Contains(b, []byte("9890")) || bytes.Contains(b, []byte("/dq")) {
+				snap.nginxBackups = append(snap.nginxBackups, nginxFileBackup{
+					path:    p,
+					content: b,
+					mode:    info.Mode().Perm(),
+				})
+				_ = os.Remove(p)
+			}
+		}
+	}
 	if stdout != nil {
-		fmt.Fprintln(stdout, "[+] Stopped legacy v2 services, pihole container (if running), and v2 nft tables.")
+		fmt.Fprintln(stdout, "[+] Stopped legacy v2 services, pihole container (if running), legacy nginx configs, and v2 nft tables.")
 	}
 	return snap
 }
@@ -830,6 +893,13 @@ func cleanupLegacyV2WithNFTDir(ctx context.Context, exec reconcile.SystemExecuto
 func (s *v2CleanupSnapshot) restore(ctx context.Context, exec reconcile.SystemExecutor, stdout io.Writer) {
 	if s == nil {
 		return
+	}
+	for _, nb := range s.nginxBackups {
+		_ = os.MkdirAll(filepath.Dir(nb.path), 0o755)
+		_ = os.WriteFile(nb.path, nb.content, nb.mode)
+	}
+	if len(s.nginxBackups) > 0 && exec != nil && exec.ServiceIsActive(ctx, s.initSys, "nginx") {
+		_ = exec.ServiceReload(ctx, s.initSys, "nginx")
 	}
 	for _, svc := range s.activeServices {
 		_ = exec.ServiceEnableStart(ctx, s.initSys, svc)

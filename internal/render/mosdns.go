@@ -2,6 +2,7 @@ package render
 
 import (
 	"fmt"
+	"net"
 	"net/netip"
 	"net/url"
 	"path/filepath"
@@ -58,7 +59,11 @@ func RenderMosDNS(s *state.State, opts RenderOptions) ([]RenderedFile, bool, err
 	}
 	sort.Strings(hostKeys)
 	for _, dom := range hostKeys {
-		hostLines = append(hostLines, fmt.Sprintf("%s %s", dom, s.Client.DNS.Hosts[dom]))
+		hostKey := dom
+		if rest, ok := strings.CutPrefix(dom, "*."); ok && rest != "" {
+			hostKey = "domain:" + rest
+		}
+		hostLines = append(hostLines, fmt.Sprintf("%s %s", hostKey, s.Client.DNS.Hosts[dom]))
 	}
 
 	// Build node domain list so proxy server domains resolve cleanly via encrypted global DNS
@@ -119,20 +124,21 @@ func RenderMosDNS(s *state.State, opts RenderOptions) ([]RenderedFile, bool, err
 		if srv == "" {
 			continue
 		}
-		if !strings.Contains(srv, "://") && !strings.Contains(srv, ":") {
-			srv = srv + ":53"
+		if !strings.Contains(srv, "://") {
+			if ip, err := netip.ParseAddr(strings.Trim(srv, "[]")); err == nil {
+				srv = net.JoinHostPort(ip.String(), "53")
+			} else if _, _, err := net.SplitHostPort(srv); err != nil {
+				srv = net.JoinHostPort(srv, "53")
+			}
 		}
 		fmt.Fprintf(&yaml, "        - addr: %q\n", srv)
 	}
 
 	yaml.WriteString("\n  - tag: forward_global\n    type: forward\n    args:\n      concurrent: 2\n      upstreams:\n")
 	for _, srv := range dohServers {
-		srv = strings.TrimSpace(srv)
+		srv = NormalizeDoHUpstream(srv)
 		if srv == "" {
 			continue
-		}
-		if !strings.HasPrefix(srv, "https://") && !strings.HasPrefix(srv, "tls://") && !strings.HasPrefix(srv, "tcp://") {
-			srv = "https://" + srv
 		}
 		fmt.Fprintf(&yaml, "        - addr: %q\n", srv)
 		if parsed, err := url.Parse(srv); err == nil && parsed.Hostname() != "" {
@@ -173,18 +179,36 @@ func RenderMosDNS(s *state.State, opts RenderOptions) ([]RenderedFile, bool, err
 	}
 	yaml.WriteString("      - exec: $hosts\n      - exec: jump has_resp_sequence\n")
 	yaml.WriteString("      - exec: $cache\n      - exec: jump has_resp_sequence\n")
+	fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: $forward_chn\n      - exec: jump has_resp_sequence\n", whitePath)
 	if s.Client.DNS.BlockAds {
 		adsPath := filepath.Join(opts.StateDir, "rules", "Domains.ads.txt")
 		fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: reject 3\n", adsPath)
 	}
 	fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: goto global_sequence\n", blackPath)
-	fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: $forward_chn\n      - exec: jump has_resp_sequence\n", whitePath)
 	fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: goto global_sequence\n", nodesPath)
+	if opts.DomainsAppleExists {
+		if s.Client.Routing.AppleNodeID != "" {
+			fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: goto global_sequence\n", opts.DomainsApplePath)
+		} else {
+			fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: $chn_sequence\n      - exec: jump has_resp_sequence\n", opts.DomainsApplePath)
+		}
+	}
+	if opts.DomainsGamesExists {
+		if s.Client.Routing.SteamProxy {
+			fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: goto global_sequence\n", opts.DomainsGamesPath)
+		} else {
+			fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: $chn_sequence\n      - exec: jump has_resp_sequence\n", opts.DomainsGamesPath)
+		}
+	}
 	fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: $fallback\n      - exec: jump has_resp_sequence\n", opts.DomainsChnPath)
 	yaml.WriteString("      - exec: goto global_sequence\n\n")
 
 	yaml.WriteString("  - type: udp_server\n    args:\n      entry: main_sequence\n      listen: 0.0.0.0:53\n\n")
 	yaml.WriteString("  - type: tcp_server\n    args:\n      entry: main_sequence\n      listen: 0.0.0.0:53\n")
+	if s.System.EnableIPv6 {
+		yaml.WriteString("\n  - type: udp_server\n    args:\n      entry: main_sequence\n      listen: \"[::]:53\"\n\n")
+		yaml.WriteString("  - type: tcp_server\n    args:\n      entry: main_sequence\n      listen: \"[::]:53\"\n")
+	}
 
 	files := []RenderedFile{
 		{

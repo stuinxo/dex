@@ -573,7 +573,8 @@ func cmdCert(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 		fs := flag.NewFlagSet("cert issue", flag.ContinueOnError)
 		fs.SetOutput(stderr)
 		dom := fs.String("domain", "", "domain")
-		tok := fs.String("cf-token", "", "Cloudflare API Token")
+		tok := fs.String("cf-token", "", "Cloudflare API Token (or Global API Key with --cf-email)")
+		email := fs.String("cf-email", "", "Cloudflare account email (for Global API Key)")
 		renew := fs.Bool("renew", false, "keep CF token for automatic renewal")
 		if err := fs.Parse(rest); err != nil {
 			return 2
@@ -588,9 +589,13 @@ func cmdCert(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 		if *tok == "" && st != nil {
 			*tok = st.Cert.CFToken
 		}
+		if *email == "" && st != nil {
+			*email = st.Cert.CFEmail
+		}
 		rep, err := cert.IssueCloudflareACME(context.Background(), nil, cert.ACMEConfig{
 			Domain:    *dom,
 			CFToken:   *tok,
+			CFEmail:   *email,
 			AutoRenew: *renew,
 			CertPath:  store.DefaultCert(),
 			KeyPath:   store.DefaultKey(),
@@ -607,8 +612,10 @@ func cmdCert(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 				cur.Cert.AutoRenew = *renew
 				if *renew {
 					cur.Cert.CFToken = *tok
+					cur.Cert.CFEmail = *email
 				} else {
 					cur.Cert.CFToken = ""
+					cur.Cert.CFEmail = ""
 				}
 				return nil
 			})
@@ -839,7 +846,8 @@ func cmdDDNS(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 		fs := flag.NewFlagSet("ddns set", flag.ContinueOnError)
 		fs.SetOutput(stderr)
 		dom := fs.String("domain", "", "domain")
-		tok := fs.String("token", "", "Cloudflare API Token")
+		tok := fs.String("token", "", "Cloudflare API Token or Global Key")
+		email := fs.String("email", "", "Cloudflare email (for Global API Key)")
 		v6 := fs.Bool("ipv6", false, "also update AAAA")
 		if err := fs.Parse(args[1:]); err != nil {
 			return 2
@@ -850,6 +858,7 @@ func cmdDDNS(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 				Provider:   "cloudflare",
 				Domain:     *dom,
 				CFToken:    *tok,
+				CFEmail:    *email,
 				EnableIPv6: *v6,
 			}
 			return nil
@@ -866,7 +875,7 @@ func cmdDDNS(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 			return 1
 		}
 		d := daemon.NewCloudflareDDNS(nil)
-		res, err := d.SyncOnce(context.Background(), st.Client.DDNS.Domain, st.Client.DDNS.CFToken, st.Client.DDNS.EnableIPv6, true)
+		res, err := d.SyncOnceWithEmail(context.Background(), st.Client.DDNS.Domain, st.Client.DDNS.CFToken, st.Client.DDNS.CFEmail, st.Client.DDNS.EnableIPv6, true)
 		if err != nil {
 			fmt.Fprintf(stderr, "ddns sync failed: %v\n", err)
 			return 1
@@ -1638,7 +1647,11 @@ func runMigrateWithExec(store *state.Store, exec reconcile.SystemExecutor, v2NFT
 			fmt.Fprintf(stderr, "migrate dry-run validation failed (legacy v2 untouched): %v\n", err)
 			return 1
 		}
-		snap := cleanupLegacyV2WithNFTDir(ctx, exec, v2NFTDir, stdout)
+		nginxConfDir := "/etc/nginx/conf.d"
+		if baseOpts.RootPrefix != "" {
+			nginxConfDir = filepath.Join(baseOpts.RootPrefix, "etc", "nginx", "conf.d")
+		}
+		snap := cleanupLegacyV2WithPaths(ctx, exec, v2NFTDir, nginxConfDir, stdout)
 		if _, err := reconcile.Reconcile(ctx, store, exec, baseOpts); err != nil {
 			snap.restore(ctx, exec, stderr)
 			fmt.Fprintf(stderr, "apply failed after v2 cleanup (legacy v2 restored): %v\n", err)

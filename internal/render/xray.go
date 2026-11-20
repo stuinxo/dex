@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/stuinxo/de_GWD/v3/internal/state"
 )
@@ -155,6 +156,26 @@ func buildClientOutbound(tag string, n state.OutboundNode, mark int) map[string]
 				"sockopt": sockopt,
 			},
 		}
+	case "vmess-tcp":
+		return map[string]any{
+			"tag":      tag,
+			"protocol": "vmess",
+			"settings": map[string]any{
+				"vnext": []map[string]any{{
+					"address": n.Address,
+					"port":    port,
+					"users": []map[string]any{{
+						"id":       n.UUID,
+						"alterId":  0,
+						"security": "auto",
+					}},
+				}},
+			},
+			"streamSettings": map[string]any{
+				"network": "tcp",
+				"sockopt": sockopt,
+			},
+		}
 	case "socks5":
 		srv := map[string]any{
 			"address": n.Address,
@@ -205,6 +226,166 @@ func buildClientOutbound(tag string, n state.OutboundNode, mark int) map[string]
 				"sockopt": sockopt,
 			},
 		}
+	}
+}
+
+func buildVMessTCPInbound(tag string, port int, uuids []string) map[string]any {
+	clients := make([]map[string]any, 0, len(uuids))
+	for _, u := range uuids {
+		clients = append(clients, map[string]any{
+			"id":      u,
+			"alterId": 0,
+		})
+	}
+	return map[string]any{
+		"tag":      tag,
+		"listen":   "0.0.0.0",
+		"port":     port,
+		"protocol": "vmess",
+		"settings": map[string]any{
+			"clients": clients,
+		},
+		"streamSettings": map[string]any{
+			"network": "tcp",
+		},
+	}
+}
+
+func buildTProxyInbound(tag, listen string, mark int) map[string]any {
+	return map[string]any{
+		"tag":      tag,
+		"port":     9896,
+		"listen":   listen,
+		"protocol": "dokodemo-door",
+		"settings": map[string]any{"network": "tcp,udp", "followRedirect": true},
+		"streamSettings": map[string]any{
+			"sockopt": map[string]any{
+				"tproxy":      "tproxy",
+				"mark":        mark,
+				"tcpFastOpen": false,
+				"tcpMptcp":    true,
+			},
+		},
+		"sniffing": map[string]any{
+			"enabled":      true,
+			"destOverride": []string{"http", "tls", "quic"},
+			"routeOnly":    true,
+			"metadataOnly": false,
+		},
+	}
+}
+
+func normalizeXrayDomainRules(list []string) []string {
+	var out []string
+	for _, raw := range list {
+		r := strings.TrimSpace(raw)
+		if r == "" {
+			continue
+		}
+		if rest, ok := strings.CutPrefix(r, "*."); ok && rest != "" {
+			r = "domain:" + rest
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func buildMainServerInbound(s *state.State, opts RenderOptions) map[string]any {
+	firstUUID := ""
+	if len(s.Server.UUIDs) > 0 {
+		firstUUID = s.Server.UUIDs[0]
+	}
+	proto := s.Server.EffectiveProtocol()
+	path := NormalizePath(s.Server.Path, firstUUID)
+
+	listen := "0.0.0.0"
+	port := s.Server.ListenPort
+	if s.Server.TLSMode == "nginx" {
+		listen = "127.0.0.1"
+		port = 9890
+	}
+
+	netType := "xhttp"
+	netKey := "xhttpSettings"
+	netSettings := map[string]any{
+		"path": path,
+		"mode": "auto",
+	}
+	if proto == "vless-ws" || proto == "vmess-ws" {
+		netType = "ws"
+		netKey = "wsSettings"
+		netSettings = map[string]any{
+			"path": path,
+		}
+	}
+
+	sockopt := map[string]any{
+		"tcpFastOpen": true,
+		"tcpNoDelay":  true,
+	}
+	if s.Server.TLSMode == "nginx" {
+		sockopt = map[string]any{
+			"tcpFastOpen": true,
+			"tcpMptcp":    true,
+		}
+	}
+
+	stream := map[string]any{
+		"network": netType,
+		netKey:    netSettings,
+		"sockopt": sockopt,
+	}
+	if s.Server.TLSMode == "nginx" {
+		stream["security"] = "none"
+	} else {
+		stream["security"] = "tls"
+		stream["tlsSettings"] = map[string]any{
+			"alpn":       []string{"h2", "http/1.1"},
+			"minVersion": "1.2",
+			"certificates": []map[string]any{{
+				"certificateFile": opts.CertFile,
+				"keyFile":         opts.KeyFile,
+			}},
+		}
+	}
+
+	sniff := map[string]any{
+		"enabled":      true,
+		"destOverride": []string{"http", "tls", "quic"},
+		"routeOnly":    true,
+	}
+
+	if proto == "vmess-ws" {
+		clients := make([]map[string]any, 0, len(s.Server.UUIDs))
+		for _, u := range s.Server.UUIDs {
+			clients = append(clients, map[string]any{"id": u, "alterId": 0})
+		}
+		return map[string]any{
+			"tag":            "main",
+			"listen":         listen,
+			"port":           port,
+			"protocol":       "vmess",
+			"settings":       map[string]any{"clients": clients},
+			"streamSettings": stream,
+			"sniffing":       sniff,
+		}
+	}
+
+	clients := make([]map[string]any, 0, len(s.Server.UUIDs))
+	for _, u := range s.Server.UUIDs {
+		clients = append(clients, map[string]any{"id": u})
+	}
+	return map[string]any{
+		"tag":      "main",
+		"listen":   listen,
+		"port":     port,
+		"protocol": "vless",
+		"settings": map[string]any{
+			"clients":    clients,
+			"decryption": "none",
+		},
+		"streamSettings": stream,
+		"sniffing":       sniff,
 	}
 }
 
@@ -411,12 +592,40 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 			})
 		}
 		if s.RproxyS.Enabled {
-			rpsClients := make([]map[string]any, 0, len(s.RproxyS.UUIDs))
+			rpsClients := make([]map[string]any, 0, len(s.RproxyS.UUIDs)+len(s.RproxyS.InUUIDs))
+			seenRPS := make(map[string]struct{}, len(s.RproxyS.UUIDs))
 			for _, u := range s.RproxyS.UUIDs {
+				seenRPS[u] = struct{}{}
 				rpsClients = append(rpsClients, map[string]any{
 					"id":      u,
 					"reverse": map[string]any{"tag": "portal"},
 				})
+			}
+			for _, u := range s.RproxyS.InUUIDs {
+				if _, exists := seenRPS[u]; exists {
+					continue
+				}
+				seenRPS[u] = struct{}{}
+				rpsClients = append(rpsClients, map[string]any{
+					"id": u,
+				})
+			}
+			rpsSec := strings.TrimSpace(s.RproxyS.Security)
+			if rpsSec == "" {
+				rpsSec = "tls"
+			}
+			rpsStream := map[string]any{
+				"network":  "tcp",
+				"security": rpsSec,
+			}
+			if rpsSec == "tls" {
+				rpsStream["tlsSettings"] = map[string]any{
+					"minVersion": "1.2",
+					"certificates": []map[string]any{{
+						"certificateFile": opts.CertFile,
+						"keyFile":         opts.KeyFile,
+					}},
+				}
 			}
 			inbounds = append(inbounds, map[string]any{
 				"tag":      "rps-tunnel",
@@ -427,18 +636,15 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 					"decryption": "none",
 					"clients":    rpsClients,
 				},
-				"streamSettings": map[string]any{
-					"network":  "tcp",
-					"security": "tls",
-					"tlsSettings": map[string]any{
-						"minVersion": "1.2",
-						"certificates": []map[string]any{{
-							"certificateFile": opts.CertFile,
-							"keyFile":         opts.KeyFile,
-						}},
-					},
-				},
+				"streamSettings": rpsStream,
 			})
+			if len(s.RproxyS.InUUIDs) > 0 {
+				rules = append(rules, map[string]any{
+					"type":        "field",
+					"inboundTag":  []string{"rps-tunnel"},
+					"outboundTag": "portal",
+				})
+			}
 			var rpsTags []string
 			for _, m := range s.RproxyS.Mappings {
 				tag := fmt.Sprintf("rps-map-%d", m.Port)
@@ -517,27 +723,10 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 		}
 
 		// Primary TPROXY inbound
-		inbounds = append(inbounds, map[string]any{
-			"tag":      "tproxy-in",
-			"port":     9896,
-			"listen":   "127.0.0.1",
-			"protocol": "dokodemo-door",
-			"settings": map[string]any{"network": "tcp,udp", "followRedirect": true},
-			"streamSettings": map[string]any{
-				"sockopt": map[string]any{
-					"tproxy":      "tproxy",
-					"mark":        clientMark,
-					"tcpFastOpen": false,
-					"tcpMptcp":    true,
-				},
-			},
-			"sniffing": map[string]any{
-				"enabled":      true,
-				"destOverride": []string{"http", "tls", "quic"},
-				"routeOnly":    true,
-				"metadataOnly": false,
-			},
-		})
+		inbounds = append(inbounds, buildTProxyInbound("tproxy-in", "127.0.0.1", clientMark))
+		if s.System.EnableIPv6 {
+			inbounds = append(inbounds, buildTProxyInbound("tproxy-in-v6", "::1", clientMark))
+		}
 
 		// Primary default outbound
 		if active := s.Client.ActiveNode(); active != nil {
@@ -564,16 +753,24 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 
 		// FWD0 inbound (routes into client default/routing pipeline)
 		if s.Client.FWD0.Enabled {
-			inbounds = append(inbounds, buildXHTTPDirectTLSInbound(
-				"forward0", s.Client.FWD0.Port, s.Client.FWD0.UUIDs, s.Client.FWD0.Path, opts.CertFile, opts.KeyFile,
-			))
+			if s.Client.FWD0.EffectiveProtocol() == "vmess-tcp" {
+				inbounds = append(inbounds, buildVMessTCPInbound("forward0", s.Client.FWD0.Port, s.Client.FWD0.UUIDs))
+			} else {
+				inbounds = append(inbounds, buildXHTTPDirectTLSInbound(
+					"forward0", s.Client.FWD0.Port, s.Client.FWD0.UUIDs, s.Client.FWD0.Path, opts.CertFile, opts.KeyFile,
+				))
+			}
 		}
 
 		// FWD1 inbound + dedicated upstream outbound (always freedom/vless safe with finalRules)
 		if s.Client.FWD1.Enabled {
-			inbounds = append(inbounds, buildXHTTPDirectTLSInbound(
-				"forward1", s.Client.FWD1.Port, s.Client.FWD1.UUIDs, s.Client.FWD1.Path, opts.CertFile, opts.KeyFile,
-			))
+			if s.Client.FWD1.EffectiveProtocol() == "vmess-tcp" {
+				inbounds = append(inbounds, buildVMessTCPInbound("forward1", s.Client.FWD1.Port, s.Client.FWD1.UUIDs))
+			} else {
+				inbounds = append(inbounds, buildXHTTPDirectTLSInbound(
+					"forward1", s.Client.FWD1.Port, s.Client.FWD1.UUIDs, s.Client.FWD1.Path, opts.CertFile, opts.KeyFile,
+				))
+			}
 			var upNode *state.OutboundNode
 			if s.Client.FWD1.UpstreamNodeID != "" {
 				upNode = s.Client.FindNode(s.Client.FWD1.UpstreamNodeID)
@@ -641,9 +838,12 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 			})
 		}
 
-		// Apple rule: custom node if selected, otherwise direct
+		// Apple proxy override (when user picked a custom NodeSM node) stays with NodeSM before domain black/white lists;
+		// default Apple/Steam direct rules come after domain black/white lists so blacklisted Apple/Steam domains can match default.
+		appleProxied := false
 		if s.Client.Routing.AppleNodeID != "" {
 			if appleNode := s.Client.FindNode(s.Client.Routing.AppleNodeID); appleNode != nil {
+				appleProxied = true
 				outbounds = append(outbounds, buildClientOutbound("nodeSMapple", *appleNode, clientMark))
 				rules = append(rules, map[string]any{
 					"type":        "field",
@@ -651,15 +851,29 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 					"network":     "tcp,udp",
 					"outboundTag": "nodeSMapple",
 				})
-			} else {
-				rules = append(rules, map[string]any{
-					"type":        "field",
-					"domain":      state.AppleDirectDomains,
-					"network":     "tcp,udp",
-					"outboundTag": "direct",
-				})
 			}
-		} else {
+		}
+
+		// DNS WhitelistDomains -> direct, BlacklistDomains -> default (after NodeCU/NodeSM, before default Apple/Steam direct)
+		if whiteDomains := normalizeXrayDomainRules(s.Client.DNS.WhitelistDomains); len(whiteDomains) > 0 {
+			rules = append(rules, map[string]any{
+				"type":        "field",
+				"domain":      whiteDomains,
+				"network":     "tcp,udp",
+				"outboundTag": "direct",
+			})
+		}
+		if blackDomains := normalizeXrayDomainRules(s.Client.DNS.BlacklistDomains); len(blackDomains) > 0 {
+			rules = append(rules, map[string]any{
+				"type":        "field",
+				"domain":      blackDomains,
+				"network":     "tcp,udp",
+				"outboundTag": "default",
+			})
+		}
+
+		// Default Apple direct rule when no custom proxy node is selected
+		if !appleProxied {
 			rules = append(rules, map[string]any{
 				"type":        "field",
 				"domain":      state.AppleDirectDomains,
@@ -704,6 +918,32 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 			if tPort <= 0 {
 				tPort = 443
 			}
+			rpcSec := strings.TrimSpace(s.Client.RproxyC.Security)
+			if rpcSec == "" {
+				rpcSec = "tls"
+			}
+			rpcStream := map[string]any{
+				"network":  "tcp",
+				"security": rpcSec,
+				"sockopt": map[string]any{
+					"mark":        clientMark,
+					"tcpFastOpen": true,
+					"tcpNoDelay":  true,
+				},
+			}
+			if rpcSec == "tls" {
+				sni := strings.TrimSpace(s.Client.RproxyC.ServerName)
+				if sni == "" {
+					sni = s.Client.RproxyC.TunnelAddress
+				}
+				tlsCfg := map[string]any{
+					"serverName": sni,
+				}
+				if pcs := strings.TrimSpace(s.Client.RproxyC.PinnedPeerCertSha256); pcs != "" {
+					tlsCfg["pinnedPeerCertSha256"] = pcs
+				}
+				rpcStream["tlsSettings"] = tlsCfg
+			}
 			outbounds = append(outbounds, map[string]any{
 				"tag":      "reverseTunnel",
 				"protocol": "vless",
@@ -714,19 +954,9 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 					"encryption": "none",
 					"reverse":    map[string]any{"tag": "bridge"},
 				},
-				"streamSettings": map[string]any{
-					"network":  "tcp",
-					"security": "tls",
-					"tlsSettings": map[string]any{
-						"serverName": s.Client.RproxyC.TunnelAddress,
-					},
-					"sockopt": map[string]any{
-						"mark":        clientMark,
-						"tcpFastOpen": true,
-						"tcpNoDelay":  true,
-					},
-				},
+				"streamSettings": rpcStream,
 			})
+			var bridgeRules []map[string]any
 			for i, m := range s.Client.RproxyC.Mappings {
 				mTag := fmt.Sprintf("mapping%d", i)
 				outbounds = append(outbounds, buildFreedomOutbound(
@@ -734,13 +964,25 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 					clientMark,
 					fmt.Sprintf("%s:%d", m.IntIP, m.IntPort),
 				))
-				rules = append([]map[string]any{{
+				bridgeRules = append(bridgeRules, map[string]any{
 					"type":        "field",
 					"inboundTag":  []string{"bridge"},
+					"ip":          []string{"127.0.0.1"},
 					"port":        strconv.Itoa(m.ExtPort),
 					"network":     m.Proto,
 					"outboundTag": mTag,
-				}}, rules...)
+				})
+			}
+			if s.Client.RproxyC.OutDirect {
+				outbounds = append(outbounds, buildFreedomOutbound("directOut", clientMark, ""))
+				bridgeRules = append(bridgeRules, map[string]any{
+					"type":        "field",
+					"inboundTag":  []string{"bridge"},
+					"outboundTag": "directOut",
+				})
+			}
+			if len(bridgeRules) > 0 {
+				rules = append(bridgeRules, rules...)
 			}
 		}
 
@@ -749,47 +991,7 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 	case state.RoleServer, state.RoleLanding:
 		needed = true
 		// Main inbound
-		firstUUID := ""
-		if len(s.Server.UUIDs) > 0 {
-			firstUUID = s.Server.UUIDs[0]
-		}
-		if s.Server.TLSMode == "nginx" {
-			clients := make([]map[string]any, 0, len(s.Server.UUIDs))
-			for _, u := range s.Server.UUIDs {
-				clients = append(clients, map[string]any{"id": u})
-			}
-			inbounds = append(inbounds, map[string]any{
-				"tag":      "main",
-				"listen":   "127.0.0.1",
-				"port":     9890,
-				"protocol": "vless",
-				"settings": map[string]any{
-					"clients":    clients,
-					"decryption": "none",
-				},
-				"streamSettings": map[string]any{
-					"network":  "xhttp",
-					"security": "none",
-					"xhttpSettings": map[string]any{
-						"path": NormalizePath(s.Server.Path, firstUUID),
-						"mode": "auto",
-					},
-					"sockopt": map[string]any{
-						"tcpFastOpen": true,
-						"tcpMptcp":    true,
-					},
-				},
-				"sniffing": map[string]any{
-					"enabled":      true,
-					"destOverride": []string{"http", "tls", "quic"},
-					"routeOnly":    true,
-				},
-			})
-		} else {
-			inbounds = append(inbounds, buildXHTTPDirectTLSInbound(
-				"main", s.Server.ListenPort, s.Server.UUIDs, s.Server.Path, opts.CertFile, opts.KeyFile,
-			))
-		}
+		inbounds = append(inbounds, buildMainServerInbound(s, opts))
 
 		// Outbounds: handle Option 35 SOCKS5 outbound global default vs direct
 		directOb := buildFreedomOutbound("direct", 0, "")

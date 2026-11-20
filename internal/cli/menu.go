@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"strconv"
@@ -119,11 +120,24 @@ func runInteractiveMenu(store *state.Store, exec reconcile.SystemExecutor, stdin
 			}
 			pStr := ask("Web UI port", "8443")
 			if p, perr := strconv.Atoi(pStr); perr == nil && p >= 1 && p <= 65535 {
-				_, _ = store.Update(st.Role, func(cur *state.State) error {
+				if _, uerr := store.Update(st.Role, func(cur *state.State) error {
 					cur.Auth.ListenAddr = fmt.Sprintf(":%d", p)
 					return nil
-				})
+				}); uerr != nil {
+					fmt.Fprintf(stderr, "update failed: %v\n", uerr)
+					continue
+				}
 				fmt.Fprintf(stdout, "Web listen port set to :%d\n", p)
+				if exec != nil {
+					initSys := exec.DetectInitSystem()
+					if exec.ServiceIsActive(context.Background(), initSys, "dex-daemon") {
+						if rerr := exec.ServiceRestart(context.Background(), initSys, "dex-daemon"); rerr != nil {
+							fmt.Fprintf(stderr, "restart dex-daemon failed: %v\n", rerr)
+						} else {
+							fmt.Fprintln(stdout, "Restarted dex-daemon with new listen port.")
+						}
+					}
+				}
 			}
 		case "9":
 			if st == nil {

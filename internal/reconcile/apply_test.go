@@ -24,6 +24,7 @@ type mockExecutor struct {
 	failValidation string // "xray" | "nft" | "haproxy" | "nginx"
 	failHealthSvc  string
 	failReloadSvc  string
+	nginxVersion   string
 	inactiveSvcs   map[string]bool
 	startedSvcs    []string
 	reloadedSvcs   []string
@@ -51,6 +52,9 @@ func (m *mockExecutor) RunCommand(ctx context.Context, env []string, name string
 	}
 	if failVal == "nginx" && name == "nginx" {
 		return "nginx syntax err", errors.New("exit 1")
+	}
+	if name == "nginx" && len(args) == 1 && args[0] == "-v" && m.nginxVersion != "" {
+		return m.nginxVersion, nil
 	}
 	return "ok", nil
 }
@@ -735,5 +739,91 @@ func TestReconcileRollbackStopsNewlyStartedServicesBeforeDeletingUnits(t *testin
 		if !found {
 			t.Fatalf("expected %q on rollback, cmds=%v", wantCmd, exec.cmds)
 		}
+	}
+}
+
+func TestReconcileWave1ImportedCertBlockAdsAndNginxLegacy(t *testing.T) {
+	// 1. Imported cert paths are passed through to renderers (without overwriting by store.DefaultCert).
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "etc", "dex")
+	store := state.NewStore(stateDir)
+	customCert := filepath.Join(root, "var", "www", "ssl", "custom.cer")
+	customKey := filepath.Join(root, "var", "www", "ssl", "custom.key")
+	_ = os.MkdirAll(filepath.Dir(customCert), 0o755)
+	_ = os.WriteFile(customCert, []byte("CERT"), 0o644)
+	_ = os.WriteFile(customKey, []byte("KEY"), 0o600)
+
+	srv := state.NewDefaultState(state.RoleServer)
+	srv.Server.Domain = "srv.example.com"
+	srv.Server.TLSMode = "nginx"
+	srv.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	srv.Cert = state.CertConfig{
+		Mode:     "imported",
+		CertFile: customCert,
+		KeyFile:  customKey,
+	}
+	if err := store.Save(srv); err != nil {
+		t.Fatalf("Save server: %v", err)
+	}
+
+	exec := &mockExecutor{nginxVersion: "nginx version: nginx/1.22.1\n"}
+	opts := ApplyOptions{
+		RootPrefix: root,
+		RenderOpts: render.RenderOptions{
+			StateDir:     "/etc/dex",
+			GeneratedDir: "/etc/dex/generated",
+		},
+	}
+	if _, err := Reconcile(context.Background(), store, exec, opts); err != nil {
+		t.Fatalf("Reconcile server failed: %v", err)
+	}
+	ngBytes, _ := os.ReadFile(filepath.Join(root, "etc", "nginx", "conf.d", "dex-server.conf"))
+	ngStr := string(ngBytes)
+	if !strings.Contains(ngStr, "ssl_certificate "+customCert+";") || !strings.Contains(ngStr, "ssl_certificate_key "+customKey+";") {
+		t.Fatalf("expected imported cert/key in nginx config, got:\n%s", ngStr)
+	}
+	if !strings.Contains(ngStr, "listen 443 ssl http2;") {
+		t.Fatalf("expected legacy http2 directive for nginx 1.22.1, got:\n%s", ngStr)
+	}
+
+	// 2. Client with block_ads=true creates empty Domains.ads.txt placeholder + warning when missing.
+	cRoot := t.TempDir()
+	cStateDir := filepath.Join(cRoot, "etc", "dex")
+	cStore := state.NewStore(cStateDir)
+	cli := state.NewDefaultState(state.RoleClient)
+	cli.Client.DNS.BlockAds = true
+	cli.Client.DNS.BlacklistDomains = []string{"bad.example.com"}
+	if err := cStore.Save(cli); err != nil {
+		t.Fatalf("Save client: %v", err)
+	}
+	// Pre-create non-empty Domains.apple.txt to verify auto-detection
+	appleDisk := filepath.Join(cRoot, "etc", "dex", "rules", "Domains.apple.txt")
+	_ = os.MkdirAll(filepath.Dir(appleDisk), 0o755)
+	_ = os.WriteFile(appleDisk, []byte("apple.com\n"), 0o644)
+
+	cRes, err := Reconcile(context.Background(), cStore, &mockExecutor{}, ApplyOptions{
+		RootPrefix: cRoot,
+		RenderOpts: render.RenderOptions{
+			StateDir:     "/etc/dex",
+			GeneratedDir: "/etc/dex/generated",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile client failed: %v", err)
+	}
+	adsDisk := filepath.Join(cRoot, "etc", "dex", "rules", "Domains.ads.txt")
+	if _, err := os.Stat(adsDisk); err != nil {
+		t.Fatalf("expected placeholder Domains.ads.txt created, err=%v", err)
+	}
+	if !strings.Contains(strings.Join(cRes.Warnings, "\n"), "Domains.ads.txt") {
+		t.Fatalf("expected warning about placeholder Domains.ads.txt, got %v", cRes.Warnings)
+	}
+	mosCfg, _ := os.ReadFile(filepath.Join(cRoot, "etc", "dex", "generated", "mosdns", "mosdns.yaml"))
+	if !strings.Contains(string(mosCfg), "Domains.apple.txt") {
+		t.Fatalf("expected non-empty Domains.apple.txt auto-detected in mosdns.yaml")
+	}
+	nftCfg, _ := os.ReadFile(filepath.Join(cRoot, "etc", "dex", "generated", "nftables.conf"))
+	if !strings.Contains(string(nftCfg), "203.0.113.10") {
+		t.Fatalf("expected BlacklistDomains resolved IP in nftables.conf")
 	}
 }

@@ -242,19 +242,28 @@ func (OSExecutor) ResolveHostIPs(ctx context.Context, host string) ([]netip.Addr
 	if ip, err := netip.ParseAddr(host); err == nil {
 		return []netip.Addr{ip}, nil
 	}
+	// Query external upstream DNS directly first so local MosDNS hosts.txt does not return stale bootstrap IPs.
+	var lastErr error
+	for _, upstreamDNS := range []string{"223.5.5.5:53", "119.29.29.29:53", "1.1.1.1:53"} {
+		fips, ferr := lookupDNSWithServer(ctx, upstreamDNS, host)
+		if ferr == nil && len(fips) > 0 {
+			return fips, nil
+		}
+		if ferr != nil {
+			lastErr = ferr
+		}
+	}
 	cctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
 	ips, err := net.DefaultResolver.LookupNetIP(cctx, "ip", host)
 	if err == nil && len(ips) > 0 {
 		return ips, nil
 	}
-	for _, fallbackDNS := range []string{"223.5.5.5:53", "1.1.1.1:53"} {
-		if fips, ferr := lookupDNSWithServer(ctx, fallbackDNS, host); ferr == nil && len(fips) > 0 {
-			return fips, nil
-		}
-	}
 	if err != nil {
 		return nil, err
+	}
+	if lastErr != nil {
+		return nil, lastErr
 	}
 	return ips, nil
 }

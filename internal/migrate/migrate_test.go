@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stuinxo/de_GWD/v3/internal/cryptoext"
@@ -194,5 +195,123 @@ backend bk_10001
 	}
 	if _, err := render.RenderAll(dexsState, render.RenderOptions{}); err != nil {
 		t.Fatalf("RenderAll dexsState: %v", err)
+	}
+}
+
+func TestImportV2ClientWave1Fixes(t *testing.T) {
+	dir := t.TempDir()
+	_, pub, err := cryptoext.GenerateRealityKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	priv, derivedPub, err := cryptoext.GenerateRealityKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = pub
+
+	// 1. v2_client without vtrui/config.json: path!="" -> vmess-ws, path=="" -> vmess-tcp,
+	// CIDR already having /24, nodeSM.status==off, wireguard.status==off, RproxyS, block53, cfEmail, DoG note.
+	zeroConf := `{
+  "address": {
+    "alias": "edge-gw",
+    "localIP": "192.168.50.2/24",
+    "serverName": "gw.example.com",
+    "webUIport": "8443"
+  },
+  "dns": {
+    "dog": "dog.example.com:443"
+  },
+  "v2node": [
+    {"domain": "ws.example.com:443", "name": "WS", "uuid": "11111111-1111-4111-8111-111111111111", "path": "wsnode", "tls": "ws.example.com"},
+    {"domain": "tcp.example.com:10443", "name": "TCP", "uuid": "22222222-2222-4222-8222-222222222222", "path": ""}
+  ],
+  "update": {
+    "v2node": {"domain": "ws.example.com", "port": 443, "uuid": "11111111-1111-4111-8111-111111111111", "path": "wsnode", "tls": "ws.example.com"}
+  },
+  "v2nodeDIV": {
+    "nodeSM": {"status": "off", "openai": "ws.example.com:443", "steam": "proxy"}
+  },
+  "FORWARD": {
+    "domain": "gw.example.com",
+    "email": "cert@example.com",
+    "block53": "on",
+    "DoGs": {"port": 9443},
+    "FWD0": {"status": "on", "port": "1443", "uuid": [{"FWD0uuid": "33333333-3333-4333-8333-333333333333"}]},
+    "Rproxy": {
+      "server": {
+        "status": "on",
+        "inStatus": "on",
+        "mappingStatus": "on",
+        "tunnel": {"port": "20000", "uuid": "44444444-4444-4444-8444-444444444444"},
+        "inUUID": [{"RproxyS0uuid": "55555555-5555-4555-8555-555555555555"}],
+        "mapping": [{"port": "18080", "protocol": "tcp"}]
+      }
+    }
+  },
+  "wireguard": {
+    "status": "off",
+    "server": {"WGaddress": "home.example.com", "WGport": "51820", "sprivatekey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "spublickey": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="}
+  },
+  "ddns": {
+    "ddnsCF": {"cfDomain": "home.example.com", "cfAPIkey": "global-key", "cfEmail": "ddns@example.com"}
+  }
+}`
+	confPath := filepath.Join(dir, "0conf")
+	_ = os.WriteFile(confPath, []byte(zeroConf), 0o600)
+	_ = os.WriteFile(filepath.Join(dir, "extra_inbounds.json"), []byte(`[
+  {"tag": "inbound-reality-9443", "port": 9443, "protocol": "vless", "settings": {"clients": [{"id": "66666666-6666-4666-8666-666666666666"}]}, "streamSettings": {"security": "reality", "realitySettings": {"dest": "www.apple.com:443", "serverNames": ["www.apple.com"], "privateKey": "`+priv+`", "shortIds": ["abcd"]}}}
+]`), 0o600)
+
+	st, notes, err := ImportV2Client(confPath, dir)
+	if err != nil {
+		t.Fatalf("ImportV2Client: %v", err)
+	}
+	if err := st.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if st.System.Hostname != "edge-gw" || st.System.LANAddrCIDR != "192.168.50.2/24" {
+		t.Fatalf("unexpected hostname/LANAddrCIDR: %q / %q", st.System.Hostname, st.System.LANAddrCIDR)
+	}
+	if st.Client.Nodes[0].Protocol != "vmess-ws" || st.Client.Nodes[0].Path != "/wsnode" || st.Client.Nodes[1].Protocol != "vmess-tcp" {
+		t.Fatalf("unexpected node protocols: %+v", st.Client.Nodes)
+	}
+	if len(st.Client.Routing.ServiceMap) != 0 || st.Client.Routing.SteamProxy {
+		t.Fatalf("expected nodeSM.status==off respected, got %+v", st.Client.Routing)
+	}
+	if st.Client.WireGuard.Enabled {
+		t.Fatalf("expected wireguard.status==off respected")
+	}
+	if !st.RproxyS.Enabled || len(st.RproxyS.InUUIDs) != 1 || st.RproxyS.ListenPort != 20000 {
+		t.Fatalf("expected RproxyS imported, got %+v", st.RproxyS)
+	}
+	if !st.Client.DNS.BlockExternal53 || st.Client.DDNS.CFEmail != "ddns@example.com" || st.Cert.CFEmail != "cert@example.com" {
+		t.Fatalf("expected block53/emails imported: block53=%v ddnsEmail=%q certEmail=%q", st.Client.DNS.BlockExternal53, st.Client.DDNS.CFEmail, st.Cert.CFEmail)
+	}
+	if st.Client.FWD0.Protocol != "vmess-tcp" {
+		t.Fatalf("expected FWD0 protocol=vmess-tcp, got %q", st.Client.FWD0.Protocol)
+	}
+	if len(st.ExtraInbounds) != 1 || st.ExtraInbounds[0].RealityPubKey != derivedPub {
+		t.Fatalf("expected RealityPubKey derived=%q, got %+v", derivedPub, st.ExtraInbounds)
+	}
+	joinedNotes := strings.Join(notes, "\n")
+	if !strings.Contains(joinedNotes, "dns.dog") || !strings.Contains(joinedNotes, "FORWARD.DoGs") || !strings.Contains(joinedNotes, "vmess-tcp") {
+		t.Fatalf("expected DoG/DoGs/vmess-tcp notes, got:\n%s", joinedNotes)
+	}
+
+	// 2. v2_server with vmess+ws main inbound
+	srvRoot := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(srvRoot, "etc", "nginx", "conf.d"), 0o755)
+	_ = os.MkdirAll(filepath.Join(srvRoot, "opt", "de_GWD", "vtrui"), 0o755)
+	_ = os.WriteFile(filepath.Join(srvRoot, "etc", "nginx", "conf.d", "default.conf"), []byte("server {\n  listen 443 ssl;\n  server_name ws.example.com;\n}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(srvRoot, "opt", "de_GWD", "vtrui", "config.json"), []byte(`{
+  "inbounds": [{"port": 9890, "protocol": "vmess", "settings": {"clients": [{"id": "11111111-1111-4111-8111-111111111111", "alterId": 0}]}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/ws-legacy"}}}]
+}`), 0o644)
+	srvSt, _, err := ImportV2Server(srvRoot)
+	if err != nil {
+		t.Fatalf("ImportV2Server vmess-ws: %v", err)
+	}
+	if srvSt.Server.Protocol != "vmess-ws" || srvSt.Server.Path != "/ws-legacy" {
+		t.Fatalf("expected vmess-ws /ws-legacy, got %q %q", srvSt.Server.Protocol, srvSt.Server.Path)
 	}
 }

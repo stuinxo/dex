@@ -254,6 +254,53 @@ install_mosdns_and_rules() {
   if [ ! -s "${STATE_DIR}/rules/Domains.chn.txt" ]; then
     gh_fetch "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt" "${STATE_DIR}/rules/Domains.chn.txt" || warn "Failed to fetch Domains.chn.txt"
   fi
+  if [ ! -s "${STATE_DIR}/rules/Domains.ads.txt" ]; then
+    gh_fetch "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/reject-list.txt" "${STATE_DIR}/rules/Domains.ads.txt" || warn "Failed to fetch Domains.ads.txt"
+  fi
+  if [ ! -s "${STATE_DIR}/rules/Domains.apple.txt" ]; then
+    gh_fetch "https://raw.githubusercontent.com/stuinxo/de_GWD/main/resource/chnroute/mosdns_chnlist/Domains.apple.txt" "${STATE_DIR}/rules/Domains.apple.txt" \
+      || gh_fetch "https://raw.githubusercontent.com/jacyl4/chnroute/main/mosdns_chnlist/Domains.apple.txt" "${STATE_DIR}/rules/Domains.apple.txt" \
+      || warn "Failed to fetch Domains.apple.txt"
+  fi
+  if [ ! -s "${STATE_DIR}/rules/Domains.games.txt" ]; then
+    gh_fetch "https://raw.githubusercontent.com/stuinxo/de_GWD/main/resource/chnroute/mosdns_chnlist/Domains.games.txt" "${STATE_DIR}/rules/Domains.games.txt" \
+      || gh_fetch "https://raw.githubusercontent.com/jacyl4/chnroute/main/mosdns_chnlist/Domains.games.txt" "${STATE_DIR}/rules/Domains.games.txt" \
+      || warn "Failed to fetch Domains.games.txt"
+  fi
+}
+
+ensure_ntp() {
+  case "$OS_INIT" in
+    systemd)
+      if systemctl is-active --quiet systemd-timesyncd 2>/dev/null \
+        || systemctl is-active --quiet chrony 2>/dev/null \
+        || systemctl is-active --quiet chronyd 2>/dev/null \
+        || systemctl is-active --quiet ntp 2>/dev/null; then
+        return 0
+      fi
+      if [ "$OS_PKG" = "apt" ]; then
+        wait_apt_lock
+        if apt-get install -y -qq --no-install-recommends systemd-timesyncd >/dev/null 2>&1; then
+          systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || true
+          return 0
+        fi
+        wait_apt_lock
+        if apt-get install -y -qq --no-install-recommends chrony >/dev/null 2>&1; then
+          systemctl enable --now chrony >/dev/null 2>&1 || true
+        fi
+      fi
+      ;;
+    openrc)
+      if rc-service chronyd status >/dev/null 2>&1 || rc-service ntpd status >/dev/null 2>&1; then
+        return 0
+      fi
+      if [ "$OS_PKG" = "apk" ]; then
+        apk add --no-cache chrony >/dev/null 2>&1 || true
+        rc-update add chronyd default >/dev/null 2>&1 || true
+        rc-service chronyd start >/dev/null 2>&1 || true
+      fi
+      ;;
+  esac
 }
 
 main() {
@@ -273,6 +320,7 @@ main() {
           apt-get install -y -qq --no-install-recommends wireguard-tools >/dev/null 2>&1 || true
           ;;
       esac
+      ensure_ntp
       install_xray_core
       install_mosdns_and_rules
       "$INSTALL_BIN" init --role client --apply
@@ -291,6 +339,8 @@ main() {
               || die "Failed to install server Debian/Ubuntu packages."
             ;;
         esac
+        rm -f /etc/nginx/sites-enabled/default
+        ensure_ntp
       fi
       install_xray_core
       say "[+] Ready. Run 'dex init --role $role --domain <dom> --apply' or 'dex' for interactive menu."

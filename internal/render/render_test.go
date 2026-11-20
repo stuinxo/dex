@@ -1,6 +1,7 @@
 package render
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"net/netip"
 	"strings"
@@ -261,12 +262,12 @@ func TestRenderServerSocks5AndNginx(t *testing.T) {
 			PrivateBypass: true,
 		},
 		{
-			Name:     "sg",
-			Enabled:  true,
-			Address:  "sg.example.net",
-			Port:     1081,
-			Domains:  []string{"geosite:netflix"},
-			IPs:      []string{"geoip:telegram"},
+			Name:    "sg",
+			Enabled: true,
+			Address: "sg.example.net",
+			Port:    1081,
+			Domains: []string{"geosite:netflix"},
+			IPs:     []string{"geoip:telegram"},
 		},
 	}
 
@@ -292,5 +293,295 @@ func TestRenderServerSocks5AndNginx(t *testing.T) {
 	ngStr := string(ng.Content)
 	if !strings.Contains(ngStr, "listen 80;") || !strings.Contains(ngStr, "listen 443 ssl;") || !strings.Contains(ngStr, "location /dq") || !strings.Contains(ngStr, "location /11111111") {
 		t.Fatalf("unexpected nginx-dex.conf:\n%s", ngStr)
+	}
+}
+
+func TestRenderWave1ProtocolsAndDataPlane(t *testing.T) {
+	// 1. Client with vmess-tcp, FWD0 vmess-tcp, RproxyC pinnedPeerCertSha256 + OutDirect,
+	// IPv6, wildcard hosts, block53, block_ads, Apple/Steam, Blacklist/Whitelist domains, DoH normalization.
+	s := state.NewDefaultState(state.RoleClient)
+	s.System.EnableIPv6 = true
+	s.System.LANAddrCIDR = "192.168.10.2/24"
+	s.Client.Nodes = []state.OutboundNode{{
+		ID:       "tcp-1",
+		Name:     "LegacyVMessTCP",
+		Protocol: "vmess-tcp",
+		Address:  "203.0.113.50",
+		Port:     10443,
+		UUID:     "11111111-1111-4111-8111-111111111111",
+	}}
+	s.Client.ActiveNodeID = "tcp-1"
+	s.Client.FWD0 = state.FWD0Config{
+		Enabled:  true,
+		Protocol: "vmess-tcp",
+		Port:     1443,
+		UUIDs:    []string{"22222222-2222-4222-8222-222222222222"},
+	}
+	s.Client.RproxyC = state.RproxyCConfig{
+		Enabled:              true,
+		TunnelAddress:        "198.51.100.77",
+		TunnelPort:           20000,
+		TunnelUUID:           "33333333-3333-4333-8333-333333333333",
+		Security:             "tls",
+		ServerName:           "tun.example.com",
+		PinnedPeerCertSha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		OutDirect:            true,
+		Mappings: []state.RproxyClientMapping{
+			{ExtPort: 18080, Proto: "tcp", IntIP: "192.168.10.10", IntPort: 80},
+		},
+	}
+	s.Client.DNS.ChinaServers = []string{"2400:3200::1", "223.5.5.5"}
+	s.Client.DNS.DoHServers = []string{
+		"dns.example.com",
+		"quic://dns.adguard-dns.com",
+		"https://cloudflare-dns.com/dns-query",
+	}
+	s.Client.DNS.Hosts = map[string]string{"*.home.arpa": "192.168.10.5"}
+	s.Client.DNS.BlockAds = true
+	s.Client.DNS.BlockExternal53 = true
+	s.Client.DNS.BlacklistDomains = []string{"blocked.example.org"}
+	s.Client.DNS.WhitelistDomains = []string{"direct.example.org"}
+	s.Client.Routing.AppleNodeID = "tcp-1"
+	s.Client.Routing.SteamProxy = false
+
+	opts := RenderOptions{
+		StateDir:           "/etc/dex",
+		InitSystem:         "openrc",
+		DomainsAppleExists: true,
+		DomainsGamesExists: true,
+		ResolvedHostIPs: map[string][]netip.Addr{
+			"cloudflare-dns.com":  {netip.MustParseAddr("104.16.248.249")},
+			"blocked.example.org": {netip.MustParseAddr("198.51.100.11")},
+			"direct.example.org":  {netip.MustParseAddr("198.51.100.12")},
+		},
+		ChnRouteCIDRs: []string{"1.0.1.0/24"},
+	}
+
+	bundle, err := RenderAll(s, opts)
+	if err != nil {
+		t.Fatalf("RenderAll client: %v", err)
+	}
+
+	// Verify xray.json
+	xf, _ := findFile(bundle, "xray.json")
+	xrayStr := string(xf.Content)
+	if strings.Contains(xrayStr, `"allowInsecure": true`) {
+		t.Fatalf("xray.json must never emit allowInsecure: true:\n%s", xrayStr)
+	}
+	var xcfg map[string]any
+	if err := json.Unmarshal(xf.Content, &xcfg); err != nil {
+		t.Fatalf("unmarshal xray.json: %v", err)
+	}
+
+	// Check vmess-tcp outbound, tproxy-in-v6, forward0 vmess-tcp, directOut, pinnedPeerCertSha256
+	inbs := xcfg["inbounds"].([]any)
+	hasTProxyV6, hasFWD0VMess := false, false
+	for _, raw := range inbs {
+		m := raw.(map[string]any)
+		if m["tag"] == "tproxy-in-v6" && m["listen"] == "::1" {
+			hasTProxyV6 = true
+		}
+		if m["tag"] == "forward0" && m["protocol"] == "vmess" {
+			stream := m["streamSettings"].(map[string]any)
+			if stream["network"] == "tcp" && stream["security"] == nil {
+				hasFWD0VMess = true
+			}
+		}
+	}
+	if !hasTProxyV6 || !hasFWD0VMess {
+		t.Fatalf("missing tproxy-in-v6 (%v) or forward0 vmess-tcp (%v)", hasTProxyV6, hasFWD0VMess)
+	}
+
+	obs := xcfg["outbounds"].([]any)
+	hasDefaultVMessTCP, hasDirectOut, hasReversePCS := false, false, false
+	for _, raw := range obs {
+		m := raw.(map[string]any)
+		switch m["tag"] {
+		case "default":
+			stream := m["streamSettings"].(map[string]any)
+			sock := stream["sockopt"].(map[string]any)
+			if m["protocol"] == "vmess" && stream["network"] == "tcp" && stream["security"] == nil && sock["mark"] == float64(255) {
+				hasDefaultVMessTCP = true
+			}
+		case "directOut":
+			if m["protocol"] == "freedom" {
+				hasDirectOut = true
+			}
+		case "reverseTunnel":
+			tls := m["streamSettings"].(map[string]any)["tlsSettings"].(map[string]any)
+			if tls["serverName"] == "tun.example.com" && tls["pinnedPeerCertSha256"] == "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" {
+				hasReversePCS = true
+			}
+		}
+	}
+	if !hasDefaultVMessTCP || !hasDirectOut || !hasReversePCS {
+		t.Fatalf("missing outbound expectations: default=%v directOut=%v reversePCS=%v", hasDefaultVMessTCP, hasDirectOut, hasReversePCS)
+	}
+
+	// Verify routing order: bridge mapping0 (with ip 127.0.0.1) before directOut; whitelist -> direct; blacklist -> default
+	rules := xcfg["routing"].(map[string]any)["rules"].([]any)
+	mapIdx, directOutIdx, whiteIdx, blackIdx := -1, -1, -1, -1
+	for i, raw := range rules {
+		r := raw.(map[string]any)
+		switch r["outboundTag"] {
+		case "mapping0":
+			mapIdx = i
+			ips, _ := r["ip"].([]any)
+			if len(ips) != 1 || ips[0] != "127.0.0.1" {
+				t.Fatalf("expected mapping0 rule ip=[\"127.0.0.1\"], got %+v", r["ip"])
+			}
+		case "directOut":
+			directOutIdx = i
+		case "direct":
+			if doms, ok := r["domain"].([]any); ok && len(doms) == 1 && doms[0] == "direct.example.org" {
+				whiteIdx = i
+			}
+		case "default":
+			if doms, ok := r["domain"].([]any); ok && len(doms) == 1 && doms[0] == "blocked.example.org" {
+				blackIdx = i
+			}
+		}
+	}
+	if mapIdx < 0 || directOutIdx < 0 || mapIdx >= directOutIdx || whiteIdx < 0 || blackIdx < 0 {
+		t.Fatalf("unexpected routing indices: map=%d directOut=%d white=%d black=%d", mapIdx, directOutIdx, whiteIdx, blackIdx)
+	}
+
+	// Verify BlacklistDomains/WhitelistDomains appear before default Apple/Steam direct rules
+	sDefaultApple := *s
+	sDefaultApple.Client.Routing.AppleNodeID = ""
+	sDefaultApple.Client.Routing.SteamProxy = false
+	xfDef, _, err := RenderXray(&sDefaultApple, opts)
+	if err != nil {
+		t.Fatalf("RenderXray default apple: %v", err)
+	}
+	var xcfgDef map[string]any
+	_ = json.Unmarshal(xfDef, &xcfgDef)
+	defRules := xcfgDef["routing"].(map[string]any)["rules"].([]any)
+	defBlackIdx, defAppleIdx, defSteamIdx := -1, -1, -1
+	for i, raw := range defRules {
+		r := raw.(map[string]any)
+		if doms, ok := r["domain"].([]any); ok && len(doms) > 0 {
+			switch doms[0] {
+			case "blocked.example.org":
+				defBlackIdx = i
+			case "geosite:apple":
+				defAppleIdx = i
+			case "domain:steamserver.net":
+				defSteamIdx = i
+			}
+		}
+	}
+	if defBlackIdx < 0 || defAppleIdx < 0 || defSteamIdx < 0 || defBlackIdx >= defAppleIdx || defBlackIdx >= defSteamIdx {
+		t.Fatalf("expected blacklist rule before default Apple/Steam direct rules: black=%d apple=%d steam=%d", defBlackIdx, defAppleIdx, defSteamIdx)
+	}
+
+	// Check vmess-tcp BuildNodeURI & BuildFWDURI
+	tcpURI := BuildNodeURI(s.Client.Nodes[0])
+	if !strings.HasPrefix(tcpURI, "vmess://") {
+		t.Fatalf("expected vmess:// URI, got %q", tcpURI)
+	}
+	rawJSON, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(tcpURI, "vmess://"))
+	if err != nil || !strings.Contains(string(rawJSON), `"net":"tcp"`) || !strings.Contains(string(rawJSON), `"tls":""`) {
+		t.Fatalf("unexpected vmess-tcp URI payload: %s err=%v", string(rawJSON), err)
+	}
+	s.Client.DDNS.Domain = "home.example.com"
+	fwdURI := BuildFWDURI(s, "fwd0", "")
+	if !strings.HasPrefix(fwdURI, "vmess://") {
+		t.Fatalf("expected BuildFWDURI vmess:// for vmess-tcp FWD0, got %q", fwdURI)
+	}
+
+	// Check MosDNS config
+	mf, _ := findFile(bundle, "mosdns/mosdns.yaml")
+	mStr := string(mf.Content)
+	for _, needle := range []string{
+		`"[2400:3200::1]:53"`,
+		`"https://dns.example.com/dq"`,
+		`"quic://dns.adguard-dns.com"`,
+		`listen: "[::]:53"`,
+	} {
+		if !strings.Contains(mStr, needle) {
+			t.Errorf("mosdns.yaml missing %q", needle)
+		}
+	}
+	whitePos := strings.Index(mStr, "domains_white.txt")
+	adsPos := strings.Index(mStr, "Domains.ads.txt")
+	applePos := strings.Index(mStr, "Domains.apple.txt")
+	gamesPos := strings.Index(mStr, "Domains.games.txt")
+	chnPos := strings.Index(mStr, "Domains.chn.txt")
+	if whitePos < 0 || adsPos < 0 || whitePos > adsPos {
+		t.Fatalf("expected domains_white.txt before Domains.ads.txt: white=%d ads=%d", whitePos, adsPos)
+	}
+	if applePos < 0 || gamesPos < 0 || chnPos < 0 || applePos > chnPos || gamesPos > chnPos {
+		t.Fatalf("expected Apple/Games before Domains.chn.txt: apple=%d games=%d chn=%d", applePos, gamesPos, chnPos)
+	}
+	hf, _ := findFile(bundle, "mosdns/hosts.txt")
+	if !strings.Contains(string(hf.Content), "domain:home.arpa 192.168.10.5") {
+		t.Fatalf("expected wildcard converted to domain:home.arpa in hosts.txt:\n%s", string(hf.Content))
+	}
+
+	// Check nftables: block_external_53, cloudflare 104.16.248.249 excluded, list_b/list_w populated
+	nf, _ := findFile(bundle, "nftables.conf")
+	nStr := string(nf.Content)
+	if !strings.Contains(nStr, "meta l4proto { tcp, udp } th dport 53 drop") {
+		t.Fatalf("missing block_external_53 rule in nftables.conf")
+	}
+	if strings.Contains(nStr, "104.16.248.249") {
+		t.Fatalf("expected cloudflare DoH IP 104.16.248.249 excluded from @global_dns_v4")
+	}
+	if !strings.Contains(nStr, "198.51.100.11") || !strings.Contains(nStr, "198.51.100.12") {
+		t.Fatalf("expected resolved blacklist/whitelist domain IPs in nftables.conf")
+	}
+
+	// Check OpenRC units
+	if mosUnit, ok := findFile(bundle, "openrc/dex-mosdns"); !ok || mosUnit.TargetPath != "/etc/init.d/dex-mosdns" {
+		t.Fatalf("missing openrc/dex-mosdns unit")
+	}
+	nftUnit, ok := findFile(bundle, "openrc/dex-nft")
+	if !ok || !strings.Contains(string(nftUnit.Content), "table 220") || !strings.Contains(string(nftUnit.Content), "ip -6 route replace local default dev lo table 220") {
+		t.Fatalf("openrc/dex-nft missing IPv4/IPv6 table 220 policy routing:\n%s", string(nftUnit.Content))
+	}
+
+	// 2. Server with vmess-ws, NginxLegacyHTTP2, RproxyS InUUIDs + Security=none
+	srv := state.NewDefaultState(state.RoleServer)
+	srv.Server.Protocol = "vmess-ws"
+	srv.Server.TLSMode = "nginx"
+	srv.Server.Domain = "ws.example.com"
+	srv.Server.ListenPort = 443
+	srv.Server.Path = "/ws-main"
+	srv.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	srv.RproxyS = state.RproxySConfig{
+		Enabled:    true,
+		ListenPort: 20000,
+		Security:   "none",
+		UUIDs:      []string{"22222222-2222-4222-8222-222222222222"},
+		InUUIDs:    []string{"33333333-3333-4333-8333-333333333333"},
+	}
+	sBundle, err := RenderAll(srv, RenderOptions{NginxLegacyHTTP2: true})
+	if err != nil {
+		t.Fatalf("RenderAll server vmess-ws: %v", err)
+	}
+	ngf, _ := findFile(sBundle, "nginx-dex.conf")
+	ngStr := string(ngf.Content)
+	if !strings.Contains(ngStr, "listen 443 ssl http2;") || !strings.Contains(ngStr, "Upgrade $http_upgrade;") || !strings.Contains(ngStr, `Connection "upgrade";`) {
+		t.Fatalf("expected legacy http2 + WS upgrade headers in nginx-dex.conf:\n%s", ngStr)
+	}
+	sxf, _ := findFile(sBundle, "xray.json")
+	var sxcfg map[string]any
+	_ = json.Unmarshal(sxf.Content, &sxcfg)
+	sInbs := sxcfg["inbounds"].([]any)
+	mainInb := sInbs[0].(map[string]any)
+	if mainInb["protocol"] != "vmess" || mainInb["streamSettings"].(map[string]any)["network"] != "ws" {
+		t.Fatalf("expected server main inbound vmess+ws, got %+v", mainInb)
+	}
+	rpsInb := sInbs[1].(map[string]any)
+	if rpsInb["streamSettings"].(map[string]any)["security"] != "none" {
+		t.Fatalf("expected RproxyS security=none, got %+v", rpsInb["streamSettings"])
+	}
+	if len(rpsInb["settings"].(map[string]any)["clients"].([]any)) != 2 {
+		t.Fatalf("expected 2 clients in rps-tunnel (tunnel + in_uuid)")
+	}
+	mainURI := BuildServerMainURI(srv)
+	if !strings.HasPrefix(mainURI, "vmess://") {
+		t.Fatalf("expected vmess:// BuildServerMainURI for vmess-ws, got %q", mainURI)
 	}
 }

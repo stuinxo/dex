@@ -128,8 +128,12 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 			"8.8.8.8":              {},
 			"8.8.4.4":              {},
 			"9.9.9.9":              {},
+			"104.16.248.249":       {},
+			"104.16.249.249":       {},
 			"2606:4700:4700::1111": {},
 			"2606:4700:4700::1001": {},
+			"2606:4700::6810:f8f9": {},
+			"2606:4700::6810:f9f9": {},
 			"2001:4860:4860::8888": {},
 			"2001:4860:4860::8844": {},
 			"2620:fe::fe":          {},
@@ -180,8 +184,24 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 		v2node4, v2node6 := splitIPsByFamily(v2nodeRaw)
 
 		chn4, _ := splitIPsByFamily(opts.ChnRouteCIDRs)
-		listB4, listB6 := splitIPsByFamily(s.Client.DNS.BlacklistIPs)
-		listW4, listW6 := splitIPsByFamily(s.Client.DNS.WhitelistIPs)
+		blackIPRaw := append([]string(nil), s.Client.DNS.BlacklistIPs...)
+		for _, dom := range s.Client.DNS.BlacklistDomains {
+			if host := ExtractDomainHost(dom); host != "" {
+				for _, ip := range opts.ResolvedHostIPs[host] {
+					blackIPRaw = append(blackIPRaw, ip.String())
+				}
+			}
+		}
+		whiteIPRaw := append([]string(nil), s.Client.DNS.WhitelistIPs...)
+		for _, dom := range s.Client.DNS.WhitelistDomains {
+			if host := ExtractDomainHost(dom); host != "" {
+				for _, ip := range opts.ResolvedHostIPs[host] {
+					whiteIPRaw = append(whiteIPRaw, ip.String())
+				}
+			}
+		}
+		listB4, listB6 := splitIPsByFamily(blackIPRaw)
+		listW4, listW6 := splitIPsByFamily(whiteIPRaw)
 
 		var lanProxyRaw, lanDirectRaw []string
 		if s.Client.Routing.Divert.Enabled {
@@ -221,6 +241,9 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 		}
 		b.WriteString("        ct state established,related accept\n")
 		b.WriteString("        ct state invalid counter drop\n")
+		if s.Client.DNS.BlockExternal53 {
+			b.WriteString("        meta l4proto { tcp, udp } th dport 53 drop\n")
+		}
 		b.WriteString("    }\n")
 
 		b.WriteString("    chain forward {\n        type filter hook forward priority 0; policy accept;\n")

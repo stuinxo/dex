@@ -87,6 +87,59 @@ func splitHostPort(raw string, defPort int) (string, int) {
 	return raw, defPort
 }
 
+func isEmptyJSONVal(v any) bool {
+	if v == nil {
+		return true
+	}
+	switch x := v.(type) {
+	case string:
+		return strings.TrimSpace(x) == ""
+	case []any:
+		return len(x) == 0
+	case map[string]any:
+		return len(x) == 0
+	default:
+		return false
+	}
+}
+
+func isVtruiVlessXHTTP(extraDir string) bool {
+	if extraDir == "" {
+		return false
+	}
+	b, err := os.ReadFile(filepath.Join(extraDir, "vtrui", "config.json"))
+	if err != nil {
+		return false
+	}
+	var cfg struct {
+		Outbounds []struct {
+			Protocol       string `json:"protocol"`
+			StreamSettings struct {
+				Network string `json:"network"`
+			} `json:"streamSettings"`
+		} `json:"outbounds"`
+	}
+	if err := json.Unmarshal(b, &cfg); err != nil || len(cfg.Outbounds) == 0 {
+		return false
+	}
+	return strings.EqualFold(cfg.Outbounds[0].Protocol, "vless") &&
+		strings.EqualFold(cfg.Outbounds[0].StreamSettings.Network, "xhttp")
+}
+
+func inferV2NodeProtoAndPath(rawPath string, vtruiVlessXHTTP bool) (string, string) {
+	p := strings.TrimSpace(rawPath)
+	if p != "" && !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	if vtruiVlessXHTTP {
+		return "vless-xhttp", p
+	}
+	if p == "" {
+		return "vmess-tcp", ""
+	}
+	return "vmess-ws", p
+}
+
 // ImportV2Client converts a v2 /opt/de_GWD/0conf (and optional extra_*.json in extraDir)
 // into a validated v3 State along with human-readable migration notes.
 func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
@@ -104,6 +157,9 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 
 	// Address & Auth
 	if addr, ok := doc["address"].(map[string]any); ok {
+		if alias := strVal(addr["alias"]); alias != "" {
+			st.System.Hostname = alias
+		}
 		if p := intVal(addr["webUIport"], 443); p > 0 {
 			st.Auth.ListenAddr = fmt.Sprintf(":%d", p)
 		}
@@ -119,9 +175,15 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 			}
 		}
 		if lip := strVal(addr["localIP"]); lip != "" {
-			st.System.LANAddrCIDR = lip + "/24"
+			if strings.Contains(lip, "/") {
+				st.System.LANAddrCIDR = lip
+			} else {
+				st.System.LANAddrCIDR = lip + "/24"
+			}
 		}
 	}
+
+	vtruiVlessXHTTP := isVtruiVlessXHTTP(extraDir)
 
 	// Nodes: .v2node[]
 	domainToNodeID := make(map[string]string)
@@ -142,15 +204,16 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 			if name == "" {
 				name = domRaw
 			}
+			proto, normPath := inferV2NodeProtoAndPath(strVal(m["path"]), vtruiVlessXHTTP)
 			node := state.OutboundNode{
 				ID:       id,
 				Name:     name,
-				Protocol: "vless-xhttp",
+				Protocol: proto,
 				Address:  host,
 				Port:     port,
 				UUID:     uuid,
 				TLSSNI:   strVal(m["tls"]),
-				Path:     strVal(m["path"]),
+				Path:     normPath,
 			}
 			st.Client.Nodes = append(st.Client.Nodes, node)
 			domainToNodeID[domRaw] = id
@@ -185,15 +248,16 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 				if id := resolveNodeID(cand); id != "" {
 					st.Client.ActiveNodeID = id
 				} else if uuid := strVal(vn["uuid"]); uuid != "" {
+					proto, normPath := inferV2NodeProtoAndPath(strVal(vn["path"]), vtruiVlessXHTTP)
 					st.Client.Nodes = append([]state.OutboundNode{{
 						ID:       "v2node-active",
 						Name:     cand,
-						Protocol: "vless-xhttp",
+						Protocol: proto,
 						Address:  dom,
 						Port:     port,
 						UUID:     uuid,
 						TLSSNI:   strVal(vn["tls"]),
-						Path:     strVal(vn["path"]),
+						Path:     normPath,
 					}}, st.Client.Nodes...)
 					st.Client.ActiveNodeID = "v2node-active"
 				}
@@ -249,18 +313,20 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 			}
 		}
 		if sm, ok := div["nodeSM"].(map[string]any); ok {
-			for _, svc := range state.NodeSMServices {
-				if target := strVal(sm[svc]); target != "" {
-					if nid := resolveNodeID(target); nid != "" {
-						st.Client.Routing.ServiceMap[svc] = nid
+			if !strings.EqualFold(strVal(sm["status"]), "off") {
+				for _, svc := range state.NodeSMServices {
+					if target := strVal(sm[svc]); target != "" {
+						if nid := resolveNodeID(target); nid != "" {
+							st.Client.Routing.ServiceMap[svc] = nid
+						}
 					}
 				}
-			}
-			if appleTarget := strVal(sm["apple"]); appleTarget != "" {
-				st.Client.Routing.AppleNodeID = resolveNodeID(appleTarget)
-			}
-			if strings.EqualFold(strVal(sm["steam"]), "proxy") {
-				st.Client.Routing.SteamProxy = true
+				if appleTarget := strVal(sm["apple"]); appleTarget != "" {
+					st.Client.Routing.AppleNodeID = resolveNodeID(appleTarget)
+				}
+				if strings.EqualFold(strVal(sm["steam"]), "proxy") {
+					st.Client.Routing.SteamProxy = true
+				}
 			}
 		}
 	}
@@ -302,12 +368,18 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 		if _, hasXDNS := dnsObj["xDNS"]; hasXDNS {
 			notes = append(notes, "Ignored deprecated dns.xDNS section")
 		}
+		if dog, hasDog := dnsObj["dog"]; hasDog && !isEmptyJSONVal(dog) {
+			notes = append(notes, "Ignored deprecated dns.dog (DNS over gRPC is not supported in v3; configure DoH instead)")
+		}
 	}
 
-	// FORWARD: FWD0, FWD1, Rproxy, ACME CF token
+	// FORWARD: FWD0, FWD1, Rproxy, ACME CF token, block53, DoGs
 	if fwd, ok := doc["FORWARD"].(map[string]any); ok {
 		if dom := strVal(fwd["domain"]); dom != "" {
 			st.Cert.Domain = dom
+		}
+		if email := strVal(fwd["email"]); email != "" {
+			st.Cert.CFEmail = email
 		}
 		if tok := strVal(fwd["token"]); tok != "" {
 			st.Cert.CFToken = tok
@@ -316,6 +388,12 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 		} else if key := strVal(fwd["APIkey"]); key != "" {
 			st.Cert.CFToken = key
 			st.Cert.Mode = "acme"
+		}
+		if strings.EqualFold(strVal(fwd["block53"]), "on") {
+			st.Client.DNS.BlockExternal53 = true
+		}
+		if dogs, hasDogs := fwd["DoGs"]; hasDogs && !isEmptyJSONVal(dogs) {
+			notes = append(notes, "Ignored deprecated FORWARD.DoGs (DNS over gRPC server is not supported in v3)")
 		}
 		if f0, ok := fwd["FWD0"].(map[string]any); ok {
 			var uuids []string
@@ -331,10 +409,14 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 				}
 			}
 			st.Client.FWD0 = state.FWD0Config{
-				Enabled: strings.EqualFold(strVal(f0["status"]), "on"),
-				Port:    intVal(f0["port"], 0),
-				Path:    strVal(f0["path"]),
-				UUIDs:   uuids,
+				Enabled:  strings.EqualFold(strVal(f0["status"]), "on"),
+				Protocol: "vmess-tcp",
+				Port:     intVal(f0["port"], 0),
+				Path:     strVal(f0["path"]),
+				UUIDs:    uuids,
+			}
+			if st.Client.FWD0.Enabled {
+				notes = append(notes, "Imported FWD0 with legacy vmess-tcp protocol (no TLS)")
 			}
 			if st.Client.FWD0.Enabled && st.Client.FWD0.Port > 0 && st.Auth.ListenAddr == fmt.Sprintf(":%d", st.Client.FWD0.Port) {
 				nextPort := 8443
@@ -360,10 +442,14 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 			}
 			st.Client.FWD1 = state.FWD1Config{
 				Enabled:        strings.EqualFold(strVal(f1["status"]), "on"),
+				Protocol:       "vmess-tcp",
 				Port:           intVal(f1["port"], 0),
 				Path:           strVal(f1["path"]),
 				UUIDs:          uuids,
 				UpstreamNodeID: resolveNodeID(strVal(f1["upstream"])),
+			}
+			if st.Client.FWD1.Enabled {
+				notes = append(notes, "Imported FWD1 with legacy vmess-tcp protocol (no TLS)")
 			}
 		}
 		if rp, ok := fwd["Rproxy"].(map[string]any); ok {
@@ -399,7 +485,53 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 					TunnelAddress: tAddr,
 					TunnelPort:    tPort,
 					TunnelUUID:    strVal(tun["uuid"]),
+					OutDirect:     strings.EqualFold(strVal(rc["outStatus"]), "on"),
 					Mappings:      maps,
+				}
+			}
+			if rs, ok := rp["server"].(map[string]any); ok {
+				tun, _ := rs["tunnel"].(map[string]any)
+				lp := intVal(tun["port"], 0)
+				tu := strVal(tun["uuid"])
+				if lp > 0 && tu != "" {
+					var inUUIDs []string
+					if !strings.EqualFold(strVal(rs["inStatus"]), "off") {
+						if arr, ok := rs["inUUID"].([]any); ok {
+							for _, item := range arr {
+								if m, ok := item.(map[string]any); ok {
+									if u := strVal(m["RproxyS0uuid"]); u != "" {
+										inUUIDs = append(inUUIDs, u)
+									}
+								} else if s := strVal(item); s != "" {
+									inUUIDs = append(inUUIDs, s)
+								}
+							}
+						}
+					}
+					var maps []state.RproxyServerMapping
+					if !strings.EqualFold(strVal(rs["mappingStatus"]), "off") {
+						if arr, ok := rs["mapping"].([]any); ok {
+							for _, item := range arr {
+								if m, ok := item.(map[string]any); ok {
+									mp := intVal(m["port"], 0)
+									if mp > 0 {
+										maps = append(maps, state.RproxyServerMapping{
+											Port:  mp,
+											Proto: normalizeProto(strVal(m["protocol"])),
+										})
+									}
+								}
+							}
+						}
+					}
+					st.RproxyS = state.RproxySConfig{
+						Enabled:    !strings.EqualFold(strVal(rs["status"]), "off"),
+						Domain:     st.Cert.Domain,
+						ListenPort: lp,
+						UUIDs:      []string{tu},
+						InUUIDs:    inUUIDs,
+						Mappings:   maps,
+					}
 				}
 			}
 		}
@@ -412,6 +544,7 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 		port := intVal(srv["WGport"], 51820)
 		spriv := strVal(srv["sprivatekey"])
 		spub := strVal(srv["spublickey"])
+		wgEnabled := !strings.EqualFold(strVal(wgObj["status"]), "off") && !strings.EqualFold(strVal(srv["status"]), "off")
 		var peers []state.WGPeer
 		seenPeerNames := make(map[string]struct{})
 		if arr, ok := wgObj["clients"].([]any); ok {
@@ -447,7 +580,7 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 		}
 		if addr != "" && spriv != "" && spub != "" {
 			st.Client.WireGuard = state.WireGuardConfig{
-				Enabled:          true,
+				Enabled:          wgEnabled,
 				EndpointHost:     addr,
 				ListenPort:       port,
 				SubnetCIDR:       "172.16.66.1/24",
@@ -469,12 +602,14 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 			if tok == "" {
 				tok = strVal(cf["cfAPIkey"])
 			}
+			email := strVal(cf["cfEmail"])
 			if dom != "" && tok != "" {
 				st.Client.DDNS = state.DDNSConfig{
 					Enabled:  true,
 					Provider: "cloudflare",
 					Domain:   dom,
 					CFToken:  tok,
+					CFEmail:  email,
 				}
 			}
 		}
@@ -581,6 +716,14 @@ func importExtraInboundsDir(dir string) ([]state.ExtraInbound, []string) {
 					ex.RealityShortID = sids[0]
 				}
 			}
+			if ex.RealityPubKey == "" {
+				ex.RealityPubKey = readRealityPubKeyFromInfo(filepath.Join(dir, "vtrui", "reality.info"))
+			}
+			if ex.RealityPubKey == "" && ex.RealityPrivKey != "" {
+				if derived, derr := cryptoext.DeriveRealityPublicKey(ex.RealityPrivKey); derr == nil {
+					ex.RealityPubKey = derived
+				}
+			}
 		case proto == "vless" && netName == "xhttp":
 			ex.Protocol = "vless-xhttp"
 			ex.ViaNginx = sec == "none"
@@ -632,6 +775,23 @@ func importExtraInboundsDir(dir string) ([]state.ExtraInbound, []string) {
 		out = append(out, ex)
 	}
 	return out, nil
+}
+
+func readRealityPubKeyFromInfo(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if v, ok := strings.CutPrefix(line, "PUBKEY="); ok {
+			return strings.TrimSpace(v)
+		}
+		if v, ok := strings.CutPrefix(line, "Public key:"); ok {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 func readStringIntMap(path string) map[string]int {

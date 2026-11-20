@@ -51,7 +51,51 @@ start_pre() {
 			})
 		}
 
+		if b.MosDNSNeeded {
+			script := fmt.Sprintf(`#!/sbin/openrc-run
+description="DEX MosDNS Split Resolver"
+command="%s"
+command_args="start -c %s"
+command_background=true
+pidfile="/run/dex-mosdns.pid"
+output_log="/var/log/dex-mosdns.log"
+error_log="/var/log/dex-mosdns.log"
+
+depend() {
+  need net
+}
+
+start_pre() {
+  [ -s %s ] || return 1
+  export GOMEMLIMIT="%s"
+}
+`, opts.MosDNSBin, mosdnsConf, mosdnsConf, memLimit)
+			out = append(out, RenderedFile{
+				RelName:    "openrc/dex-mosdns",
+				TargetPath: "/etc/init.d/dex-mosdns",
+				Content:    []byte(script),
+				Mode:       0o755,
+			})
+		}
+
 		if b.NFTClientNeeded || b.NFTRelayNeeded {
+			tproxyStart := ""
+			tproxyStop := ""
+			if b.NFTClientNeeded {
+				tproxyStart = `
+  ip route replace local default dev lo scope host table 220
+  ip rule list priority 100 | grep -Fq "fwmark 0x9 lookup 220" || ip rule add fwmark 0x9 table 220 priority 100`
+				if s.System.EnableIPv6 {
+					tproxyStart += `
+  ip -6 route replace local default dev lo table 220
+  ip -6 rule list priority 100 | grep -Fq "fwmark 0x9 lookup 220" || ip -6 rule add fwmark 0x9 table 220 priority 100`
+				}
+				tproxyStop = `
+  ip rule del fwmark 0x9 table 220 priority 100 2>/dev/null || true
+  ip route del local default dev lo table 220 2>/dev/null || true
+  ip -6 rule del fwmark 0x9 table 220 priority 100 2>/dev/null || true
+  ip -6 route del local default dev lo table 220 2>/dev/null || true`
+			}
 			script := fmt.Sprintf(`#!/sbin/openrc-run
 description="DEX nftables Rules"
 depend() {
@@ -59,7 +103,7 @@ depend() {
 }
 start() {
   ebegin "Loading dex nftables"
-  [ -s %s ] && nft -f %s
+  [ -s %s ] && nft -f %s%s
   eend $?
 }
 stop() {
@@ -68,10 +112,10 @@ stop() {
   nft delete table inet dex_filter 2>/dev/null || true
   nft delete table inet dex_nat 2>/dev/null || true
   nft delete table inet dex_flow 2>/dev/null || true
-  nft delete table inet dex_relay 2>/dev/null || true
+  nft delete table inet dex_relay 2>/dev/null || true%s
   eend 0
 }
-`, nftConf, nftConf)
+`, nftConf, nftConf, tproxyStart, tproxyStop)
 			out = append(out, RenderedFile{
 				RelName:    "openrc/dex-nft",
 				TargetPath: "/etc/init.d/dex-nft",

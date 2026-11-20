@@ -7,6 +7,13 @@ import (
 	"github.com/stuinxo/de_GWD/v3/internal/state"
 )
 
+func listenSSLDirective(port int, legacyHTTP2 bool) string {
+	if legacyHTTP2 {
+		return fmt.Sprintf("  listen %d ssl http2;", port)
+	}
+	return fmt.Sprintf("  listen %d ssl;\n  http2 on;", port)
+}
+
 // RenderNginx generates a single declarative Nginx config (/etc/nginx/conf.d/dex-server.conf)
 // without sed block slicing.
 func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, err error) {
@@ -58,8 +65,7 @@ func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, 
 
 `)
 		fmt.Fprintf(&b, `server {
-  listen %d ssl;
-  http2 on;
+%s
   server_name %s;
   root %s;
   index index.html index.htm;
@@ -81,7 +87,7 @@ func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, 
   ssl_buffer_size 4k;
   ssl_early_data on;
 
-`, port, domain, webRoot, port, opts.CertFile, opts.KeyFile)
+`, listenSSLDirective(port, opts.NginxLegacyHTTP2), domain, webRoot, port, opts.CertFile, opts.KeyFile)
 
 		if s.Server.EnableDoH {
 			b.WriteString(`  location /dq {
@@ -103,10 +109,17 @@ func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, 
 `)
 		}
 
+		mainProto := s.Server.EffectiveProtocol()
+		mainConnHeaders := `    proxy_set_header            Connection "";`
+		if mainProto == "vmess-ws" || mainProto == "vless-ws" {
+			mainConnHeaders = `    proxy_set_header            Upgrade $http_upgrade;
+    proxy_set_header            Connection "upgrade";`
+		}
+
 		fmt.Fprintf(&b, `  location %s {
     proxy_pass                  http://dex_xray;
     proxy_http_version          1.1;
-    proxy_set_header            Connection "";
+%s
     proxy_set_header            Host $host;
     proxy_set_header            X-Real-IP $remote_addr;
     proxy_set_header            X-Real-PORT $remote_port;
@@ -121,7 +134,7 @@ func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, 
     proxy_send_timeout          600s;
   }
 }
-`, xhttpPath)
+`, xhttpPath, mainConnHeaders)
 	}
 
 	for _, ex := range extraViaNginx {
@@ -137,8 +150,7 @@ func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, 
 		}
 		fmt.Fprintf(&b, `
 server {
-  listen %d ssl;
-  http2 on;
+%s
   server_name %s;
   ssl_certificate %s;
   ssl_certificate_key %s;
@@ -157,7 +169,7 @@ server {
     proxy_read_timeout 600s;
   }
 }
-`, ex.ListenPort, dom, opts.CertFile, opts.KeyFile, path, ExtraInternalPort(ex.ListenPort), wsHeaders)
+`, listenSSLDirective(ex.ListenPort, opts.NginxLegacyHTTP2), dom, opts.CertFile, opts.KeyFile, path, ExtraInternalPort(ex.ListenPort), wsHeaders)
 	}
 
 	return []byte(b.String()), true, nil

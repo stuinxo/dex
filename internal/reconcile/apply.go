@@ -91,7 +91,7 @@ func servicesForFile(relName, targetPath, wgUnit string) ([]string, bool) {
 		return []string{"dex-xray"}, true
 	case relName == "nftables.conf" || relName == "systemd/dex-nft.service" || relName == "openrc/dex-nft":
 		return []string{"dex-nft"}, true
-	case strings.HasPrefix(relName, "mosdns/") || relName == "systemd/dex-mosdns.service":
+	case strings.HasPrefix(relName, "mosdns/") || relName == "systemd/dex-mosdns.service" || relName == "openrc/dex-mosdns":
 		return []string{"dex-mosdns"}, true
 	case relName == "haproxy.cfg":
 		return []string{"haproxy"}, true
@@ -122,7 +122,7 @@ func servicesForFile(relName, targetPath, wgUnit string) ([]string, bool) {
 		return []string{"dex-xray"}, true
 	case base == "nftables.conf" || base == "dex-nft.service" || targetPath == "/etc/init.d/dex-nft":
 		return []string{"dex-nft"}, true
-	case strings.Contains(slash, "/mosdns/") || base == "dex-mosdns.service":
+	case strings.Contains(slash, "/mosdns/") || base == "dex-mosdns.service" || targetPath == "/etc/init.d/dex-mosdns":
 		return []string{"dex-mosdns"}, true
 	case targetPath == "/etc/haproxy/haproxy.cfg":
 		return []string{"haproxy"}, true
@@ -194,6 +194,53 @@ func readChnRouteFile(path string) []string {
 	return out
 }
 
+func isNonEmptyFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir() && info.Size() > 0
+}
+
+func isNginxLegacyHTTP2(versionOutput string) bool {
+	idx := strings.Index(versionOutput, "nginx/")
+	if idx < 0 {
+		return false
+	}
+	rest := versionOutput[idx+len("nginx/"):]
+	end := strings.IndexAny(rest, " \t\r\n")
+	if end >= 0 {
+		rest = rest[:end]
+	}
+	parts := strings.Split(rest, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	var nums [3]int
+	for i := 0; i < len(parts) && i < 3; i++ {
+		n, err := fmt.Sscanf(parts[i], "%d", &nums[i])
+		if err != nil || n != 1 {
+			return false
+		}
+	}
+	if nums[0] != 1 {
+		return nums[0] < 1
+	}
+	if nums[1] != 25 {
+		return nums[1] < 25
+	}
+	return nums[2] < 1
+}
+
+func stateNeedsNginx(st *state.State) bool {
+	if st.Role == state.RoleServer && st.Server.TLSMode == "nginx" {
+		return true
+	}
+	for _, ex := range st.ExtraInbounds {
+		if ex.ViaNginx {
+			return true
+		}
+	}
+	return false
+}
+
 func populateRenderOptions(ctx context.Context, st *state.State, store *state.Store, exec SystemExecutor, opts ApplyOptions) (render.RenderOptions, []string) {
 	ropts := opts.RenderOpts
 	if ropts.StateDir == "" {
@@ -203,12 +250,32 @@ func populateRenderOptions(ctx context.Context, st *state.State, store *state.St
 		ropts.GeneratedDir = store.GeneratedDir()
 	}
 	if ropts.CertFile == "" {
-		ropts.CertFile = store.DefaultCert()
+		if st.Cert.Mode == "imported" && st.Cert.CertFile != "" && st.Cert.KeyFile != "" {
+			ropts.CertFile = st.Cert.CertFile
+		} else {
+			ropts.CertFile = store.DefaultCert()
+		}
 	}
 	if ropts.KeyFile == "" {
-		ropts.KeyFile = store.DefaultKey()
+		if st.Cert.Mode == "imported" && st.Cert.CertFile != "" && st.Cert.KeyFile != "" {
+			ropts.KeyFile = st.Cert.KeyFile
+		} else {
+			ropts.KeyFile = store.DefaultKey()
+		}
 	}
 	ropts = ropts.WithDefaults()
+
+	if !ropts.DomainsAppleExists {
+		ropts.DomainsAppleExists = isNonEmptyFile(mapTargetPath(opts.RootPrefix, ropts.DomainsApplePath))
+	}
+	if !ropts.DomainsGamesExists {
+		ropts.DomainsGamesExists = isNonEmptyFile(mapTargetPath(opts.RootPrefix, ropts.DomainsGamesPath))
+	}
+	if !opts.RenderOpts.NginxLegacyHTTP2 && stateNeedsNginx(st) && exec != nil && exec.HasCommand("nginx") {
+		if out, _ := exec.RunCommand(ctx, nil, "nginx", "-v"); out != "" {
+			ropts.NginxLegacyHTTP2 = isNginxLegacyHTTP2(out)
+		}
+	}
 
 	if ropts.InitSystem == "" || opts.RenderOpts.InitSystem == "" {
 		ropts.InitSystem = exec.DetectInitSystem()
@@ -261,6 +328,16 @@ func populateRenderOptions(ctx context.Context, st *state.State, store *state.St
 		}
 		for _, rawDoH := range st.Client.DNS.DoHServers {
 			if host := render.ExtractDoHHost(rawDoH); host != "" {
+				resolveHost(host)
+			}
+		}
+		for _, dom := range st.Client.DNS.BlacklistDomains {
+			if host := render.ExtractDomainHost(dom); host != "" {
+				resolveHost(host)
+			}
+		}
+		for _, dom := range st.Client.DNS.WhitelistDomains {
+			if host := render.ExtractDomainHost(dom); host != "" {
 				resolveHost(host)
 			}
 		}
@@ -383,6 +460,16 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 	// Ensure a self-signed fallback cert exists whenever TLS is referenced before ACME/import.
 	certCreated := false
 	if !opts.DryRun {
+		if st.Role == state.RoleClient && st.Client.DNS.BlockAds {
+			adsDiskPath := mapTargetPath(opts.RootPrefix, filepath.Join(ropts.StateDir, "rules", "Domains.ads.txt"))
+			if _, statErr := os.Stat(adsDiskPath); os.IsNotExist(statErr) {
+				if werr := writeBytesExact(adsDiskPath, []byte{}, 0o644); werr != nil {
+					warnings = append(warnings, fmt.Sprintf("create placeholder Domains.ads.txt: %v", werr))
+				} else {
+					warnings = append(warnings, "Domains.ads.txt missing; created empty placeholder (run 'dex rules update --ads' to populate)")
+				}
+			}
+		}
 		certTarget := ropts.CertFile
 		keyTarget := ropts.KeyFile
 		if st.Cert.Mode == "imported" && st.Cert.CertFile != "" && st.Cert.KeyFile != "" {

@@ -23,6 +23,7 @@ import (
 type ACMEConfig struct {
 	Domain    string
 	CFToken   string
+	CFEmail   string
 	AutoRenew bool
 	AcmeBin   string
 	AcmeHome  string
@@ -224,6 +225,12 @@ func IssueCloudflareACME(ctx context.Context, runner ACMERunner, cfg ACMEConfig)
 	scrubLegacyKeys(accountConf)
 
 	env := []string{"CF_Token=" + strings.TrimSpace(cfg.CFToken)}
+	if strings.TrimSpace(cfg.CFEmail) != "" {
+		env = []string{
+			"CF_Key=" + strings.TrimSpace(cfg.CFToken),
+			"CF_Email=" + strings.TrimSpace(cfg.CFEmail),
+		}
+	}
 	if _, err := runner.Run(ctx, env, cfg.AcmeBin, "--home", cfg.AcmeHome, "--set-default-ca", "--server", "letsencrypt"); err != nil {
 		return nil, fmt.Errorf("acme set-default-ca: %w", err)
 	}
@@ -286,7 +293,7 @@ func scrubLegacyKeys(path string) {
 	var kept []string
 	for _, l := range lines {
 		t := strings.TrimSpace(l)
-		if strings.Contains(t, "CF_Key") || strings.Contains(t, "CF_Email") || strings.Contains(t, "example.com") {
+		if strings.Contains(t, "CF_Token") || strings.Contains(t, "CF_Key") || strings.Contains(t, "CF_Email") || strings.Contains(t, "example.com") {
 			continue
 		}
 		kept = append(kept, l)

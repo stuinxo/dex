@@ -23,17 +23,59 @@ type CloudflareDDNS struct {
 	FetchPublic6 func(ctx context.Context) (string, error)
 	Hub          *TaskHub
 
-	mu         sync.Mutex
-	lastIP4    string
-	lastIP6    string
-	zoneCache  map[string]string // domain -> zoneID
-	recCache4  map[string]string // domain -> recordID
-	recCache6  map[string]string // domain -> recordID
+	mu        sync.Mutex
+	lastIP4   string
+	lastIP6   string
+	zoneCache map[string]string // domain -> zoneID
+	recCache4 map[string]string // domain -> recordID
+	recCache6 map[string]string // domain -> recordID
+}
+
+var (
+	cnPublicIPv4URLs = []string{
+		"https://4.ipw.cn",
+		"https://myip.ipip.net/s",
+		"https://members.3322.org/dyndns/getip",
+		"https://api.ipify.org",
+	}
+	cnPublicIPv6URLs = []string{
+		"https://6.ipw.cn",
+		"https://api6.ipify.org",
+		"https://ifconfig.me",
+	}
+	globalPublicIPv4URLs = []string{
+		"https://api.ipify.org",
+		"https://ip.sb",
+		"https://ifconfig.me",
+	}
+)
+
+func newDirectHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			DialContext:       newDirectDialer().DialContext,
+			ForceAttemptHTTP2: true,
+			DisableKeepAlives: true,
+		},
+	}
+}
+
+// FetchCNPublicIP probes the host's direct domestic WAN IPv4 using SO_MARK=0xff to bypass local TPROXY.
+func FetchCNPublicIP(ctx context.Context) (string, error) {
+	return fetchPublicIP(ctx, newDirectHTTPClient(), cnPublicIPv4URLs, false)
+}
+
+// FetchGlobalPublicIP probes the outbound proxy/global public IPv4 through the active routing path.
+func FetchGlobalPublicIP(ctx context.Context) (string, error) {
+	c := &http.Client{Timeout: 10 * time.Second}
+	return fetchPublicIP(ctx, c, globalPublicIPv4URLs, false)
 }
 
 // NewCloudflareDDNS constructs a CloudflareDDNS updater.
 func NewCloudflareDDNS(hub *TaskHub) *CloudflareDDNS {
 	c := &http.Client{Timeout: 10 * time.Second}
+	directClient := newDirectHTTPClient()
 	d := &CloudflareDDNS{
 		BaseURL:    "https://api.cloudflare.com/client/v4",
 		HTTPClient: c,
@@ -43,10 +85,10 @@ func NewCloudflareDDNS(hub *TaskHub) *CloudflareDDNS {
 		recCache6:  make(map[string]string),
 	}
 	d.FetchPublic4 = func(ctx context.Context) (string, error) {
-		return fetchPublicIP(ctx, c, []string{"https://api.ipify.org", "https://ip.sb", "https://ifconfig.me"}, false)
+		return fetchPublicIP(ctx, directClient, cnPublicIPv4URLs, false)
 	}
 	d.FetchPublic6 = func(ctx context.Context) (string, error) {
-		return fetchPublicIP(ctx, c, []string{"https://api6.ipify.org", "https://ifconfig.me"}, true)
+		return fetchPublicIP(ctx, directClient, cnPublicIPv6URLs, true)
 	}
 	return d
 }
@@ -90,8 +132,15 @@ type SyncResult struct {
 
 // SyncOnce checks public IPv4 (and IPv6 if enableIPv6) and updates Cloudflare if changed or forced.
 func (d *CloudflareDDNS) SyncOnce(ctx context.Context, domain, cfToken string, enableIPv6, force bool) (*SyncResult, error) {
+	return d.SyncOnceWithEmail(ctx, domain, cfToken, "", enableIPv6, force)
+}
+
+// SyncOnceWithEmail checks public IPv4/IPv6 and updates Cloudflare using Bearer API Token
+// or Global API Key (X-Auth-Email + X-Auth-Key) when cfEmail is non-empty.
+func (d *CloudflareDDNS) SyncOnceWithEmail(ctx context.Context, domain, cfToken, cfEmail string, enableIPv6, force bool) (*SyncResult, error) {
 	domain = strings.TrimSpace(domain)
 	cfToken = strings.TrimSpace(cfToken)
+	cfEmail = strings.TrimSpace(cfEmail)
 	if domain == "" || cfToken == "" {
 		return nil, errors.New("missing DDNS domain or Cloudflare token")
 	}
@@ -107,7 +156,7 @@ func (d *CloudflareDDNS) SyncOnce(ctx context.Context, domain, cfToken string, e
 	need4 := force || ip4 != d.lastIP4
 	d.mu.Unlock()
 	if need4 {
-		if err := d.upsertRecord(ctx, domain, cfToken, "A", ip4); err != nil {
+		if err := d.upsertRecord(ctx, domain, cfToken, cfEmail, "A", ip4); err != nil {
 			return nil, fmt.Errorf("update A record: %w", err)
 		}
 		d.mu.Lock()
@@ -126,7 +175,7 @@ func (d *CloudflareDDNS) SyncOnce(ctx context.Context, domain, cfToken string, e
 			need6 := force || ip6 != d.lastIP6
 			d.mu.Unlock()
 			if need6 {
-				if err := d.upsertRecord(ctx, domain, cfToken, "AAAA", ip6); err != nil {
+				if err := d.upsertRecord(ctx, domain, cfToken, cfEmail, "AAAA", ip6); err != nil {
 					return res, fmt.Errorf("update AAAA record: %w", err)
 				}
 				d.mu.Lock()
@@ -142,7 +191,7 @@ func (d *CloudflareDDNS) SyncOnce(ctx context.Context, domain, cfToken string, e
 	return res, nil
 }
 
-func (d *CloudflareDDNS) cfRequest(ctx context.Context, method, path, token string, body any, out any) error {
+func (d *CloudflareDDNS) cfRequest(ctx context.Context, method, path, token, email string, body any, out any) error {
 	var bodyReader io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -155,7 +204,12 @@ func (d *CloudflareDDNS) cfRequest(ctx context.Context, method, path, token stri
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	if strings.TrimSpace(email) != "" {
+		req.Header.Set("X-Auth-Email", strings.TrimSpace(email))
+		req.Header.Set("X-Auth-Key", token)
+	} else {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := d.HTTPClient.Do(req)
 	if err != nil {
@@ -183,7 +237,7 @@ func (d *CloudflareDDNS) cfRequest(ctx context.Context, method, path, token stri
 	return nil
 }
 
-func (d *CloudflareDDNS) findZoneID(ctx context.Context, domain, token string) (string, error) {
+func (d *CloudflareDDNS) findZoneID(ctx context.Context, domain, token, email string) (string, error) {
 	d.mu.Lock()
 	zid := d.zoneCache[domain]
 	d.mu.Unlock()
@@ -195,7 +249,7 @@ func (d *CloudflareDDNS) findZoneID(ctx context.Context, domain, token string) (
 		ID   string `json:"id"`
 		Name string `json:"name"`
 	}
-	if err := d.cfRequest(ctx, http.MethodGet, "/zones?per_page=50", token, nil, &zones); err != nil {
+	if err := d.cfRequest(ctx, http.MethodGet, "/zones?per_page=50", token, email, nil, &zones); err != nil {
 		return "", err
 	}
 	bestLen := -1
@@ -216,8 +270,8 @@ func (d *CloudflareDDNS) findZoneID(ctx context.Context, domain, token string) (
 	return zid, nil
 }
 
-func (d *CloudflareDDNS) upsertRecord(ctx context.Context, domain, token, recType, ip string) error {
-	zoneID, err := d.findZoneID(ctx, domain, token)
+func (d *CloudflareDDNS) upsertRecord(ctx context.Context, domain, token, email, recType, ip string) error {
+	zoneID, err := d.findZoneID(ctx, domain, token, email)
 	if err != nil {
 		return err
 	}
@@ -237,7 +291,7 @@ func (d *CloudflareDDNS) upsertRecord(ctx context.Context, domain, token, recTyp
 			Content string `json:"content"`
 		}
 		q := fmt.Sprintf("/zones/%s/dns_records?type=%s&name=%s", zoneID, recType, url.QueryEscape(domain))
-		if err := d.cfRequest(ctx, http.MethodGet, q, token, nil, &recs); err != nil {
+		if err := d.cfRequest(ctx, http.MethodGet, q, token, email, nil, &recs); err != nil {
 			return err
 		}
 		for _, r := range recs {
@@ -262,12 +316,12 @@ func (d *CloudflareDDNS) upsertRecord(ctx context.Context, domain, token, recTyp
 		"proxied": false,
 	}
 	if recID != "" {
-		return d.cfRequest(ctx, http.MethodPut, fmt.Sprintf("/zones/%s/dns_records/%s", zoneID, recID), token, payload, nil)
+		return d.cfRequest(ctx, http.MethodPut, fmt.Sprintf("/zones/%s/dns_records/%s", zoneID, recID), token, email, payload, nil)
 	}
 	var created struct {
 		ID string `json:"id"`
 	}
-	if err := d.cfRequest(ctx, http.MethodPost, fmt.Sprintf("/zones/%s/dns_records", zoneID), token, payload, &created); err != nil {
+	if err := d.cfRequest(ctx, http.MethodPost, fmt.Sprintf("/zones/%s/dns_records", zoneID), token, email, payload, &created); err != nil {
 		return err
 	}
 	if created.ID != "" {

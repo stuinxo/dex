@@ -144,6 +144,7 @@ func TestImportPairAndSelfSigned(t *testing.T) {
 type fakeACMERunner struct {
 	t         *testing.T
 	calls     [][]string
+	envs      [][]string
 	mainDom   string
 	certBytes []byte
 	keyBytes  []byte
@@ -151,6 +152,7 @@ type fakeACMERunner struct {
 
 func (f *fakeACMERunner) Run(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
 	f.calls = append(f.calls, append([]string{name}, args...))
+	f.envs = append(f.envs, append([]string(nil), env...))
 	for i := 0; i < len(args); i++ {
 		if args[i] == "--issue" {
 			var home string
@@ -204,5 +206,44 @@ func TestIssueCloudflareACMEAndTokenScrub(t *testing.T) {
 	}
 	if strings.Contains(string(accData), "CF_Token") || strings.Contains(string(accData), "CF_Key") {
 		t.Fatalf("expected CF credentials scrubbed when AutoRenew=false, got %q", string(accData))
+	}
+
+	// Verify scrubLegacyKeys removes stale CF_Token / CF_Key / CF_Email while preserving unrelated keys
+	legacyConf := filepath.Join(dir, "legacy-account.conf")
+	_ = os.WriteFile(legacyConf, []byte("SAVED_CF_Token='stale-tok'\nSAVED_CF_Key='stale-key'\nSAVED_CF_Email='old@example.com'\nOTHER_KEY='keep'\n"), 0o600)
+	scrubLegacyKeys(legacyConf)
+	scrubbed, err := os.ReadFile(legacyConf)
+	if err != nil {
+		t.Fatalf("read legacyConf: %v", err)
+	}
+	if strings.Contains(string(scrubbed), "CF_Token") || strings.Contains(string(scrubbed), "CF_Key") || strings.Contains(string(scrubbed), "CF_Email") || !strings.Contains(string(scrubbed), "OTHER_KEY='keep'") {
+		t.Fatalf("expected stale CF_* scrubbed and OTHER_KEY preserved, got %q", string(scrubbed))
+	}
+
+	// Verify Global API Key (CFEmail != "") passes CF_Key + CF_Email and scrubs them when AutoRenew=false
+	runnerEmail := &fakeACMERunner{
+		t:         t,
+		mainDom:   "example.com",
+		certBytes: cPEM,
+		keyBytes:  kPEM,
+	}
+	if _, err := IssueCloudflareACME(context.Background(), runnerEmail, ACMEConfig{
+		Domain:    "sub.example.com",
+		CFToken:   "global-key",
+		CFEmail:   "owner@example.com",
+		AutoRenew: false,
+		AcmeBin:   filepath.Join(acmeHome, "acme.sh"),
+		AcmeHome:  acmeHome,
+		CertPath:  filepath.Join(dir, "dex2.cer"),
+		KeyPath:   filepath.Join(dir, "dex2.key"),
+	}); err != nil {
+		t.Fatalf("IssueCloudflareACME with CFEmail: %v", err)
+	}
+	if len(runnerEmail.envs) == 0 || !strings.Contains(strings.Join(runnerEmail.envs[0], ","), "CF_Key=global-key") || !strings.Contains(strings.Join(runnerEmail.envs[0], ","), "CF_Email=owner@example.com") {
+		t.Fatalf("expected CF_Key and CF_Email in acme env, got %+v", runnerEmail.envs)
+	}
+	accData2, _ := os.ReadFile(filepath.Join(acmeHome, "account.conf"))
+	if strings.Contains(string(accData2), "CF_Token") || strings.Contains(string(accData2), "CF_Key") || strings.Contains(string(accData2), "CF_Email") {
+		t.Fatalf("expected CF_Token/CF_Key/CF_Email scrubbed when AutoRenew=false, got %q", string(accData2))
 	}
 }

@@ -51,6 +51,7 @@ type CertConfig struct {
 	CertFile  string `json:"cert_file,omitempty"`
 	KeyFile   string `json:"key_file,omitempty"`
 	CFToken   string `json:"cf_token,omitempty"`
+	CFEmail   string `json:"cf_email,omitempty"`
 	AutoRenew bool   `json:"auto_renew"`
 }
 
@@ -70,7 +71,7 @@ type ClientConfig struct {
 type OutboundNode struct {
 	ID             string `json:"id"`
 	Name           string `json:"name"`
-	Protocol       string `json:"protocol"` // vless-xhttp | vless-reality | vless-ws | vmess-ws | socks5
+	Protocol       string `json:"protocol"` // vless-xhttp | vless-reality | vless-ws | vmess-ws | vmess-tcp | socks5
 	Address        string `json:"address"`
 	Port           int    `json:"port"`
 	UUID           string `json:"uuid,omitempty"`
@@ -114,29 +115,52 @@ type DNSConfig struct {
 	BlacklistIPs     []string          `json:"blacklist_ips,omitempty"`
 	WhitelistIPs     []string          `json:"whitelist_ips,omitempty"`
 	BlockAds         bool              `json:"block_ads"`
+	BlockExternal53  bool              `json:"block_external_53"`
 }
 
 type FWD0Config struct {
-	Enabled bool     `json:"enabled"`
-	Port    int      `json:"port"`
-	Path    string   `json:"path,omitempty"`
-	UUIDs   []string `json:"uuids,omitempty"`
+	Enabled  bool     `json:"enabled"`
+	Protocol string   `json:"protocol,omitempty"` // vless-xhttp (default) | vmess-tcp
+	Port     int      `json:"port"`
+	Path     string   `json:"path,omitempty"`
+	UUIDs    []string `json:"uuids,omitempty"`
+}
+
+// EffectiveProtocol returns the FWD0 inbound protocol, defaulting to vless-xhttp.
+func (f FWD0Config) EffectiveProtocol() string {
+	if strings.TrimSpace(f.Protocol) != "" {
+		return strings.TrimSpace(f.Protocol)
+	}
+	return "vless-xhttp"
 }
 
 type FWD1Config struct {
 	Enabled        bool     `json:"enabled"`
+	Protocol       string   `json:"protocol,omitempty"` // vless-xhttp (default) | vmess-tcp
 	Port           int      `json:"port"`
 	Path           string   `json:"path,omitempty"`
 	UUIDs          []string `json:"uuids,omitempty"`
 	UpstreamNodeID string   `json:"upstream_node_id,omitempty"`
 }
 
+// EffectiveProtocol returns the FWD1 inbound protocol, defaulting to vless-xhttp.
+func (f FWD1Config) EffectiveProtocol() string {
+	if strings.TrimSpace(f.Protocol) != "" {
+		return strings.TrimSpace(f.Protocol)
+	}
+	return "vless-xhttp"
+}
+
 type RproxyCConfig struct {
-	Enabled       bool                  `json:"enabled"`
-	TunnelAddress string                `json:"tunnel_address,omitempty"`
-	TunnelPort    int                   `json:"tunnel_port,omitempty"`
-	TunnelUUID    string                `json:"tunnel_uuid,omitempty"`
-	Mappings      []RproxyClientMapping `json:"mappings,omitempty"`
+	Enabled              bool                  `json:"enabled"`
+	TunnelAddress        string                `json:"tunnel_address,omitempty"`
+	TunnelPort           int                   `json:"tunnel_port,omitempty"`
+	TunnelUUID           string                `json:"tunnel_uuid,omitempty"`
+	Security             string                `json:"security,omitempty"` // tls (default) | none
+	ServerName           string                `json:"server_name,omitempty"`
+	PinnedPeerCertSha256 string                `json:"pinned_peer_cert_sha256,omitempty"`
+	OutDirect            bool                  `json:"out_direct,omitempty"`
+	Mappings             []RproxyClientMapping `json:"mappings,omitempty"`
 }
 
 type RproxyClientMapping struct {
@@ -168,11 +192,13 @@ type DDNSConfig struct {
 	Provider   string `json:"provider,omitempty"` // cloudflare
 	Domain     string `json:"domain,omitempty"`
 	CFToken    string `json:"cf_token,omitempty"`
+	CFEmail    string `json:"cf_email,omitempty"`
 	EnableIPv6 bool   `json:"enable_ipv6"`
 }
 
 type ServerConfig struct {
-	TLSMode         string          `json:"tls_mode"` // direct | nginx
+	Protocol        string          `json:"protocol,omitempty"` // vless-xhttp (default) | vmess-ws | vless-ws
+	TLSMode         string          `json:"tls_mode"`           // direct | nginx
 	Domain          string          `json:"domain,omitempty"`
 	ConnectHost     string          `json:"connect_host,omitempty"`
 	ListenPort      int             `json:"listen_port"`
@@ -182,6 +208,14 @@ type ServerConfig struct {
 	EnableDoH       bool            `json:"enable_doh"`
 	CamouflageDir   string          `json:"camouflage_dir,omitempty"`
 	Socks5Outbounds []Socks5Profile `json:"socks5_outbounds,omitempty"`
+}
+
+// EffectiveProtocol returns the server main inbound protocol, defaulting to vless-xhttp.
+func (s ServerConfig) EffectiveProtocol() string {
+	if strings.TrimSpace(s.Protocol) != "" {
+		return strings.TrimSpace(s.Protocol)
+	}
+	return "vless-xhttp"
 }
 
 type Socks5Profile struct {
@@ -215,7 +249,9 @@ type RproxySConfig struct {
 	Enabled    bool                  `json:"enabled"`
 	Domain     string                `json:"domain,omitempty"`
 	ListenPort int                   `json:"listen_port"`
+	Security   string                `json:"security,omitempty"` // tls (default) | none
 	UUIDs      []string              `json:"uuids,omitempty"`
+	InUUIDs    []string              `json:"in_uuids,omitempty"`
 	Mappings   []RproxyServerMapping `json:"mappings,omitempty"`
 }
 

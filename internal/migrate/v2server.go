@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/stuinxo/de_GWD/v3/internal/cryptoext"
 	"github.com/stuinxo/de_GWD/v3/internal/state"
 )
 
@@ -66,9 +67,27 @@ func ImportV2Server(rootDir string) (*state.State, []string, error) {
 						}
 					}
 				}
+				proto := strings.ToLower(strVal(first["protocol"]))
 				if stream, ok := first["streamSettings"].(map[string]any); ok {
-					if xs, ok := stream["xhttpSettings"].(map[string]any); ok {
-						st.Server.Path = strVal(xs["path"])
+					netName := strings.ToLower(strVal(stream["network"]))
+					switch {
+					case proto == "vmess" && netName == "ws":
+						st.Server.Protocol = "vmess-ws"
+						if ws, ok := stream["wsSettings"].(map[string]any); ok {
+							st.Server.Path = strVal(ws["path"])
+						}
+					case proto == "vless" && netName == "ws":
+						st.Server.Protocol = "vless-ws"
+						if ws, ok := stream["wsSettings"].(map[string]any); ok {
+							st.Server.Path = strVal(ws["path"])
+						}
+					default:
+						st.Server.Protocol = "vless-xhttp"
+						if xs, ok := stream["xhttpSettings"].(map[string]any); ok {
+							st.Server.Path = strVal(xs["path"])
+						} else if ws, ok := stream["wsSettings"].(map[string]any); ok {
+							st.Server.Path = strVal(ws["path"])
+						}
 					}
 				}
 			}
@@ -202,6 +221,18 @@ func importExtraFromVtrui(xcfg map[string]any, optDir string) ([]state.ExtraInbo
 	portsMap := readStringIntMap(filepath.Join(optDir, "extra_ports.json"))
 	domainsMap := readStringMap(filepath.Join(optDir, "extra_domains.json"))
 	inbsOut, notes := decodeExtraInboundsList(filtered, portsMap, domainsMap)
+	realityInfoPub := readRealityPubKeyFromInfo(filepath.Join(optDir, "vtrui", "reality.info"))
+	for i := range inbsOut {
+		if inbsOut[i].Protocol == "vless-reality" && inbsOut[i].RealityPubKey == "" {
+			if realityInfoPub != "" {
+				inbsOut[i].RealityPubKey = realityInfoPub
+			} else if inbsOut[i].RealityPrivKey != "" {
+				if derived, derr := cryptoext.DeriveRealityPublicKey(inbsOut[i].RealityPrivKey); derr == nil {
+					inbsOut[i].RealityPubKey = derived
+				}
+			}
+		}
+	}
 	return inbsOut, notes
 }
 

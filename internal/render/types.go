@@ -11,28 +11,32 @@ import (
 	"strings"
 
 	"github.com/stuinxo/de_GWD/v3/internal/cryptoext"
+	"github.com/stuinxo/de_GWD/v3/internal/socks5out"
 	"github.com/stuinxo/de_GWD/v3/internal/state"
 )
 
 // RenderOptions supplies environment and runtime-resolved inputs to pure renderers.
 type RenderOptions struct {
-	StateDir         string
-	GeneratedDir     string
-	CertFile         string
-	KeyFile          string
-	XrayBin          string
-	MosDNSBin        string
-	DexBin           string
-	InitSystem       string // systemd | openrc
-	IsContainer      bool
-	MemMB            int
-	ResolvedHostIPs  map[string][]netip.Addr
-	PhysicalNICs     []string
-	ChnRoutePath     string
-	DomainsChnPath   string
-	DomainsGamesPath string
-	DomainsApplePath string
-	ChnRouteCIDRs    []string
+	StateDir           string
+	GeneratedDir       string
+	CertFile           string
+	KeyFile            string
+	XrayBin            string
+	MosDNSBin          string
+	DexBin             string
+	InitSystem         string // systemd | openrc
+	IsContainer        bool
+	MemMB              int
+	ResolvedHostIPs    map[string][]netip.Addr
+	PhysicalNICs       []string
+	ChnRoutePath       string
+	DomainsChnPath     string
+	DomainsGamesPath   string
+	DomainsApplePath   string
+	DomainsAppleExists bool
+	DomainsGamesExists bool
+	NginxLegacyHTTP2   bool
+	ChnRouteCIDRs      []string
 }
 
 // WithDefaults fills omitted path/runtime defaults in RenderOptions.
@@ -130,6 +134,42 @@ func ExtractDoHHost(raw string) string {
 	return ""
 }
 
+// NormalizeDoHUpstream normalizes a bare DoH domain/path while preserving explicit schemes (https/quic/h3/tls/tcp/udp).
+func NormalizeDoHUpstream(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if strings.Contains(raw, "://") {
+		return raw
+	}
+	if !strings.Contains(raw, "/") {
+		return "https://" + raw + "/dq"
+	}
+	return "https://" + raw
+}
+
+// ExtractDomainHost strips domain:/full:/*. prefixes from a routing domain rule and returns a resolvable host if valid.
+func ExtractDomainHost(rule string) string {
+	r := strings.TrimSpace(rule)
+	if r == "" {
+		return ""
+	}
+	for _, skip := range []string{"regexp:", "keyword:", "geosite:", "ext:"} {
+		if strings.HasPrefix(r, skip) {
+			return ""
+		}
+	}
+	r = strings.TrimPrefix(r, "domain:")
+	r = strings.TrimPrefix(r, "full:")
+	r = strings.TrimPrefix(r, "*.")
+	r = strings.Trim(r, "[]")
+	if socks5out.IsValidAddress(r) {
+		return r
+	}
+	return ""
+}
+
 // NormalizePath ensures path starts with "/" and defaults from UUID if empty.
 func NormalizePath(path, uuid string) string {
 	p := strings.TrimSpace(path)
@@ -200,6 +240,23 @@ func BuildNodeURI(n state.OutboundNode) string {
 		}
 		b, _ := json.Marshal(payload)
 		return "vmess://" + base64.StdEncoding.EncodeToString(b)
+	case "vmess-tcp":
+		payload := map[string]any{
+			"v":    "2",
+			"ps":   label,
+			"add":  n.Address,
+			"port": port,
+			"id":   n.UUID,
+			"aid":  0,
+			"scy":  "auto",
+			"net":  "tcp",
+			"type": "none",
+			"host": "",
+			"path": "",
+			"tls":  "",
+		}
+		b, _ := json.Marshal(payload)
+		return "vmess://" + base64.StdEncoding.EncodeToString(b)
 	case "socks5":
 		if n.Username != "" {
 			return fmt.Sprintf("socks5://%s@%s:%d#%s",
@@ -211,19 +268,79 @@ func BuildNodeURI(n state.OutboundNode) string {
 	}
 }
 
-// BuildServerMainURI returns the primary VLESS+XHTTP+TLS URI for server or landing roles.
+// BuildServerMainURI returns the primary share URI for server or landing roles.
 func BuildServerMainURI(s *state.State) string {
-	if len(s.Server.UUIDs) == 0 {
+	if s == nil || len(s.Server.UUIDs) == 0 {
 		return ""
 	}
 	uuid := s.Server.UUIDs[0]
 	return BuildNodeURI(state.OutboundNode{
 		Name:     fmt.Sprintf("%s:%d", s.Server.EffectiveConnectHost(), s.Server.EffectivePublicPort()),
-		Protocol: "vless-xhttp",
+		Protocol: s.Server.EffectiveProtocol(),
 		Address:  s.Server.EffectiveConnectHost(),
 		Port:     s.Server.EffectivePublicPort(),
 		UUID:     uuid,
 		TLSSNI:   s.Server.Domain,
 		Path:     NormalizePath(s.Server.Path, uuid),
+	})
+}
+
+// BuildFWDURI returns a client share URI for FWD0 ("fwd0") or FWD1 ("fwd1").
+func BuildFWDURI(s *state.State, fwdKind, uuid string) string {
+	if s == nil {
+		return ""
+	}
+	var (
+		port  int
+		path  string
+		proto string
+		uuids []string
+	)
+	switch strings.ToLower(strings.TrimSpace(fwdKind)) {
+	case "fwd0":
+		port = s.Client.FWD0.Port
+		path = s.Client.FWD0.Path
+		proto = s.Client.FWD0.EffectiveProtocol()
+		uuids = s.Client.FWD0.UUIDs
+	case "fwd1":
+		port = s.Client.FWD1.Port
+		path = s.Client.FWD1.Path
+		proto = s.Client.FWD1.EffectiveProtocol()
+		uuids = s.Client.FWD1.UUIDs
+	default:
+		return ""
+	}
+	if uuid == "" && len(uuids) > 0 {
+		uuid = uuids[0]
+	}
+	if uuid == "" || port <= 0 {
+		return ""
+	}
+	host := ""
+	for _, cand := range []string{s.Cert.Domain, s.Client.DDNS.Domain, s.Client.WireGuard.EndpointHost} {
+		if strings.TrimSpace(cand) != "" {
+			host = strings.TrimSpace(cand)
+			break
+		}
+	}
+	if host == "" && strings.TrimSpace(s.Auth.ServerName) != "" && strings.TrimSpace(s.Auth.ServerName) != "dex" {
+		host = strings.TrimSpace(s.Auth.ServerName)
+	}
+	if host == "" && strings.TrimSpace(s.System.LANAddrCIDR) != "" {
+		if p, err := netip.ParsePrefix(strings.TrimSpace(s.System.LANAddrCIDR)); err == nil {
+			host = p.Addr().String()
+		}
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return BuildNodeURI(state.OutboundNode{
+		Name:     fmt.Sprintf("%s-%s:%d", strings.ToLower(strings.TrimSpace(fwdKind)), host, port),
+		Protocol: proto,
+		Address:  host,
+		Port:     port,
+		UUID:     uuid,
+		TLSSNI:   host,
+		Path:     path,
 	})
 }

@@ -193,3 +193,52 @@ func TestCloudflareDDNSCreateAndUpdate(t *testing.T) {
 		t.Fatalf("changed IP update failed: res=%+v err=%v updated=%v content=%q", res3, err, updated, recordContent)
 	}
 }
+
+func TestCloudflareDDNSGlobalAPIKeyHeaders(t *testing.T) {
+	var gotEmail, gotKey, gotAuth string
+	cfSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotEmail = r.Header.Get("X-Auth-Email")
+		gotKey = r.Header.Get("X-Auth-Key")
+		gotAuth = r.Header.Get("Authorization")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/zones":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"result":  []map[string]string{{"id": "z1", "name": "example.com"}},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/zones/z1/dns_records":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"result":  []map[string]string{{"id": "r1", "name": "home.example.com", "content": "203.0.113.99"}},
+			})
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer cfSrv.Close()
+
+	ddns := NewCloudflareDDNS(NewTaskHub(10))
+	ddns.BaseURL = cfSrv.URL
+	ddns.FetchPublic4 = func(ctx context.Context) (string, error) { return "203.0.113.99", nil }
+
+	res, err := ddns.SyncOnceWithEmail(context.Background(), "home.example.com", "global-key-xyz", "user@example.com", false, false)
+	if err != nil {
+		t.Fatalf("SyncOnceWithEmail failed: %v", err)
+	}
+	if !res.Updated4 {
+		t.Fatalf("expected Updated4=true")
+	}
+	if gotEmail != "user@example.com" || gotKey != "global-key-xyz" || gotAuth != "" {
+		t.Fatalf("unexpected auth headers: email=%q key=%q auth=%q", gotEmail, gotKey, gotAuth)
+	}
+
+	// Verify direct HTTP client (SO_MARK=0xff with non-root EPERM fallback) can dial local test server
+	ipSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("203.0.113.55\n"))
+	}))
+	defer ipSrv.Close()
+	gotIP, err := fetchPublicIP(context.Background(), newDirectHTTPClient(), []string{ipSrv.URL}, false)
+	if err != nil || gotIP != "203.0.113.55" {
+		t.Fatalf("direct client fetchPublicIP failed: got=%q err=%v", gotIP, err)
+	}
+}
