@@ -15,6 +15,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -730,6 +731,14 @@ func (s *Server) handlePutState(w http.ResponseWriter, r *http.Request, _ *sessi
 			ex.UUID, _ = cryptoext.GenerateUUID()
 		}
 	}
+	if incoming.Role == state.RoleClient && incoming.Client.WireGuard.Enabled {
+		if strings.TrimSpace(incoming.Client.WireGuard.ServerPrivateKey) == "" || strings.TrimSpace(incoming.Client.WireGuard.ServerPublicKey) == "" {
+			if priv, pub, kerr := cryptoext.GenerateWireGuardKeypair(); kerr == nil {
+				incoming.Client.WireGuard.ServerPrivateKey = priv
+				incoming.Client.WireGuard.ServerPublicKey = pub
+			}
+		}
+	}
 	if err := incoming.Validate(); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -953,7 +962,10 @@ func (s *Server) handleParseNodeURI(w http.ResponseWriter, r *http.Request, _ *s
 
 func (s *Server) handleAddWGPeer(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
 	var req struct {
-		Name string `json:"name"`
+		Name         string `json:"name"`
+		EndpointHost string `json:"endpoint_host"`
+		ListenPort   int    `json:"listen_port"`
+		SubnetCIDR   string `json:"subnet_cidr"`
 	}
 	if err := decodeJSONBody(r, &req, 4096); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
@@ -979,13 +991,24 @@ func (s *Server) handleAddWGPeer(w http.ResponseWriter, r *http.Request, _ *sess
 				return fmt.Errorf("peer %q already exists", name)
 			}
 		}
-		if cur.Client.WireGuard.ServerPrivateKey == "" || cur.Client.WireGuard.ServerPublicKey == "" {
+		if strings.TrimSpace(cur.Client.WireGuard.ServerPrivateKey) == "" || strings.TrimSpace(cur.Client.WireGuard.ServerPublicKey) == "" {
 			sp, spub, kerr := cryptoext.GenerateWireGuardKeypair()
 			if kerr != nil {
 				return kerr
 			}
 			cur.Client.WireGuard.ServerPrivateKey = sp
 			cur.Client.WireGuard.ServerPublicKey = spub
+		}
+		if ep := strings.TrimSpace(req.EndpointHost); ep != "" && socks5out.IsValidAddress(ep) {
+			cur.Client.WireGuard.EndpointHost = ep
+		}
+		if req.ListenPort >= 1 && req.ListenPort <= 65535 {
+			cur.Client.WireGuard.ListenPort = req.ListenPort
+		}
+		if sub := strings.TrimSpace(req.SubnetCIDR); sub != "" {
+			if p, perr := netip.ParsePrefix(sub); perr == nil && p.Addr().Is4() {
+				cur.Client.WireGuard.SubnetCIDR = sub
+			}
 		}
 		if cur.Client.WireGuard.ListenPort == 0 {
 			cur.Client.WireGuard.ListenPort = 51820

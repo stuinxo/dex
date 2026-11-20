@@ -85,6 +85,17 @@ func formatNFTElements(items []string) string {
 	return "        elements = { " + strings.Join(items, ", ") + " }\n"
 }
 
+func wireGuardSubnetCIDR(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if p, err := netip.ParsePrefix(raw); err == nil && p.Addr().Is4() {
+		return p.Masked().String()
+	}
+	if a, err := netip.ParseAddr(raw); err == nil && a.Is4() {
+		return netip.PrefixFrom(a, 24).Masked().String()
+	}
+	return "172.16.66.0/24"
+}
+
 func writeNFTSet(b *strings.Builder, name, nftType string, elems []string, interval bool) {
 	fmt.Fprintf(b, "    set %s {\n", name)
 	fmt.Fprintf(b, "        type %s\n", nftType)
@@ -225,8 +236,9 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 				fmt.Fprintf(&b, "    flowtable acceleration {\n        hook ingress priority filter; devices = { %s };\n    }\n", strings.Join(nics, ", "))
 				b.WriteString("    chain forward {\n        type filter hook forward priority filter; policy accept;\n")
 				if s.Client.WireGuard.Enabled {
-					b.WriteString("        ct state established ip daddr 172.16.66.0/24 flow offload @acceleration\n")
-					b.WriteString("        ct state established ip saddr 172.16.66.0/24 flow offload @acceleration\n")
+					wgNet := wireGuardSubnetCIDR(s.Client.WireGuard.SubnetCIDR)
+					fmt.Fprintf(&b, "        ct state established ip daddr %s flow offload @acceleration\n", wgNet)
+					fmt.Fprintf(&b, "        ct state established ip saddr %s flow offload @acceleration\n", wgNet)
 				}
 				b.WriteString("    }\n}\n\n")
 			}
@@ -267,9 +279,10 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 			lanIf = strings.TrimSpace(opts.PhysicalNICs[0])
 		}
 		if s.Client.WireGuard.Enabled && lanIf != "" {
+			wgNet := wireGuardSubnetCIDR(s.Client.WireGuard.SubnetCIDR)
 			b.WriteString("table inet dex_nat {}\ndelete table inet dex_nat\ntable inet dex_nat {\n")
 			b.WriteString("    chain postrouting {\n        type nat hook postrouting priority srcnat; policy accept;\n")
-			fmt.Fprintf(&b, "        oifname %q ip saddr 172.16.66.0/24 masquerade\n", lanIf)
+			fmt.Fprintf(&b, "        oifname %q ip saddr %s masquerade\n", lanIf, wgNet)
 			b.WriteString("    }\n}\n\n")
 		}
 
@@ -294,6 +307,9 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 		// prerouting
 		b.WriteString("    chain prerouting {\n        type filter hook prerouting priority mangle; policy accept;\n")
 		b.WriteString("        fib daddr type local meta l4proto { tcp, udp } th dport != 9896 accept\n")
+		if s.Client.WireGuard.Enabled && s.Client.WireGuard.ListenPort > 0 {
+			fmt.Fprintf(&b, "        meta l4proto udp th dport %d accept\n", s.Client.WireGuard.ListenPort)
+		}
 		b.WriteString("        meta l4proto udp th dport { 53, 5341, 9896, 67, 68, 1900, 5350, 5351, 5353 } accept\n")
 		b.WriteString("        meta l4proto tcp th dport { 53, 5341, 9896, 2195, 2196, 2197, 3689, 5223, 5297 } accept\n")
 		b.WriteString("        ip daddr @global_dns_v4 accept\n")
@@ -327,6 +343,9 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 		// output
 		b.WriteString("    chain output {\n        type route hook output priority mangle; policy accept;\n")
 		b.WriteString("        ct direction reply accept\n")
+		if s.Client.WireGuard.Enabled && s.Client.WireGuard.ListenPort > 0 {
+			fmt.Fprintf(&b, "        meta l4proto udp th sport %d accept\n", s.Client.WireGuard.ListenPort)
+		}
 		b.WriteString("        meta l4proto udp th dport { 53, 5341, 9896, 67, 68, 1900, 5350, 5351, 5353 } accept\n")
 		b.WriteString("        meta l4proto tcp th dport { 53, 5341, 9896, 2195, 2196, 2197, 3689, 5223, 5297 } accept\n")
 		b.WriteString("        meta mark 0xff accept\n")

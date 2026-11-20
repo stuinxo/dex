@@ -407,3 +407,82 @@ func TestWave2EndpointsAndSecurity(t *testing.T) {
 		t.Fatalf("expected hostname gw-livingroom, got %q", afterSys.System.Hostname)
 	}
 }
+
+func TestWireGuardAutoKeygenOnPutAndPeerEndpointSync(t *testing.T) {
+	srv, store, _ := setupTestWeb(t, false)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	loginReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/auth/login", strings.NewReader(`{"password":"myPass123"}`))
+	loginReq.Header.Set("Content-Type", "application/json")
+	loginRec := httptest.NewRecorder()
+	srv.ServeHTTP(loginRec, loginReq)
+	if loginRec.Code != 200 {
+		t.Fatalf("login failed: %d", loginRec.Code)
+	}
+	var lData map[string]any
+	_ = json.Unmarshal(loginRec.Body.Bytes(), &lData)
+	csrf := lData["csrf_token"].(string)
+	cookies := loginRec.Result().Cookies()
+
+	doReq := func(method, path, body string) *httptest.ResponseRecorder {
+		req, _ := http.NewRequest(method, ts.URL+path, strings.NewReader(body))
+		req.Header.Set("X-CSRF-Token", csrf)
+		req.Header.Set("Content-Type", "application/json")
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. PUT /api/v1/state with wireguard.enabled=true and empty server keypair auto-generates valid keypair
+	cur, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur.Client.WireGuard.Enabled = true
+	cur.Client.WireGuard.EndpointHost = "10.0.0.230"
+	cur.Client.WireGuard.ListenPort = 51820
+	cur.Client.WireGuard.SubnetCIDR = "172.16.66.1/24"
+	cur.Client.WireGuard.ServerPrivateKey = ""
+	cur.Client.WireGuard.ServerPublicKey = ""
+	putBytes, _ := json.Marshal(cur)
+	putRec := doReq(http.MethodPut, "/api/v1/state", string(putBytes))
+	if putRec.Code != 200 {
+		t.Fatalf("PUT /api/v1/state with empty WG server keys failed: %d %s", putRec.Code, putRec.Body.String())
+	}
+	afterPut, _ := store.Load()
+	if afterPut.Client.WireGuard.ServerPrivateKey == "" || afterPut.Client.WireGuard.ServerPublicKey == "" {
+		t.Fatalf("expected auto-generated WG server keypair, got priv=%q pub=%q",
+			afterPut.Client.WireGuard.ServerPrivateKey, afterPut.Client.WireGuard.ServerPublicKey)
+	}
+	derivedPub, derr := cryptoext.DeriveWireGuardPublicKey(afterPut.Client.WireGuard.ServerPrivateKey)
+	if derr != nil || derivedPub != afterPut.Client.WireGuard.ServerPublicKey {
+		t.Fatalf("auto-generated WG keypair mismatch: derived=%q stored=%q err=%v",
+			derivedPub, afterPut.Client.WireGuard.ServerPublicKey, derr)
+	}
+
+	// 2. POST /api/v1/wireguard/peers syncs endpoint_host / listen_port and returns updated Endpoint in config
+	peerPayload := `{"name":"phone","endpoint_host":"home.ddns.example","listen_port":51822,"subnet_cidr":"10.66.66.1/24"}`
+	peerRec := doReq(http.MethodPost, "/api/v1/wireguard/peers", peerPayload)
+	if peerRec.Code != 200 {
+		t.Fatalf("POST /api/v1/wireguard/peers failed: %d %s", peerRec.Code, peerRec.Body.String())
+	}
+	var peerResp struct {
+		OK     bool   `json:"ok"`
+		Config string `json:"config"`
+	}
+	_ = json.Unmarshal(peerRec.Body.Bytes(), &peerResp)
+	if !strings.Contains(peerResp.Config, "Endpoint = home.ddns.example:51822") {
+		t.Fatalf("expected synced Endpoint in peer config, got:\n%s", peerResp.Config)
+	}
+	if !strings.Contains(peerResp.Config, "DNS = 10.66.66.1") || !strings.Contains(peerResp.Config, "Address = 10.66.66.11/32") {
+		t.Fatalf("expected synced subnet in peer config, got:\n%s", peerResp.Config)
+	}
+	afterPeer, _ := store.Load()
+	if afterPeer.Client.WireGuard.EndpointHost != "home.ddns.example" || afterPeer.Client.WireGuard.ListenPort != 51822 {
+		t.Fatalf("expected persisted WG endpoint/port, got %+v", afterPeer.Client.WireGuard)
+	}
+}

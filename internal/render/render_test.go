@@ -698,3 +698,70 @@ func TestWave2ParseNodeURIWGIPAndTimers(t *testing.T) {
 		t.Fatalf("expected 5min refresh interval when NFTRelayNeeded, got %+v", bRelay)
 	}
 }
+
+func TestRenderNFTablesWireGuardSubnetAndBypass(t *testing.T) {
+	s := state.NewDefaultState(state.RoleClient)
+	s.System.LANInterface = "eth0"
+	s.System.EnableFlowtable = true
+	s.Client.WireGuard = state.WireGuardConfig{
+		Enabled:          true,
+		EndpointHost:     "10.0.0.230",
+		ListenPort:       51821,
+		SubnetCIDR:       "10.66.66.1/24",
+		ServerPrivateKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		ServerPublicKey:  "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+	}
+
+	data, clientNeeded, _, err := RenderNFTables(s, RenderOptions{PhysicalNICs: []string{"eth0"}})
+	if err != nil {
+		t.Fatalf("RenderNFTables: %v", err)
+	}
+	if !clientNeeded {
+		t.Fatalf("expected clientNeeded=true")
+	}
+	nftStr := string(data)
+
+	for _, needle := range []string{
+		"ct state established ip daddr 10.66.66.0/24 flow offload @acceleration",
+		"ct state established ip saddr 10.66.66.0/24 flow offload @acceleration",
+		`oifname "eth0" ip saddr 10.66.66.0/24 masquerade`,
+		"meta l4proto udp th dport 51821 accept",
+		"meta l4proto udp th sport 51821 accept",
+	} {
+		if !strings.Contains(nftStr, needle) {
+			t.Errorf("nftables.conf missing %q\n%s", needle, nftStr)
+		}
+	}
+	if strings.Contains(nftStr, "172.16.66.0/24") {
+		t.Errorf("unexpected hardcoded 172.16.66.0/24 when custom subnet configured")
+	}
+
+	// Verify prerouting has dport accept and output has sport accept in the respective chains
+	preIdx := strings.Index(nftStr, "chain prerouting {")
+	outIdx := strings.Index(nftStr, "chain output {")
+	// Note: dex_filter also has chain output, so find the dex_client chain output (type route hook output)
+	dexClientIdx := strings.Index(nftStr, "table inet dex_client {")
+	clientPreIdx := dexClientIdx + strings.Index(nftStr[dexClientIdx:], "chain prerouting {")
+	clientOutIdx := dexClientIdx + strings.Index(nftStr[dexClientIdx:], "chain output {")
+	if dexClientIdx < 0 || preIdx < 0 || outIdx < 0 || clientPreIdx >= clientOutIdx {
+		t.Fatalf("unexpected dex_client layout")
+	}
+	preSection := nftStr[clientPreIdx:clientOutIdx]
+	outSection := nftStr[clientOutIdx:]
+	if !strings.Contains(preSection, "meta l4proto udp th dport 51821 accept") {
+		t.Errorf("dex_client prerouting missing dport 51821 accept")
+	}
+	if !strings.Contains(outSection, "meta l4proto udp th sport 51821 accept") {
+		t.Errorf("dex_client output missing sport 51821 accept")
+	}
+
+	// Fallback when SubnetCIDR is invalid/empty
+	s.Client.WireGuard.SubnetCIDR = "not-a-cidr"
+	fallbackData, _, _, err := RenderNFTables(s, RenderOptions{PhysicalNICs: []string{"eth0"}})
+	if err != nil {
+		t.Fatalf("RenderNFTables fallback: %v", err)
+	}
+	if !strings.Contains(string(fallbackData), `oifname "eth0" ip saddr 172.16.66.0/24 masquerade`) {
+		t.Errorf("expected fallback 172.16.66.0/24 in dex_nat")
+	}
+}

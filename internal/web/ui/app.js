@@ -1632,7 +1632,13 @@
     var name = $("wg-peer-name").value.trim();
     if (!name) { showToast("请输入 Peer 名称", true); return; }
     try {
-      await api("POST", "/api/v1/wireguard/peers", { name: name });
+      var payload = {
+        name: name,
+        endpoint_host: $("wg-endpoint").value.trim(),
+        listen_port: Number($("wg-port").value || 51820),
+        subnet_cidr: $("wg-subnet").value.trim()
+      };
+      await api("POST", "/api/v1/wireguard/peers", payload);
       $("wg-peer-name").value = "";
       showToast("已添加 WireGuard Peer " + name);
       await refreshAll();
