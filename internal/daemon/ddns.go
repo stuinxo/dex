@@ -33,10 +33,11 @@ type CloudflareDDNS struct {
 
 var (
 	cnPublicIPv4URLs = []string{
-		"https://4.ipw.cn",
 		"https://myip.ipip.net/s",
-		"https://members.3322.org/dyndns/getip",
-		"https://api.ipify.org",
+		"http://members.3322.org/dyndns/getip",
+		"http://ip.3322.net",
+		"https://4.ipw.cn",
+		"https://api-ipv4.ip.sb/ip",
 	}
 	cnPublicIPv6URLs = []string{
 		"https://6.ipw.cn",
@@ -138,16 +139,20 @@ func NewCloudflareDDNS(hub *TaskHub) *CloudflareDDNS {
 
 func fetchPublicIP(ctx context.Context, client *http.Client, urls []string, wantV6 bool) (string, error) {
 	for _, u := range urls {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u, nil)
 		if err != nil {
+			cancel()
 			continue
 		}
 		resp, err := client.Do(req)
 		if err != nil {
+			cancel()
 			continue
 		}
 		b, err := io.ReadAll(io.LimitReader(resp.Body, 256))
 		_ = resp.Body.Close()
+		cancel()
 		if err != nil || resp.StatusCode != 200 {
 			continue
 		}

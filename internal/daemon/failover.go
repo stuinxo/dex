@@ -46,7 +46,7 @@ func ProbeNodeHealth(ctx context.Context, n state.OutboundNode, timeout time.Dur
 		_ = conn.Close()
 		return ProbeNodeResult{NodeID: n.ID, Healthy: true, LatencyMS: lat}
 
-	case "vless-reality":
+	case "vless-reality", "vmess-tcp":
 		var d net.Dialer
 		d.Timeout = timeout
 		conn, err := d.DialContext(ctx, "tcp", targetTCP)
@@ -57,28 +57,20 @@ func ProbeNodeHealth(ctx context.Context, n state.OutboundNode, timeout time.Dur
 		_ = conn.Close()
 		return ProbeNodeResult{NodeID: n.ID, Healthy: true, LatencyMS: lat}
 
-	default: // vless-xhttp, vless-ws, vmess-ws (HTTPS/TLS)
+	default: // vless-xhttp, vless-ws, vmess-ws (HTTPS/TLS, supports HTTP/2 & HTTP/1.1 ALPN)
 		sni := n.EffectiveSNI()
 		path := render.NormalizePath(n.Path, n.UUID)
 		tr := &http.Transport{
 			DisableKeepAlives: true,
-			DialTLSContext: func(dialCtx context.Context, network, _ string) (net.Conn, error) {
+			ForceAttemptHTTP2: true,
+			TLSClientConfig: &tls.Config{
+				ServerName:         sni,
+				MinVersion:         tls.VersionTLS12,
+				InsecureSkipVerify: insecureSkipVerifyForTest,
+			},
+			DialContext: func(dialCtx context.Context, _, _ string) (net.Conn, error) {
 				var d net.Dialer
-				rawConn, err := d.DialContext(dialCtx, "tcp", targetTCP)
-				if err != nil {
-					return nil, err
-				}
-				tlsConn := tls.Client(rawConn, &tls.Config{
-					ServerName:         sni,
-					MinVersion:         tls.VersionTLS12,
-					NextProtos:         []string{"h2", "http/1.1"},
-					InsecureSkipVerify: insecureSkipVerifyForTest,
-				})
-				if err := tlsConn.HandshakeContext(dialCtx); err != nil {
-					_ = rawConn.Close()
-					return nil, err
-				}
-				return tlsConn, nil
+				return d.DialContext(dialCtx, "tcp", targetTCP)
 			},
 		}
 		defer tr.CloseIdleConnections()

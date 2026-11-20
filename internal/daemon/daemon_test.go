@@ -67,6 +67,31 @@ func TestProbeNodeHealthEnforcesSNI(t *testing.T) {
 	if gotSNI != "landing.sni.test" {
 		t.Fatalf("expected TLS ServerName=landing.sni.test, got %q", gotSNI)
 	}
+
+	// Verify HTTP/2 ALPN TLS servers (like nginx/xray with h2) also probe cleanly
+	srvH2 := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	srvH2.EnableHTTP2 = true
+	srvH2.TLS = &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"h2", "http/1.1"},
+	}
+	srvH2.StartTLS()
+	defer srvH2.Close()
+	u2, _ := url.Parse(srvH2.URL)
+	port2, _ := strconv.Atoi(u2.Port())
+	res2 := ProbeNodeHealth(context.Background(), state.OutboundNode{
+		ID:       "nginx-h2",
+		Protocol: "vless-xhttp",
+		Address:  "127.0.0.1",
+		Port:     port2,
+		UUID:     "11111111-1111-4111-8111-111111111111",
+		TLSSNI:   "landing.sni.test",
+	}, 3*time.Second, true)
+	if !res2.Healthy || res2.StatusCode != 400 {
+		t.Fatalf("expected healthy HTTP/2 TLS probe, got %+v", res2)
+	}
 }
 
 func TestFailoverAndFailbackStateMachine(t *testing.T) {
