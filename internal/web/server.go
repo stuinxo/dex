@@ -157,6 +157,7 @@ func (s *Server) buildRouter() http.Handler {
 	mux.HandleFunc("GET /api/v1/backup", s.requireAuth(false, s.handleBackup))
 	mux.HandleFunc("POST /api/v1/migrate", s.requireAuth(true, s.handleMigrate))
 	mux.HandleFunc("POST /api/v1/apply", s.requireAuth(true, s.handleApply))
+	mux.HandleFunc("PUT /api/v1/system", s.requireAuth(true, s.handlePutSystem))
 	mux.HandleFunc("POST /api/v1/system/reboot", s.requireAuth(true, s.handleSystemReboot))
 	mux.HandleFunc("GET /api/v1/logs/stream", s.requireAuth(false, s.handleLogsStream))
 
@@ -1760,6 +1761,46 @@ func (s *Server) handleBackup(w http.ResponseWriter, _ *http.Request, _ *session
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="dex-backup-%s.json"`, time.Now().UTC().Format("20060102-150405")))
 	_, _ = w.Write(b)
+}
+
+func (s *Server) handlePutSystem(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
+	var req struct {
+		Hostname       *string `json:"hostname"`
+		AutoUpdateCore *bool   `json:"auto_update_core"`
+	}
+	if err := decodeJSONBody(r, &req, 4096); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid system JSON: "+err.Error())
+		return
+	}
+	cur, err := s.Store.Load()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	updated, err := s.Store.Update(cur.Role, func(dst *state.State) error {
+		if req.Hostname != nil {
+			h := strings.TrimSpace(*req.Hostname)
+			if len(h) > 128 {
+				return errors.New("hostname too long (max 128)")
+			}
+			dst.System.Hostname = h
+		}
+		if req.AutoUpdateCore != nil {
+			dst.System.AutoUpdateCore = *req.AutoUpdateCore
+		}
+		return nil
+	})
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.Hub.Log("INFO", "system", fmt.Sprintf("updated system settings (hostname=%q)", updated.System.Hostname))
+	redacted, secrets := redactStateForAPI(updated)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"state":   redacted,
+		"secrets": secrets,
+	})
 }
 
 func (s *Server) handleSystemReboot(w http.ResponseWriter, _ *http.Request, _ *sessionRecord) {

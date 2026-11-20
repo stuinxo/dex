@@ -141,7 +141,7 @@ Commands:
   rules <subcmd>        Inspect or hot-update GeoIP/Domain rule files (status|update)
   update                Upgrade dex, xray, mosdns, and/or rule datasets cleanly
   migrate               Import v2 0conf, v2 server, des, or dexs state (--cleanup-v2 --apply)
-  daemon                Run embedded Web UI + failover + Cloudflare DDNS loops
+  daemon                Run embedded Web UI (client :443 + :80->HTTPS redirect; server 127.0.0.1:8443) + failover + DDNS loops
   serve-doh             Run standalone RFC 8484 DoH forwarding server
   refresh               Re-resolve dynamic relay targets and re-apply nftables
   version               Print dex version
@@ -2410,7 +2410,14 @@ func cmdDaemon(store *state.Store, exec reconcile.SystemExecutor, args []string,
 		addr = *listen
 	}
 	if addr == "" {
-		addr = ":8443"
+		switch st.Role {
+		case state.RoleClient:
+			addr = ":443"
+		case state.RoleServer:
+			addr = "127.0.0.1:8443"
+		default:
+			addr = ":8443"
+		}
 	}
 
 	hub := daemon.NewTaskHub(300)
@@ -2435,6 +2442,32 @@ func cmdDaemon(store *state.Store, exec reconcile.SystemExecutor, args []string,
 		Addr:              addr,
 		Handler:           webSrv,
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	var redirSrv *http.Server
+	if st.Role == state.RoleClient && !*httpOnly {
+		_, httpsPort, splitErr := net.SplitHostPort(addr)
+		if splitErr != nil {
+			httpsPort = "443"
+		}
+		if httpsPort != "80" {
+			ln80, lerr := net.Listen("tcp", ":80")
+			if lerr != nil {
+				fmt.Fprintf(stderr, "warning: HTTP->HTTPS redirect on :80 disabled: %v\n", lerr)
+			} else {
+				redirSrv = &http.Server{
+					Addr:              ":80",
+					Handler:           newHTTPSRedirectHandler(httpsPort),
+					ReadHeaderTimeout: 5 * time.Second,
+				}
+				fmt.Fprintf(stdout, "dex daemon listening HTTP->HTTPS redirect on :80 -> :%s\n", httpsPort)
+				go func() {
+					if serr := redirSrv.Serve(ln80); serr != nil && !errors.Is(serr, http.ErrServerClosed) {
+						fmt.Fprintf(stderr, "http redirect error: %v\n", serr)
+					}
+				}()
+			}
+		}
 	}
 
 	errCh := make(chan error, 1)
@@ -2463,15 +2496,68 @@ func cmdDaemon(store *state.Store, exec reconcile.SystemExecutor, args []string,
 	case <-ctx.Done():
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		if redirSrv != nil {
+			_ = redirSrv.Shutdown(shutCtx)
+		}
 		_ = httpSrv.Shutdown(shutCtx)
 		return 0
 	case err := <-errCh:
+		if redirSrv != nil {
+			_ = redirSrv.Close()
+		}
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fmt.Fprintf(stderr, "daemon error: %v\n", err)
 			return 1
 		}
 		return 0
 	}
+}
+
+func newHTTPSRedirectHandler(httpsPort string) http.Handler {
+	port := strings.TrimSpace(httpsPort)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := extractRedirectHost(r.Host)
+		if host == "" || strings.ContainsAny(host, "/\\@ \t\r\n") {
+			http.Error(w, "invalid Host header", http.StatusBadRequest)
+			return
+		}
+		var authority string
+		if port == "" || port == "443" {
+			if strings.Contains(host, ":") {
+				authority = "[" + host + "]"
+			} else {
+				authority = host
+			}
+		} else {
+			authority = net.JoinHostPort(host, port)
+		}
+
+		reqURI := r.URL.RequestURI()
+		if reqURI == "" || !strings.HasPrefix(reqURI, "/") {
+			reqURI = "/"
+		}
+		// Collapse multiple leading slashes or leading backslash (e.g. //evil.com, /\evil.com)
+		// so the path never looks like a scheme-relative URL.
+		if strings.HasPrefix(reqURI, "//") || strings.HasPrefix(reqURI, "/\\") {
+			reqURI = "/" + strings.TrimLeft(reqURI, "/\\")
+		}
+		target := "https://" + authority + reqURI
+		http.Redirect(w, r, target, http.StatusMovedPermanently)
+	})
+}
+
+func extractRedirectHost(rawHost string) string {
+	h := strings.TrimSpace(rawHost)
+	if h == "" {
+		return ""
+	}
+	if parsedHost, _, err := net.SplitHostPort(h); err == nil {
+		return parsedHost
+	}
+	if strings.HasPrefix(h, "[") && strings.HasSuffix(h, "]") {
+		return h[1 : len(h)-1]
+	}
+	return h
 }
 
 func cmdServeDoH(args []string, stdout, stderr io.Writer) int {

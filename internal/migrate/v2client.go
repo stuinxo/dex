@@ -418,14 +418,6 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 			if st.Client.FWD0.Enabled {
 				notes = append(notes, "Imported FWD0 with legacy vmess-tcp protocol (no TLS)")
 			}
-			if st.Client.FWD0.Enabled && st.Client.FWD0.Port > 0 && st.Auth.ListenAddr == fmt.Sprintf(":%d", st.Client.FWD0.Port) {
-				nextPort := 8443
-				if st.Client.FWD0.Port == 8443 {
-					nextPort = 8444
-				}
-				st.Auth.ListenAddr = fmt.Sprintf(":%d", nextPort)
-				notes = append(notes, fmt.Sprintf("Shifted Web UI port to :%d to avoid conflict with FWD0 port %d", nextPort, st.Client.FWD0.Port))
-			}
 		}
 		if f1, ok := fwd["FWD1"].(map[string]any); ok {
 			var uuids []string
@@ -451,6 +443,23 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 			if st.Client.FWD1.Enabled {
 				notes = append(notes, "Imported FWD1 with legacy vmess-tcp protocol (no TLS)")
 			}
+		}
+		conflictOwner, conflictPort := "", 0
+		if st.Client.FWD0.Enabled && st.Client.FWD0.Port > 0 && st.Auth.ListenAddr == fmt.Sprintf(":%d", st.Client.FWD0.Port) {
+			conflictOwner = "FWD0"
+			conflictPort = st.Client.FWD0.Port
+		} else if st.Client.FWD1.Enabled && st.Client.FWD1.Port > 0 && st.Auth.ListenAddr == fmt.Sprintf(":%d", st.Client.FWD1.Port) {
+			conflictOwner = "FWD1"
+			conflictPort = st.Client.FWD1.Port
+		}
+		if conflictOwner != "" {
+			nextPort := 8443
+			for (st.Client.FWD0.Enabled && st.Client.FWD0.Port == nextPort) ||
+				(st.Client.FWD1.Enabled && st.Client.FWD1.Port == nextPort) {
+				nextPort++
+			}
+			st.Auth.ListenAddr = fmt.Sprintf(":%d", nextPort)
+			notes = append(notes, fmt.Sprintf("Shifted Web UI port to :%d to avoid conflict with %s port %d", nextPort, conflictOwner, conflictPort))
 		}
 		if rp, ok := fwd["Rproxy"].(map[string]any); ok {
 			if rc, ok := rp["client"].(map[string]any); ok {

@@ -315,3 +315,48 @@ func TestImportV2ClientWave1Fixes(t *testing.T) {
 		t.Fatalf("expected vmess-ws /ws-legacy, got %q %q", srvSt.Server.Protocol, srvSt.Server.Path)
 	}
 }
+
+func TestImportV2ClientFWD1PortConflictAvoidance(t *testing.T) {
+	dir := t.TempDir()
+	// Case 1: FWD1 conflicts with webUIport 443 -> shifts to :8443
+	conf1 := filepath.Join(dir, "0conf-fwd1")
+	_ = os.WriteFile(conf1, []byte(`{
+  "address": {"webUIport": "443"},
+  "FORWARD": {
+    "FWD1": {"status": "on", "port": 443, "uuid": [{"FWD1uuid": "55555555-5555-4555-8555-555555555555"}]}
+  }
+}`), 0o600)
+	st1, notes1, err := ImportV2Client(conf1, "")
+	if err != nil {
+		t.Fatalf("ImportV2Client case1: %v", err)
+	}
+	if err := st1.Validate(); err != nil {
+		t.Fatalf("Validate case1: %v", err)
+	}
+	if st1.Auth.ListenAddr != ":8443" {
+		t.Fatalf("expected ListenAddr shifted to :8443 away from FWD1 :443, got %q", st1.Auth.ListenAddr)
+	}
+	if !strings.Contains(strings.Join(notes1, "\n"), "FWD1 port 443") {
+		t.Fatalf("expected FWD1 conflict note, got %v", notes1)
+	}
+
+	// Case 2: FWD0 on 443 AND FWD1 on 8443 -> shifts to :8444
+	conf2 := filepath.Join(dir, "0conf-both")
+	_ = os.WriteFile(conf2, []byte(`{
+  "address": {"webUIport": "443"},
+  "FORWARD": {
+    "FWD0": {"status": "on", "port": 443, "uuid": [{"FWD0uuid": "44444444-4444-4444-8444-444444444444"}]},
+    "FWD1": {"status": "on", "port": 8443, "uuid": [{"FWD1uuid": "55555555-5555-4555-8555-555555555555"}]}
+  }
+}`), 0o600)
+	st2, _, err := ImportV2Client(conf2, "")
+	if err != nil {
+		t.Fatalf("ImportV2Client case2: %v", err)
+	}
+	if err := st2.Validate(); err != nil {
+		t.Fatalf("Validate case2: %v", err)
+	}
+	if st2.Auth.ListenAddr != ":8444" {
+		t.Fatalf("expected ListenAddr shifted to :8444 avoiding FWD0:443 & FWD1:8443, got %q", st2.Auth.ListenAddr)
+	}
+}

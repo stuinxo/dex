@@ -2,585 +2,906 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DEX v3 控制台</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+  <title>寒月 · DEX v3</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <div id="login-view" class="centered-wrap hidden">
-    <div class="card login-card">
-      <h1>DEX v3 控制台</h1>
-      <p class="muted">请输入管理员密码解锁配置面板</p>
-      <div id="login-error" class="error-banner hidden"></div>
-      <form id="login-form">
-        <label>密码
-          <input type="password" id="login-password" autocomplete="current-password" required>
-        </label>
-        <button type="submit" class="btn primary full">登录</button>
-      </form>
+  <div id="login-view" class="login-shell hidden">
+    <div class="card card-login">
+      <div class="card-header login-header">
+        <strong>寒月 · DEX v3</strong>
+      </div>
+      <div class="card-body">
+        <p class="text-muted login-subtitle">请输入管理员密码解锁控制台</p>
+        <div id="login-error" class="alert alert-danger hidden"></div>
+        <form id="login-form">
+          <div class="form-group">
+            <label for="login-password">密码</label>
+            <input type="password" id="login-password" class="form-control" placeholder="密码" autocomplete="current-password" required>
+          </div>
+          <button type="submit" class="btn btn-success btn-block">登录</button>
+        </form>
+      </div>
     </div>
   </div>
 
-  <div id="app-view" class="hidden">
-    <header class="topbar">
-      <div class="brand">
-        <span class="logo">DEX</span>
-        <span id="role-badge" class="badge">client</span>
-        <span id="version-badge" class="muted"></span>
+  <div id="app-view" class="app-root hidden">
+    <header class="navbar">
+      <div class="navbar-left">
+        <a id="nav-brand-link" class="navbar-brand" href="#">寒月</a>
+        <span id="nav-host-label" class="nav-host-label hidden"></span>
+        <span id="role-badge" class="badge badge-secondary">client</span>
+        <button id="btn-mark-host" type="button" class="btn btn-sm btn-outline-light">备注本机</button>
+        <button id="btn-sidebar-toggle" type="button" class="btn btn-link sidebar-toggle-btn" title="切换侧边栏" aria-label="切换侧边栏">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="3" y1="6" x2="21" y2="6"></line>
+            <line x1="3" y1="12" x2="21" y2="12"></line>
+            <line x1="3" y1="18" x2="21" y2="18"></line>
+          </svg>
+        </button>
+        <span id="arch-badge" class="badge badge-info arch-badge">AMD64</span>
       </div>
-      <div class="topbar-actions">
-        <button id="btn-apply-now" class="btn primary">应用配置</button>
-        <button id="btn-logout" class="btn">退出</button>
+      <div class="navbar-right">
+        <button id="btn-apply-now" type="button" class="btn btn-sm btn-primary">应用配置</button>
+        <button id="btn-logout" type="button" class="btn btn-sm btn-outline-light">注销</button>
       </div>
     </header>
 
-    <nav class="tabs" id="main-tabs">
-      <button class="tab active" data-tab="overview" data-roles="all">概览 &amp; 控制</button>
-      <button class="tab" data-tab="nodes" data-roles="client">节点 &amp; 测速</button>
-      <button class="tab" data-tab="routing" data-roles="client">分流 &amp; LAN</button>
-      <button class="tab" data-tab="dns" data-roles="client">DNS &amp; 规则库</button>
-      <button class="tab" data-tab="forward" data-roles="client">转发 &amp; RproxyC</button>
-      <button class="tab" data-tab="wg_ddns" data-roles="client">WireGuard &amp; DDNS</button>
-      <button class="tab" data-tab="server_cfg" data-roles="server,landing">主入站配置</button>
-      <button class="tab" data-tab="socks5" data-roles="server,landing">SOCKS5 出口</button>
-      <button class="tab" data-tab="extra" data-roles="server,landing,relay">附加协议 (55)</button>
-      <button class="tab" data-tab="relay_rproxys" data-roles="server,landing,relay">端口转发 &amp; RproxyS</button>
-      <button class="tab" data-tab="system" data-roles="all">系统 &amp; 证书 &amp; 备份</button>
-      <button class="tab" data-tab="logs" data-roles="all">实时日志</button>
-    </nav>
+    <div id="wrapper" class="wrapper">
+      <nav id="sidebar" class="sidebar" aria-label="主导航">
+        <ul id="main-tabs" class="sidebar-nav">
+          <li class="nav-item">
+            <button type="button" class="nav-link tab active" data-tab="overview" data-roles="all" data-title="概览">
+              <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="3" y="3" width="7" height="7"></rect>
+                <rect x="14" y="3" width="7" height="7"></rect>
+                <rect x="14" y="14" width="7" height="7"></rect>
+                <rect x="3" y="14" width="7" height="7"></rect>
+              </svg>
+              <span>概览</span>
+            </button>
+          </li>
+          <li class="nav-item">
+            <button type="button" class="nav-link tab" data-tab="nodes" data-roles="client" data-title="节点管理">
+              <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <line x1="8" y1="6" x2="21" y2="6"></line>
+                <line x1="8" y1="12" x2="21" y2="12"></line>
+                <line x1="8" y1="18" x2="21" y2="18"></line>
+                <circle cx="4" cy="6" r="1"></circle>
+                <circle cx="4" cy="12" r="1"></circle>
+                <circle cx="4" cy="18" r="1"></circle>
+              </svg>
+              <span>节点管理</span>
+            </button>
+          </li>
+          <li class="nav-item">
+            <button type="button" class="nav-link tab" data-tab="routing" data-roles="client" data-title="分流规则">
+              <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="6" cy="6" r="3"></circle>
+                <circle cx="6" cy="18" r="3"></circle>
+                <circle cx="18" cy="12" r="3"></circle>
+                <line x1="8.5" y1="7.5" x2="15.5" y2="10.8"></line>
+                <line x1="8.5" y1="16.5" x2="15.5" y2="13.2"></line>
+              </svg>
+              <span>分流规则</span>
+            </button>
+          </li>
+          <li class="nav-item">
+            <button type="button" class="nav-link tab" data-tab="dns" data-roles="client" data-title="DNS 与列表">
+              <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="10"></circle>
+                <polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"></polygon>
+              </svg>
+              <span>DNS 与列表</span>
+            </button>
+          </li>
+          <li class="nav-item">
+            <button type="button" class="nav-link tab" data-tab="forward" data-roles="client" data-title="中转与反代">
+              <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polyline points="17 1 21 5 17 9"></polyline>
+                <path d="M3 11V9a4 4 0 0 1 4-4h14"></path>
+                <polyline points="7 23 3 19 7 15"></polyline>
+                <path d="M21 13v2a4 4 0 0 1-4 4H3"></path>
+              </svg>
+              <span>中转与反代</span>
+            </button>
+          </li>
+          <li class="nav-item">
+            <button type="button" class="nav-link tab" data-tab="wg_ddns" data-roles="client" data-title="DDNS &amp; WireGuard">
+              <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+              </svg>
+              <span>DDNS &amp; WireGuard</span>
+            </button>
+          </li>
+          <li class="nav-item">
+            <button type="button" class="nav-link tab" data-tab="server_cfg" data-roles="server,landing" data-title="主入站配置">
+              <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="2" y="3" width="20" height="7" rx="1"></rect>
+                <rect x="2" y="14" width="20" height="7" rx="1"></rect>
+                <line x1="6" y1="6.5" x2="6.01" y2="6.5"></line>
+                <line x1="6" y1="17.5" x2="6.01" y2="17.5"></line>
+              </svg>
+              <span>主入站配置</span>
+            </button>
+          </li>
+          <li class="nav-item">
+            <button type="button" class="nav-link tab" data-tab="socks5" data-roles="server,landing" data-title="SOCKS5 出口">
+              <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M5 12h14"></path>
+                <path d="M12 5l7 7-7 7"></path>
+              </svg>
+              <span>SOCKS5 出口</span>
+            </button>
+          </li>
+          <li class="nav-item">
+            <button type="button" class="nav-link tab" data-tab="extra" data-roles="server,landing,relay" data-title="附加协议 (55)">
+              <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
+                <polyline points="2 17 12 22 22 17"></polyline>
+                <polyline points="2 12 12 17 22 12"></polyline>
+              </svg>
+              <span>附加协议 (55)</span>
+            </button>
+          </li>
+          <li class="nav-item">
+            <button type="button" class="nav-link tab" data-tab="relay_rproxys" data-roles="server,landing,relay" data-title="端口转发 &amp; RproxyS">
+              <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polyline points="16 3 21 3 21 8"></polyline>
+                <line x1="4" y1="20" x2="21" y2="3"></line>
+                <polyline points="21 16 21 21 16 21"></polyline>
+                <line x1="15" y1="15" x2="21" y2="21"></line>
+              </svg>
+              <span>端口转发 &amp; RproxyS</span>
+            </button>
+          </li>
+          <li class="nav-item">
+            <button type="button" class="nav-link tab" data-tab="system" data-roles="all" data-title="更新与系统">
+              <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="3"></circle>
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+              </svg>
+              <span>更新与系统</span>
+            </button>
+          </li>
+          <li class="nav-item">
+            <button type="button" class="nav-link tab" data-tab="logs" data-roles="all" data-title="实时日志">
+              <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polyline points="4 17 10 11 4 5"></polyline>
+                <line x1="12" y1="19" x2="20" y2="19"></line>
+              </svg>
+              <span>实时日志</span>
+            </button>
+          </li>
+          <li class="nav-item nav-item-bottom">
+            <button id="btn-sidebar-logout" type="button" class="nav-link">
+              <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+                <polyline points="16 17 21 12 16 7"></polyline>
+                <line x1="21" y1="12" x2="9" y2="12"></line>
+              </svg>
+              <span>注销</span>
+            </button>
+          </li>
+        </ul>
+      </nav>
 
-    <main class="container">
-      <!-- OVERVIEW -->
-      <section id="tab-overview" class="tab-panel active">
-        <div class="grid-2">
-          <div class="card">
-            <h3>服务运行状态</h3>
-            <div id="svc-grid" class="svc-grid"></div>
-            <div class="row-gap mt">
-              <button id="btn-force-restart-apply" class="btn">强制全量重启应用</button>
-              <button id="btn-proxy-restart" class="btn">重启代理</button>
-              <button id="btn-proxy-stop" class="btn danger">停止代理</button>
-            </div>
-          </div>
-          <div class="card">
-            <h3>系统与证书摘要</h3>
-            <div id="sys-kv" class="kv-list"></div>
-            <div class="row-gap">
-              <button id="btn-probe-conn" class="btn primary">探测 CN / Global 连通性</button>
-            </div>
-            <div id="conn-results" class="conn-grid mt"></div>
-          </div>
-        </div>
-        <div id="overview-client-nodes" class="card">
-          <h3>主节点快速切换</h3>
-          <div id="quick-nodes" class="node-cards"></div>
-        </div>
-        <div id="overview-server-share" class="card hidden">
-          <h3>服务端分享信息</h3>
-          <div id="server-share-kv" class="kv-list"></div>
-          <div class="row-gap">
-            <button id="btn-server-main-qr" class="btn">主节点 URI / QR</button>
-            <button id="btn-server-doh-qr" class="btn hidden">DoH 端点 QR</button>
-          </div>
-        </div>
-      </section>
+      <div id="content-wrapper" class="content-wrapper">
+        <main class="container-fluid">
+          <ol class="breadcrumb">
+            <li class="breadcrumb-item"><a id="breadcrumb-home" href="#">概览</a></li>
+            <li id="breadcrumb-current" class="breadcrumb-item active">状态</li>
+          </ol>
 
-      <!-- CLIENT: NODES -->
-      <section id="tab-nodes" class="tab-panel">
-        <div class="card">
-          <div class="card-head">
-            <h3>出站节点列表</h3>
-            <div class="row-gap">
-              <label class="check-row"><input type="checkbox" id="failover-enabled"> 自动故障切换</label>
-              <button id="btn-probe-nodes" class="btn">全部测速</button>
-              <button id="btn-add-node" class="btn primary">+ 添加节点</button>
-              <button id="btn-save-nodes" class="btn primary">保存并应用</button>
-            </div>
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr><th>状态</th><th>名称</th><th>协议</th><th>地址</th><th>SNI</th><th>延迟</th><th>操作</th></tr>
-              </thead>
-              <tbody id="nodes-tbody"></tbody>
-            </table>
-          </div>
-        </div>
-      </section>
+          <!-- OVERVIEW -->
+          <section id="tab-overview" class="tab-panel active">
+            <div class="kpi-grid">
+              <div id="kpi-conn-card" class="kpi-card">
+                <div class="kpi-card-body">
+                  <div class="card-body-icon">
+                    <svg width="72" height="72" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                      <path d="M13.13 22.19L11.5 18.36C13.07 17.78 14.54 17 15.9 16.09L13.13 22.19M5.64 12.5L1.81 10.87L7.91 8.1C7 9.46 6.22 10.93 5.64 12.5M21.61 2.39C21.61 2.39 16.66 .269 11 5.93C8.81 8.12 7.5 10.53 6.65 12.64C6.37 13.39 6.56 14.21 7.11 14.77L9.24 16.89C9.79 17.45 10.61 17.63 11.36 17.35C13.5 16.53 15.88 15.19 18.07 13C23.73 7.34 21.61 2.39 21.61 2.39M14.54 9.46C13.76 8.68 13.76 7.41 14.54 6.63S16.59 5.85 17.37 6.63C18.14 7.41 18.15 8.68 17.37 9.46C16.59 10.24 15.32 10.24 14.54 9.46Z"/>
+                    </svg>
+                  </div>
+                  <div class="kpi-title-row">
+                    <span>联网状态</span>
+                    <button id="btn-probe-conn" type="button" class="btn btn-xs btn-outline-light kpi-refresh-btn">探测</button>
+                  </div>
+                </div>
+                <div class="kpi-card-footer">
+                  <span id="kpi-conn-cn">国内线路: 待探测</span>
+                  <span id="kpi-conn-global">国外线路: 待探测</span>
+                </div>
+              </div>
 
-      <!-- CLIENT: ROUTING -->
-      <section id="tab-routing" class="tab-panel">
-        <div class="card">
-          <h3>NodeDT — 内网 IP 分流 &amp; 全局直连</h3>
-          <label class="check-row"><input type="checkbox" id="divert-enabled"> 启用 NodeDT</label>
-          <div class="grid-2 mt">
-            <label>NodeDT 目标节点<select id="divert-node"></select></label>
-            <label>仅代理中国 IP 的内网设备 (chn_proxy_lan_ips, 逗号或换行)
-              <textarea id="divert-chn-lan" rows="2"></textarea>
-            </label>
-            <label>全局走代理的内网 IP (global_proxy_lan_ips, 逗号或换行)
-              <textarea id="divert-global-lan" rows="2"></textarea>
-            </label>
-            <label>全局直连的内网 IP (direct_lan_ips, 逗号或换行)
-              <textarea id="divert-direct-lan" rows="2"></textarea>
-            </label>
-          </div>
-        </div>
+              <div class="kpi-card">
+                <div class="kpi-card-body">
+                  <div class="card-body-icon">
+                    <svg width="72" height="72" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                      <path d="M12 22c1.1 0 2-.9 2-2h-4a2 2 0 0 0 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/>
+                    </svg>
+                  </div>
+                  <div class="kpi-title-row"><span>版本检测</span></div>
+                </div>
+                <div class="kpi-card-footer">
+                  <span id="kpi-version" class="btn btn-light btn-pill">DEX v3</span>
+                  <span id="kpi-role-arch" class="btn btn-light btn-pill">client</span>
+                </div>
+              </div>
 
-        <div class="card">
-          <div class="card-head">
-            <h3>NodeSM — 流媒体 / AI / Apple / Steam 精细分流</h3>
-            <div class="row-gap">
-              <button id="btn-nodesm-reset" class="btn">全部设为当前主节点</button>
-              <button id="btn-nodesm-clear" class="btn">全部清空</button>
-            </div>
-          </div>
-          <div id="nodesm-grid" class="nodesm-grid"></div>
-          <div class="grid-2 mt">
-            <label>Apple 流量节点 (apple_node_id)<select id="apple-node"></select></label>
-            <label class="check-row mt"><input type="checkbox" id="steam-proxy"> Steam 下载与游戏流量走代理 (steam_proxy)</label>
-          </div>
-        </div>
+              <div class="kpi-card">
+                <div class="kpi-card-body">
+                  <div class="card-body-icon">
+                    <svg width="72" height="72" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                      <path d="M17 7H7a5 5 0 0 0 0 10h10a5 5 0 0 0 0-10zm0 8a3 3 0 1 1 0-6 3 3 0 0 1 0 6z"/>
+                    </svg>
+                  </div>
+                  <div class="kpi-title-row">
+                    <span>代理开关</span>
+                    <span id="kpi-proxy-state" class="kpi-state-tag">运行中</span>
+                  </div>
+                </div>
+                <div class="kpi-card-footer">
+                  <button id="btn-proxy-restart" type="button" class="btn btn-light btn-pill">重启代理</button>
+                  <button id="btn-proxy-stop" type="button" class="btn btn-light btn-pill">关闭代理</button>
+                </div>
+              </div>
 
-        <div class="card">
-          <h3>NodeCU — 自定义域名/IP 强制分流</h3>
-          <label class="check-row"><input type="checkbox" id="custom-enabled"> 启用 NodeCU</label>
-          <div class="grid-2 mt">
-            <label>NodeCU 目标节点<select id="custom-node"></select></label>
-            <div></div>
-            <label>自定义域名 (每行一个)<textarea id="custom-domains" rows="4"></textarea></label>
-            <label>自定义 IP/CIDR (每行一个)<textarea id="custom-ips" rows="4"></textarea></label>
-          </div>
-          <div class="mt">
-            <button id="btn-save-routing" class="btn primary">保存并应用分流</button>
-          </div>
-        </div>
-      </section>
+              <div class="kpi-card">
+                <div class="kpi-card-body">
+                  <div class="card-body-icon">
+                    <svg width="72" height="72" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                      <path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm1 11h4v-2h-3V7h-2v6z"/>
+                    </svg>
+                  </div>
+                  <div class="kpi-title-row"><span>运行时长</span></div>
+                </div>
+                <div class="kpi-card-footer">
+                  <span id="kpi-uptime">-</span>
+                  <span id="kpi-kernel">-</span>
+                </div>
+              </div>
+            </div>
 
-      <!-- CLIENT: DNS & RULES -->
-      <section id="tab-dns" class="tab-panel">
-        <div class="card">
-          <div class="card-head">
-            <h3>MosDNS 与防泄漏策略</h3>
-            <div class="row-gap">
-              <button id="btn-probe-doh" class="btn">探测 DoH 延迟</button>
-              <button id="btn-save-dns" class="btn primary">保存并应用 DNS</button>
+            <!-- CLIENT OVERVIEW: NODE LIST -->
+            <div id="overview-client-nodes" class="card mb-3">
+              <div class="card-header">
+                <div class="card-header-title">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <line x1="8" y1="6" x2="21" y2="6"></line>
+                    <line x1="8" y1="12" x2="21" y2="12"></line>
+                    <line x1="8" y1="18" x2="21" y2="18"></line>
+                    <circle cx="4" cy="6" r="1"></circle>
+                    <circle cx="4" cy="12" r="1"></circle>
+                    <circle cx="4" cy="18" r="1"></circle>
+                  </svg>
+                  <span>节点列表</span>
+                </div>
+                <div class="row-gap">
+                  <button id="btn-jump-nodesm" type="button" class="btn btn-sm btn-outline-secondary">预定义分流 NodeSM</button>
+                  <button id="btn-jump-nodecu" type="button" class="btn btn-sm btn-outline-secondary">自定义分流 NodeCU</button>
+                  <button id="btn-jump-nodes" type="button" class="btn btn-sm btn-outline-primary">节点管理</button>
+                </div>
+              </div>
+              <button id="btn-probe-nodes-overview" type="button" class="btn btn-outline-success btn-sm btn-block btn-flat">Ping (TCP)</button>
+              <div class="card-body">
+                <div class="table-responsive">
+                  <table class="table table-bordered table-hover text-center text-nowrap">
+                    <thead>
+                      <tr>
+                        <th>#</th>
+                        <th>节点地址</th>
+                        <th class="text-left">节点名</th>
+                        <th>协议</th>
+                        <th>延迟(ms)</th>
+                        <th>操作</th>
+                      </tr>
+                    </thead>
+                    <tbody id="overview-nodes-tbody"></tbody>
+                  </table>
+                </div>
+              </div>
             </div>
-          </div>
-          <div class="row-gap mb">
-            <label class="check-row"><input type="checkbox" id="dns-block-ads"> 广告域名屏蔽 (block_ads)</label>
-            <label class="check-row"><input type="checkbox" id="dns-block53"> 拦截局域网外部 53 端口 (block_external_53)</label>
-            <label class="check-row"><input type="checkbox" id="dns-ipv6"> 启用 IPv6 双栈 (TPROXY + AAAA)</label>
-            <label class="check-row"><input type="checkbox" id="dns-auto-rules"> 定时自动更新规则库 (auto_update_rules)</label>
-          </div>
-          <div id="doh-probe-results" class="conn-grid mb"></div>
-          <div class="grid-2">
-            <label>国内 DNS (china_servers, 每行一个)<textarea id="dns-china" rows="3"></textarea></label>
-            <label>国外 DoH/DoT/DoQ (doh_servers, 每行一个)<textarea id="dns-doh" rows="3"></textarea></label>
-            <label>自定义 Hosts (domain = ip, 支持 *.通配符)<textarea id="dns-hosts" rows="4"></textarea></label>
-            <label>域名白名单 (直连且免疫广告屏蔽)<textarea id="dns-white-dom" rows="4"></textarea></label>
-            <label>域名黑名单 (强制代理)<textarea id="dns-black-dom" rows="3"></textarea></label>
-            <label>IP 白名单 (直连 CIDR)<textarea id="dns-white-ip" rows="3"></textarea></label>
-            <label>IP 黑名单 (强制代理 CIDR)<textarea id="dns-black-ip" rows="3"></textarea></label>
-          </div>
-        </div>
 
-        <div class="card">
-          <div class="card-head">
-            <h3>分流规则文件状态 (Rules)</h3>
-            <div class="row-gap">
-              <label class="check-row"><input type="checkbox" id="rules-include-ads"> 含广告规则 (ads)</label>
-              <button id="btn-refresh-rules-status" class="btn">刷新状态</button>
-              <button id="btn-update-rules" class="btn primary">立即热更新规则库</button>
+            <!-- SERVER / LANDING SHARE CARD -->
+            <div id="overview-server-share" class="card mb-3 hidden">
+              <div class="card-header">
+                <span class="card-header-title">服务端分享信息</span>
+                <div class="row-gap">
+                  <button id="btn-server-main-qr" type="button" class="btn btn-sm btn-primary">主节点 URI / QR</button>
+                  <button id="btn-server-doh-qr" type="button" class="btn btn-sm btn-secondary hidden">DoH 端点 QR</button>
+                </div>
+              </div>
+              <div class="card-body">
+                <div id="server-share-kv" class="kv-list"></div>
+              </div>
             </div>
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>文件名</th><th>状态</th><th>大小</th><th>更新时间</th></tr></thead>
-              <tbody id="rules-tbody"></tbody>
-            </table>
-          </div>
-        </div>
-      </section>
 
-      <!-- CLIENT: FORWARD / RELAY / RPROXYC -->
-      <section id="tab-forward" class="tab-panel">
-        <div class="grid-2">
-          <div class="card">
-            <div class="card-head">
-              <h3>FWD0 中转入口</h3>
-              <button id="btn-fwd0-qr" class="btn btn-sm">链接 / QR</button>
-            </div>
-            <label class="check-row"><input type="checkbox" id="fwd0-enabled"> 启用 FWD0</label>
-            <div class="grid-2 mt">
-              <label>协议<select id="fwd0-proto"><option value="vless-xhttp">vless-xhttp</option><option value="vmess-tcp">vmess-tcp</option></select></label>
-              <label>端口<input type="number" id="fwd0-port"></label>
-              <label>Path<input type="text" id="fwd0-path" placeholder="/path"></label>
-              <label>UUIDs (逗号/换行)<textarea id="fwd0-uuids" rows="2"></textarea></label>
-            </div>
-          </div>
-          <div class="card">
-            <div class="card-head">
-              <h3>FWD1 中转入口</h3>
-              <button id="btn-fwd1-qr" class="btn btn-sm">链接 / QR</button>
-            </div>
-            <label class="check-row"><input type="checkbox" id="fwd1-enabled"> 启用 FWD1</label>
-            <div class="grid-2 mt">
-              <label>协议<select id="fwd1-proto"><option value="vless-xhttp">vless-xhttp</option><option value="vmess-tcp">vmess-tcp</option></select></label>
-              <label>端口<input type="number" id="fwd1-port"></label>
-              <label>出口上游节点<select id="fwd1-upstream"></select></label>
-              <label>Path<input type="text" id="fwd1-path" placeholder="/path"></label>
-              <label>UUIDs (逗号/换行)<textarea id="fwd1-uuids" rows="2"></textarea></label>
-            </div>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-head">
-            <h3>端口转发 (Option 44 — Relay)</h3>
-            <button id="btn-client-add-relay" class="btn">+ 添加转发规则</button>
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>ID</th><th>监听端口</th><th>公网端口</th><th>目标地址</th><th>协议</th><th>引擎</th><th>操作</th></tr></thead>
-              <tbody id="client-relay-tbody"></tbody>
-            </table>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-head">
-            <h3>RproxyC — 内网穿透客户端</h3>
-            <button id="btn-rc-add-map" class="btn">+ 添加端口映射</button>
-          </div>
-          <div class="row-gap mb">
-            <label class="check-row"><input type="checkbox" id="rc-enabled"> 启用 RproxyC</label>
-            <label class="check-row"><input type="checkbox" id="rc-out-direct"> 兜底直连出口 (out_direct)</label>
-          </div>
-          <div class="grid-2">
-            <label>RproxyS 地址 (tunnel_address)<input type="text" id="rc-domain"></label>
-            <label>隧道端口 (tunnel_port)<input type="number" id="rc-port"></label>
-            <label>隧道 UUID (tunnel_uuid)<input type="text" id="rc-uuid"></label>
-            <label>传输安全 (security)<select id="rc-security"><option value="tls">tls</option><option value="none">none</option></select></label>
-            <label>TLS ServerName (SNI, 可选)<input type="text" id="rc-sni"></label>
-            <label>Pinned Cert SHA256 (自签可选)<input type="text" id="rc-pin"></label>
-          </div>
-          <div class="table-wrap mt">
-            <table>
-              <thead><tr><th>公网端口 (ext_port)</th><th>内网主机 (int_ip)</th><th>内网端口 (int_port)</th><th>协议</th><th>操作</th></tr></thead>
-              <tbody id="rc-map-tbody"></tbody>
-            </table>
-          </div>
-          <div class="mt">
-            <button id="btn-save-forward" class="btn primary">保存并应用转发配置</button>
-          </div>
-        </div>
-      </section>
-
-      <!-- CLIENT: WIREGUARD & DDNS -->
-      <section id="tab-wg_ddns" class="tab-panel">
-        <div class="card">
-          <div class="card-head">
-            <h3>WireGuard 回家服务器</h3>
-            <div class="row-gap">
-              <button id="btn-wg-regen-server" class="btn">轮换服务端密钥</button>
-              <button id="btn-save-wg" class="btn primary">保存并应用 WG</button>
-            </div>
-          </div>
-          <label class="check-row"><input type="checkbox" id="wg-enabled"> 启用 WireGuard</label>
-          <div class="grid-2 mt">
-            <label>公网端点 (Endpoint Host)<input type="text" id="wg-endpoint"></label>
-            <label>UDP 端口<input type="number" id="wg-port"></label>
-            <label>内网子网 (CIDR)<input type="text" id="wg-subnet"></label>
-            <label>服务端公钥 (只读)<input type="text" id="wg-server-pub" readonly></label>
-          </div>
-          <div class="row-gap mt">
-            <input type="text" id="wg-peer-name" placeholder="新设备名称 (如 phone)">
-            <button id="btn-wg-add-peer" class="btn primary">+ 添加 Peer</button>
-          </div>
-          <div class="table-wrap mt">
-            <table>
-              <thead><tr><th>名称</th><th>隧道 IP</th><th>公钥</th><th>操作</th></tr></thead>
-              <tbody id="wg-peers-tbody"></tbody>
-            </table>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-head">
-            <h3>Cloudflare DDNS</h3>
-            <div class="row-gap">
-              <button id="btn-ddns-check-ips" class="btn">查询本机公网 IP</button>
-              <button id="btn-ddns-sync" class="btn">立即同步</button>
-              <button id="btn-save-ddns" class="btn primary">保存并应用 DDNS</button>
-            </div>
-          </div>
-          <div class="row-gap mb">
-            <label class="check-row"><input type="checkbox" id="ddns-enabled"> 启用 DDNS</label>
-            <label class="check-row"><input type="checkbox" id="ddns-v6"> 同时更新 IPv6 (AAAA)</label>
-          </div>
-          <div class="grid-2">
-            <label>域名<input type="text" id="ddns-domain"></label>
-            <label>CF Email (Global API Key 时填写)<input type="email" id="ddns-email"></label>
-            <label>CF Token / Global Key (留空保持不变)<input type="password" id="ddns-token"></label>
-          </div>
-          <div id="ddns-ip-result" class="muted mt"></div>
-        </div>
-      </section>
-
-      <!-- SERVER / LANDING: MAIN INBOUND -->
-      <section id="tab-server_cfg" class="tab-panel">
-        <div class="card">
-          <div class="card-head">
-            <h3>Server / Landing 主入站配置</h3>
-            <button id="btn-save-server" class="btn primary">保存并应用</button>
-          </div>
-          <div class="grid-2">
-            <label>主入站协议
-              <select id="srv-proto">
-                <option value="vless-xhttp">vless-xhttp (默认)</option>
-                <option value="vmess-ws">vmess-ws</option>
-                <option value="vless-ws">vless-ws</option>
-              </select>
-            </label>
-            <label>TLS 模式
-              <select id="srv-tls-mode">
-                <option value="nginx">nginx (前置反代 + 伪装站点)</option>
-                <option value="direct">direct (Xray 直连 TLS)</option>
-              </select>
-            </label>
-            <label>域名 (Domain / SNI)<input type="text" id="srv-domain"></label>
-            <label>连接主机 (ConnectHost, 留空同 Domain)<input type="text" id="srv-connect-host"></label>
-            <label>监听端口 (ListenPort)<input type="number" id="srv-port"></label>
-            <label>公网 NAT 端口 (PublicPort, 0 同监听)<input type="number" id="srv-pub-port"></label>
-            <label>Path<input type="text" id="srv-path"></label>
-            <label>伪装站点目录 (CamouflageDir)<input type="text" id="srv-camo-dir"></label>
-          </div>
-          <div class="mt">
-            <div class="card-head">
-              <label>UUID 列表 (每行一个)</label>
-              <button id="btn-srv-gen-uuid" class="btn btn-sm">+ 生成随机 UUID</button>
-            </div>
-            <textarea id="srv-uuids" rows="3"></textarea>
-          </div>
-          <label class="check-row mt"><input type="checkbox" id="srv-enable-doh"> 启用 RFC 8484 DoH 服务端点 (/dq, 需 nginx 模式)</label>
-        </div>
-      </section>
-
-      <!-- SERVER / LANDING: SOCKS5 OUTBOUNDS -->
-      <section id="tab-socks5" class="tab-panel">
-        <div class="card">
-          <div class="card-head">
-            <h3>SOCKS5 多出口分流 (Option 35)</h3>
-            <div class="row-gap">
-              <button id="btn-add-socks5" class="btn primary">+ 添加出口</button>
-              <button id="btn-save-socks5" class="btn primary">保存并应用</button>
-            </div>
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>名称</th><th>状态</th><th>地址</th><th>域名规则</th><th>IP 规则</th><th>私有旁路</th><th>操作</th></tr></thead>
-              <tbody id="socks5-tbody"></tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-
-      <!-- SERVER / LANDING / RELAY: EXTRA INBOUNDS -->
-      <section id="tab-extra" class="tab-panel">
-        <div class="card">
-          <div class="card-head">
-            <h3>附加协议入站 (Option 55)</h3>
-            <div class="row-gap">
-              <button id="btn-add-extra" class="btn primary">+ 添加附加协议</button>
-              <button id="btn-disable-all-extra" class="btn danger">全部清空</button>
-              <button id="btn-save-extra" class="btn primary">保存并应用</button>
-            </div>
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>Tag</th><th>协议</th><th>端口</th><th>Nginx</th><th>参数摘要</th><th>操作</th></tr></thead>
-              <tbody id="extra-tbody"></tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-
-      <!-- SERVER / LANDING / RELAY: RELAY & RPROXYS -->
-      <section id="tab-relay_rproxys" class="tab-panel">
-        <div class="card">
-          <div class="card-head">
-            <h3>端口转发 (Option 44 — Relay)</h3>
-            <button id="btn-srv-add-relay" class="btn">+ 添加转发规则</button>
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>ID</th><th>监听端口</th><th>公网端口</th><th>目标地址</th><th>协议</th><th>引擎</th><th>操作</th></tr></thead>
-              <tbody id="srv-relay-tbody"></tbody>
-            </table>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-head">
-            <h3>RproxyS — 反向代理服务端</h3>
-            <button id="btn-rs-add-map" class="btn">+ 添加入口端口映射</button>
-          </div>
-          <label class="check-row"><input type="checkbox" id="rs-enabled"> 启用 RproxyS</label>
-          <div class="grid-2 mt">
-            <label>隧道域名<input type="text" id="rs-domain"></label>
-            <label>隧道端口<input type="number" id="rs-port"></label>
-            <label>安全模式<select id="rs-security"><option value="tls">tls</option><option value="none">none</option></select></label>
-            <div></div>
-            <label>隧道 UUIDs (逗号或换行)<textarea id="rs-uuids" rows="2"></textarea></label>
-            <label>代理入口 InUUIDs (可选, 逗号或换行)<textarea id="rs-in-uuids" rows="2"></textarea></label>
-          </div>
-          <div class="table-wrap mt">
-            <table>
-              <thead><tr><th>公网端口</th><th>协议</th><th>操作</th></tr></thead>
-              <tbody id="rs-map-tbody"></tbody>
-            </table>
-          </div>
-          <div class="mt">
-            <button id="btn-save-relay-rproxys" class="btn primary">保存并应用转发/RproxyS</button>
-          </div>
-        </div>
-      </section>
-
-      <!-- SHARED: SYSTEM / CERT / BACKUP / MIGRATE -->
-      <section id="tab-system" class="tab-panel">
-        <div class="card">
-          <div class="card-head">
-            <h3>TLS 证书管理</h3>
-            <div class="row-gap">
-              <button id="btn-cert-self-sign" class="btn">重新生成自签证书</button>
-              <button id="btn-cert-issue" class="btn primary">ACME 签发证书</button>
-            </div>
-          </div>
-          <div id="cert-summary" class="kv-list"></div>
-          <div class="grid-2">
-            <label>ACME 模式
-              <select id="cert-mode">
-                <option value="cf">Cloudflare DNS-01 (通配符)</option>
-                <option value="http">HTTP-01 (--standalone / --webroot)</option>
-              </select>
-            </label>
-            <label>证书域名<input type="text" id="cert-domain"></label>
-            <label>CF Email (Global Key 可选)<input type="email" id="cert-cf-email"></label>
-            <label>CF Token / Global Key (留空沿用已存)<input type="password" id="cert-cf-token"></label>
-            <label>Webroot 目录 (HTTP-01 可选, 留空 standalone)<input type="text" id="cert-webroot" placeholder="/var/www/html"></label>
-            <label class="check-row mt"><input type="checkbox" id="cert-auto-renew" checked> 保留 Token 以自动续签</label>
-          </div>
-          <details class="mt">
-            <summary>手动导入证书与私钥 PEM</summary>
-            <div class="grid-2 mt">
-              <label>证书 PEM (fullchain)<textarea id="cert-imp-pem" rows="4"></textarea></label>
-              <label>私钥 PEM<textarea id="cert-imp-key" rows="4"></textarea></label>
-            </div>
-            <div class="row-gap mt">
-              <label class="check-row"><input type="checkbox" id="cert-imp-allow-self"> 允许自签证书</label>
-              <button id="btn-cert-import" class="btn primary">导入并热加载</button>
-            </div>
-          </details>
-        </div>
-
-        <div class="grid-2">
-          <div class="card">
-            <h3>配置备份与恢复 (含完整密钥)</h3>
-            <div class="row-gap mb">
-              <button id="btn-backup-download" class="btn primary">下载 JSON 全量备份</button>
-            </div>
-            <label>从 v3 备份文件恢复<input type="file" id="restore-file" accept=".json"></label>
-            <label class="mt">或粘贴 v3 Backup JSON<textarea id="restore-json" rows="4"></textarea></label>
-            <div class="row-gap mt">
-              <label class="check-row"><input type="checkbox" id="restore-apply" checked> 恢复后立即 Apply</label>
-              <button id="btn-restore-v3" class="btn primary">恢复 v3 配置</button>
-            </div>
-          </div>
-
-          <div class="card">
-            <h3>导入旧版配置 (v2 / des / dexs)</h3>
-            <label>来源类型
-              <select id="mig-kind">
-                <option value="v2_client">v2 Client (/opt/de_GWD/0conf)</option>
-                <option value="v2_server">v2 Server (本机路径)</option>
-                <option value="des">des (/etc/des/state.json)</option>
-                <option value="dexs">dexs (/etc/vless-lite/state.json)</option>
-              </select>
-            </label>
-            <label class="mt">服务器上路径 (留空使用默认路径)
-              <input type="text" id="mig-path" placeholder="/opt/de_GWD/0conf">
-            </label>
-            <label class="mt">或直接粘贴 JSON 内容
-              <textarea id="mig-raw" rows="4"></textarea>
-            </label>
-            <div class="row-gap mt">
-              <label class="check-row"><input type="checkbox" id="mig-apply" checked> 导入后立即 Apply</label>
-              <button id="btn-migrate" class="btn primary">执行迁移</button>
-            </div>
-          </div>
-        </div>
-
-        <div class="grid-2">
-          <div class="card">
-            <h3>组件在线更新与监听地址</h3>
-            <div class="row-gap mb">
-              <label class="check-row"><input type="checkbox" id="sys-auto-update-core"> 每周自动更新核心组件 (auto_update_core)</label>
-            </div>
             <div class="grid-2">
-              <label>设备别名 (system.hostname)<input type="text" id="sys-hostname" placeholder="例如 home-gateway"></label>
-              <label>Web 面板监听地址 (修改将重启 daemon)<input type="text" id="auth-listen" placeholder=":8443"></label>
+              <div class="card">
+                <div class="card-header">
+                  <span class="card-header-title">服务状态</span>
+                  <button id="btn-force-restart-apply" type="button" class="btn btn-sm btn-outline-secondary">强制全量重启应用</button>
+                </div>
+                <div class="card-body">
+                  <div id="svc-grid" class="svc-grid"></div>
+                </div>
+              </div>
+              <div class="card">
+                <div class="card-header">
+                  <span class="card-header-title">系统与证书摘要</span>
+                </div>
+                <div class="card-body">
+                  <div id="sys-kv" class="kv-list"></div>
+                </div>
+              </div>
             </div>
-            <div class="row-gap mt"><button id="btn-save-system" class="btn primary">保存系统设置</button></div>
-            <div class="grid-2 mt">
-              <label>更新组件
-                <select id="upd-component">
-                  <option value="all">all (dex + xray + mosdns)</option>
-                  <option value="dex">dex</option>
-                  <option value="xray">xray</option>
-                  <option value="mosdns">mosdns</option>
-                </select>
-              </label>
-              <label>指定版本 (留空 latest)<input type="text" id="upd-version" placeholder="latest"></label>
-            </div>
-            <div class="row-gap mt">
-              <button id="btn-update-core" class="btn">立即更新组件</button>
-              <button id="btn-reboot" class="btn danger">重启主机</button>
-            </div>
-          </div>
+          </section>
 
-          <div class="card">
-            <h3>修改 Web 登录密码</h3>
-            <label>当前密码<input type="password" id="pw-old"></label>
-            <label class="mt">新密码 (至少 6 位)<input type="password" id="pw-new"></label>
-            <button id="btn-change-pw" class="btn mt">更新密码</button>
-          </div>
-        </div>
-      </section>
-
-      <!-- SHARED: LOGS -->
-      <section id="tab-logs" class="tab-panel">
-        <div class="card">
-          <div class="card-head">
-            <h3>实时任务日志 (SSE)</h3>
-            <div class="row-gap">
-              <button id="btn-logs-toggle" class="btn">暂停滚动</button>
-              <button id="btn-logs-clear" class="btn">清空</button>
+          <!-- CLIENT: NODES -->
+          <section id="tab-nodes" class="tab-panel">
+            <div class="card">
+              <div class="card-header">
+                <span class="card-header-title">出站节点列表</span>
+                <div class="row-gap">
+                  <label class="check-row"><input type="checkbox" id="failover-enabled"> 自动故障切换</label>
+                  <button id="btn-probe-nodes" type="button" class="btn btn-sm btn-outline-success">全部测速</button>
+                  <button id="btn-add-node" type="button" class="btn btn-sm btn-primary">+ 添加节点</button>
+                  <button id="btn-save-nodes" type="button" class="btn btn-sm btn-success">保存并应用</button>
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="table-responsive">
+                  <table class="table table-bordered table-hover">
+                    <thead>
+                      <tr><th>状态</th><th>名称</th><th>协议</th><th>地址</th><th>SNI</th><th>延迟</th><th>操作</th></tr>
+                    </thead>
+                    <tbody id="nodes-tbody"></tbody>
+                  </table>
+                </div>
+              </div>
             </div>
-          </div>
-          <pre id="log-box" class="log-box"></pre>
-        </div>
-      </section>
-    </main>
+          </section>
+
+          <!-- CLIENT: ROUTING -->
+          <section id="tab-routing" class="tab-panel">
+            <div id="card-nodedt" class="card mb-3">
+              <div class="card-header">
+                <span class="card-header-title">NodeDT — 内网 IP 分流 &amp; 全局直连</span>
+              </div>
+              <div class="card-body">
+                <p class="form-hint">按局域网来源 IP 分流：可分别指定部分内网设备仅代理境外、全局走指定节点或完全直连绕过代理。</p>
+                <label class="check-row"><input type="checkbox" id="divert-enabled"> 启用 NodeDT</label>
+                <div class="grid-2 mt">
+                  <label class="field"><span>NodeDT 目标节点</span><select id="divert-node" class="form-control"></select></label>
+                  <label class="field"><span>仅代理境外 IP 的内网设备 (chn_proxy_lan_ips, 逗号或换行)</span>
+                    <textarea id="divert-chn-lan" class="form-control" rows="2"></textarea>
+                  </label>
+                  <label class="field"><span>全局走代理的内网 IP (global_proxy_lan_ips, 逗号或换行)</span>
+                    <textarea id="divert-global-lan" class="form-control" rows="2"></textarea>
+                  </label>
+                  <label class="field"><span>全局直连的内网 IP (direct_lan_ips, 逗号或换行)</span>
+                    <textarea id="divert-direct-lan" class="form-control" rows="2"></textarea>
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            <div id="card-nodesm" class="card mb-3">
+              <div class="card-header">
+                <span class="card-header-title">NodeSM — 流媒体 / AI / Apple / Steam 精细分流</span>
+                <div class="row-gap">
+                  <button id="btn-nodesm-reset" type="button" class="btn btn-sm btn-outline-secondary">全部设为当前主节点</button>
+                  <button id="btn-nodesm-clear" type="button" class="btn btn-sm btn-outline-secondary">全部清空</button>
+                </div>
+              </div>
+              <div class="card-body">
+                <p class="form-hint">按预设流媒体与 AI 服务域名分流至指定节点；留空跟随主节点，Apple 与 Steam 默认直连不走代理。</p>
+                <div id="nodesm-grid" class="nodesm-grid"></div>
+                <div class="grid-2 mt">
+                  <label class="field"><span>Apple 流量节点 (apple_node_id)</span><select id="apple-node" class="form-control"></select></label>
+                  <label class="check-row mt"><input type="checkbox" id="steam-proxy"> Steam 下载与游戏流量走代理 (steam_proxy)</label>
+                </div>
+              </div>
+            </div>
+
+            <div id="card-nodecu" class="card">
+              <div class="card-header">
+                <span class="card-header-title">NodeCU — 自定义域名/IP 强制分流</span>
+              </div>
+              <div class="card-body">
+                <p class="form-hint">自定义域名与 IP/CIDR 规则强制走指定节点（支持 domain: / keyword: / regexp: / geosite: / geoip:）。</p>
+                <label class="check-row"><input type="checkbox" id="custom-enabled"> 启用 NodeCU</label>
+                <div class="grid-2 mt">
+                  <label class="field"><span>NodeCU 目标节点</span><select id="custom-node" class="form-control"></select></label>
+                  <div></div>
+                  <label class="field"><span>自定义域名 (每行一个)</span><textarea id="custom-domains" class="form-control" rows="4"></textarea></label>
+                  <label class="field"><span>自定义 IP/CIDR (每行一个)</span><textarea id="custom-ips" class="form-control" rows="4"></textarea></label>
+                </div>
+                <div class="mt">
+                  <button id="btn-save-routing" type="button" class="btn btn-primary">保存并应用分流</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- CLIENT: DNS & RULES -->
+          <section id="tab-dns" class="tab-panel">
+            <div class="card mb-3">
+              <div class="card-header">
+                <span class="card-header-title">MosDNS 与防泄漏策略</span>
+                <div class="row-gap">
+                  <button id="btn-probe-doh" type="button" class="btn btn-sm btn-outline-success">探测 DoH 延迟</button>
+                  <button id="btn-save-dns" type="button" class="btn btn-sm btn-primary">保存并应用 DNS</button>
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="row-gap mb">
+                  <label class="check-row"><input type="checkbox" id="dns-block-ads"> 广告域名屏蔽 (block_ads)</label>
+                  <label class="check-row"><input type="checkbox" id="dns-block53"> 拦截局域网外部 53 端口 (block_external_53)</label>
+                  <label class="check-row"><input type="checkbox" id="dns-ipv6"> 启用 IPv6 双栈 (TPROXY + AAAA)</label>
+                  <label class="check-row"><input type="checkbox" id="dns-auto-rules"> 定时自动更新规则库 (auto_update_rules)</label>
+                </div>
+                <div id="doh-probe-results" class="conn-grid mb"></div>
+                <div class="grid-2">
+                  <label class="field"><span>国内 DNS (china_servers, 每行一个)</span><textarea id="dns-china" class="form-control" rows="3"></textarea></label>
+                  <label class="field"><span>国外 DoH/DoT/DoQ (doh_servers, 每行一个)</span><textarea id="dns-doh" class="form-control" rows="3"></textarea></label>
+                  <label class="field"><span>自定义 Hosts (domain = ip, 支持 *.通配符)</span><textarea id="dns-hosts" class="form-control" rows="4"></textarea></label>
+                  <label class="field"><span>域名白名单 (直连且免疫广告屏蔽)</span><textarea id="dns-white-dom" class="form-control" rows="4"></textarea></label>
+                  <label class="field"><span>域名黑名单 (强制代理)</span><textarea id="dns-black-dom" class="form-control" rows="3"></textarea></label>
+                  <label class="field"><span>IP 白名单 (直连 CIDR)</span><textarea id="dns-white-ip" class="form-control" rows="3"></textarea></label>
+                  <label class="field"><span>IP 黑名单 (强制代理 CIDR)</span><textarea id="dns-black-ip" class="form-control" rows="3"></textarea></label>
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-header">
+                <span class="card-header-title">分流规则文件状态 (Rules)</span>
+                <div class="row-gap">
+                  <label class="check-row"><input type="checkbox" id="rules-include-ads"> 含广告规则 (ads)</label>
+                  <button id="btn-refresh-rules-status" type="button" class="btn btn-sm btn-secondary">刷新状态</button>
+                  <button id="btn-update-rules" type="button" class="btn btn-sm btn-primary">立即热更新规则库</button>
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="table-responsive">
+                  <table class="table table-bordered table-hover">
+                    <thead><tr><th>文件名</th><th>状态</th><th>大小</th><th>更新时间</th></tr></thead>
+                    <tbody id="rules-tbody"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- CLIENT: FORWARD / RELAY / RPROXYC -->
+          <section id="tab-forward" class="tab-panel">
+            <div class="grid-2 mb-3">
+              <div class="card">
+                <div class="card-header">
+                  <span class="card-header-title">FWD0 中转入口</span>
+                  <button id="btn-fwd0-qr" type="button" class="btn btn-sm btn-outline-secondary">链接 / QR</button>
+                </div>
+                <div class="card-body">
+                  <label class="check-row"><input type="checkbox" id="fwd0-enabled"> 启用 FWD0</label>
+                  <div class="grid-2 mt">
+                    <label class="field"><span>协议</span><select id="fwd0-proto" class="form-control"><option value="vless-xhttp">vless-xhttp</option><option value="vmess-tcp">vmess-tcp</option></select></label>
+                    <label class="field"><span>端口</span><input type="number" id="fwd0-port" class="form-control"></label>
+                    <label class="field"><span>Path</span><input type="text" id="fwd0-path" class="form-control" placeholder="/path"></label>
+                    <label class="field"><span>UUIDs (逗号/换行)</span><textarea id="fwd0-uuids" class="form-control" rows="2"></textarea></label>
+                  </div>
+                </div>
+              </div>
+              <div class="card">
+                <div class="card-header">
+                  <span class="card-header-title">FWD1 中转入口</span>
+                  <button id="btn-fwd1-qr" type="button" class="btn btn-sm btn-outline-secondary">链接 / QR</button>
+                </div>
+                <div class="card-body">
+                  <label class="check-row"><input type="checkbox" id="fwd1-enabled"> 启用 FWD1</label>
+                  <div class="grid-2 mt">
+                    <label class="field"><span>协议</span><select id="fwd1-proto" class="form-control"><option value="vless-xhttp">vless-xhttp</option><option value="vmess-tcp">vmess-tcp</option></select></label>
+                    <label class="field"><span>端口</span><input type="number" id="fwd1-port" class="form-control"></label>
+                    <label class="field"><span>出口上游节点</span><select id="fwd1-upstream" class="form-control"></select></label>
+                    <label class="field"><span>Path</span><input type="text" id="fwd1-path" class="form-control" placeholder="/path"></label>
+                    <label class="field"><span>UUIDs (逗号/换行)</span><textarea id="fwd1-uuids" class="form-control" rows="2"></textarea></label>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="card mb-3">
+              <div class="card-header">
+                <span class="card-header-title">端口转发 (Option 44 — Relay)</span>
+                <button id="btn-client-add-relay" type="button" class="btn btn-sm btn-primary">+ 添加转发规则</button>
+              </div>
+              <div class="card-body">
+                <div class="table-responsive">
+                  <table class="table table-bordered table-hover">
+                    <thead><tr><th>ID</th><th>监听端口</th><th>公网端口</th><th>目标地址</th><th>协议</th><th>引擎</th><th>操作</th></tr></thead>
+                    <tbody id="client-relay-tbody"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-header">
+                <span class="card-header-title">RproxyC — 内网穿透客户端</span>
+                <button id="btn-rc-add-map" type="button" class="btn btn-sm btn-primary">+ 添加端口映射</button>
+              </div>
+              <div class="card-body">
+                <div class="row-gap mb">
+                  <label class="check-row"><input type="checkbox" id="rc-enabled"> 启用 RproxyC</label>
+                  <label class="check-row"><input type="checkbox" id="rc-out-direct"> 兜底直连出口 (out_direct)</label>
+                </div>
+                <div class="grid-2">
+                  <label class="field"><span>RproxyS 地址 (tunnel_address)</span><input type="text" id="rc-domain" class="form-control"></label>
+                  <label class="field"><span>隧道端口 (tunnel_port)</span><input type="number" id="rc-port" class="form-control"></label>
+                  <label class="field"><span>隧道 UUID (tunnel_uuid)</span><input type="text" id="rc-uuid" class="form-control"></label>
+                  <label class="field"><span>传输安全 (security)</span><select id="rc-security" class="form-control"><option value="tls">tls</option><option value="none">none</option></select></label>
+                  <label class="field"><span>TLS ServerName (SNI, 可选)</span><input type="text" id="rc-sni" class="form-control"></label>
+                  <label class="field"><span>Pinned Cert SHA256 (自签可选)</span><input type="text" id="rc-pin" class="form-control"></label>
+                </div>
+                <div class="table-responsive mt">
+                  <table class="table table-bordered table-hover">
+                    <thead><tr><th>公网端口 (ext_port)</th><th>内网主机 (int_ip)</th><th>内网端口 (int_port)</th><th>协议</th><th>操作</th></tr></thead>
+                    <tbody id="rc-map-tbody"></tbody>
+                  </table>
+                </div>
+                <div class="mt">
+                  <button id="btn-save-forward" type="button" class="btn btn-primary">保存并应用转发配置</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- CLIENT: WIREGUARD & DDNS -->
+          <section id="tab-wg_ddns" class="tab-panel">
+            <div class="card mb-3">
+              <div class="card-header">
+                <span class="card-header-title">WireGuard 回家服务器</span>
+                <div class="row-gap">
+                  <button id="btn-wg-regen-server" type="button" class="btn btn-sm btn-secondary">轮换服务端密钥</button>
+                  <button id="btn-save-wg" type="button" class="btn btn-sm btn-primary">保存并应用 WG</button>
+                </div>
+              </div>
+              <div class="card-body">
+                <label class="check-row"><input type="checkbox" id="wg-enabled"> 启用 WireGuard</label>
+                <div class="grid-2 mt">
+                  <label class="field"><span>公网端点 (Endpoint Host)</span><input type="text" id="wg-endpoint" class="form-control"></label>
+                  <label class="field"><span>UDP 端口</span><input type="number" id="wg-port" class="form-control"></label>
+                  <label class="field"><span>内网子网 (CIDR)</span><input type="text" id="wg-subnet" class="form-control"></label>
+                  <label class="field"><span>服务端公钥 (只读)</span><input type="text" id="wg-server-pub" class="form-control" readonly></label>
+                </div>
+                <div class="row-gap mt">
+                  <input type="text" id="wg-peer-name" class="form-control input-inline" placeholder="新设备名称 (如 phone)">
+                  <button id="btn-wg-add-peer" type="button" class="btn btn-sm btn-primary">+ 添加 Peer</button>
+                </div>
+                <div class="table-responsive mt">
+                  <table class="table table-bordered table-hover">
+                    <thead><tr><th>名称</th><th>隧道 IP</th><th>公钥</th><th>操作</th></tr></thead>
+                    <tbody id="wg-peers-tbody"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-header">
+                <span class="card-header-title">Cloudflare DDNS</span>
+                <div class="row-gap">
+                  <button id="btn-ddns-check-ips" type="button" class="btn btn-sm btn-outline-secondary">查询本机公网 IP</button>
+                  <button id="btn-ddns-sync" type="button" class="btn btn-sm btn-secondary">立即同步</button>
+                  <button id="btn-save-ddns" type="button" class="btn btn-sm btn-primary">保存并应用 DDNS</button>
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="row-gap mb">
+                  <label class="check-row"><input type="checkbox" id="ddns-enabled"> 启用 DDNS</label>
+                  <label class="check-row"><input type="checkbox" id="ddns-v6"> 同时更新 IPv6 (AAAA)</label>
+                </div>
+                <div class="grid-2">
+                  <label class="field"><span>域名</span><input type="text" id="ddns-domain" class="form-control"></label>
+                  <label class="field"><span>CF Email (Global API Key 时填写)</span><input type="email" id="ddns-email" class="form-control"></label>
+                  <label class="field"><span>CF Token / Global Key (留空保持不变)</span><input type="password" id="ddns-token" class="form-control"></label>
+                </div>
+                <div id="ddns-ip-result" class="text-muted mt"></div>
+              </div>
+            </div>
+          </section>
+
+          <!-- SERVER / LANDING: MAIN INBOUND -->
+          <section id="tab-server_cfg" class="tab-panel">
+            <div class="card">
+              <div class="card-header">
+                <span class="card-header-title">Server / Landing 主入站配置</span>
+                <button id="btn-save-server" type="button" class="btn btn-sm btn-primary">保存并应用</button>
+              </div>
+              <div class="card-body">
+                <div class="grid-2">
+                  <label class="field"><span>主入站协议</span>
+                    <select id="srv-proto" class="form-control">
+                      <option value="vless-xhttp">vless-xhttp (默认)</option>
+                      <option value="vmess-ws">vmess-ws</option>
+                      <option value="vless-ws">vless-ws</option>
+                    </select>
+                  </label>
+                  <label class="field"><span>TLS 模式</span>
+                    <select id="srv-tls-mode" class="form-control">
+                      <option value="nginx">nginx (前置反代 + 伪装站点)</option>
+                      <option value="direct">direct (Xray 直连 TLS)</option>
+                    </select>
+                  </label>
+                  <label class="field"><span>域名 (Domain / SNI)</span><input type="text" id="srv-domain" class="form-control"></label>
+                  <label class="field"><span>连接主机 (ConnectHost, 留空同 Domain)</span><input type="text" id="srv-connect-host" class="form-control"></label>
+                  <label class="field"><span>监听端口 (ListenPort)</span><input type="number" id="srv-port" class="form-control"></label>
+                  <label class="field"><span>公网 NAT 端口 (PublicPort, 0 同监听)</span><input type="number" id="srv-pub-port" class="form-control"></label>
+                  <label class="field"><span>Path</span><input type="text" id="srv-path" class="form-control"></label>
+                  <label class="field"><span>伪装站点目录 (CamouflageDir)</span><input type="text" id="srv-camo-dir" class="form-control"></label>
+                </div>
+                <div class="mt">
+                  <div class="row-between mb">
+                    <label class="field-label-inline">UUID 列表 (每行一个)</label>
+                    <button id="btn-srv-gen-uuid" type="button" class="btn btn-sm btn-outline-secondary">+ 生成随机 UUID</button>
+                  </div>
+                  <textarea id="srv-uuids" class="form-control" rows="3"></textarea>
+                </div>
+                <label class="check-row mt"><input type="checkbox" id="srv-enable-doh"> 启用 RFC 8484 DoH 服务端点 (/dq, 需 nginx 模式)</label>
+              </div>
+            </div>
+          </section>
+
+          <!-- SERVER / LANDING: SOCKS5 OUTBOUNDS -->
+          <section id="tab-socks5" class="tab-panel">
+            <div class="card">
+              <div class="card-header">
+                <span class="card-header-title">SOCKS5 多出口分流 (Option 35)</span>
+                <div class="row-gap">
+                  <button id="btn-add-socks5" type="button" class="btn btn-sm btn-primary">+ 添加出口</button>
+                  <button id="btn-save-socks5" type="button" class="btn btn-sm btn-success">保存并应用</button>
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="table-responsive">
+                  <table class="table table-bordered table-hover">
+                    <thead><tr><th>名称</th><th>状态</th><th>地址</th><th>域名规则</th><th>IP 规则</th><th>私有旁路</th><th>操作</th></tr></thead>
+                    <tbody id="socks5-tbody"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- SERVER / LANDING / RELAY: EXTRA INBOUNDS -->
+          <section id="tab-extra" class="tab-panel">
+            <div class="card">
+              <div class="card-header">
+                <span class="card-header-title">附加协议入站 (Option 55)</span>
+                <div class="row-gap">
+                  <button id="btn-add-extra" type="button" class="btn btn-sm btn-primary">+ 添加附加协议</button>
+                  <button id="btn-disable-all-extra" type="button" class="btn btn-sm btn-danger">全部清空</button>
+                  <button id="btn-save-extra" type="button" class="btn btn-sm btn-success">保存并应用</button>
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="table-responsive">
+                  <table class="table table-bordered table-hover">
+                    <thead><tr><th>Tag</th><th>协议</th><th>端口</th><th>Nginx</th><th>参数摘要</th><th>操作</th></tr></thead>
+                    <tbody id="extra-tbody"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- SERVER / LANDING / RELAY: RELAY & RPROXYS -->
+          <section id="tab-relay_rproxys" class="tab-panel">
+            <div class="card mb-3">
+              <div class="card-header">
+                <span class="card-header-title">端口转发 (Option 44 — Relay)</span>
+                <button id="btn-srv-add-relay" type="button" class="btn btn-sm btn-primary">+ 添加转发规则</button>
+              </div>
+              <div class="card-body">
+                <div class="table-responsive">
+                  <table class="table table-bordered table-hover">
+                    <thead><tr><th>ID</th><th>监听端口</th><th>公网端口</th><th>目标地址</th><th>协议</th><th>引擎</th><th>操作</th></tr></thead>
+                    <tbody id="srv-relay-tbody"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-header">
+                <span class="card-header-title">RproxyS — 反向代理服务端</span>
+                <button id="btn-rs-add-map" type="button" class="btn btn-sm btn-primary">+ 添加入口端口映射</button>
+              </div>
+              <div class="card-body">
+                <label class="check-row"><input type="checkbox" id="rs-enabled"> 启用 RproxyS</label>
+                <div class="grid-2 mt">
+                  <label class="field"><span>隧道域名</span><input type="text" id="rs-domain" class="form-control"></label>
+                  <label class="field"><span>隧道端口</span><input type="number" id="rs-port" class="form-control"></label>
+                  <label class="field"><span>安全模式</span><select id="rs-security" class="form-control"><option value="tls">tls</option><option value="none">none</option></select></label>
+                  <div></div>
+                  <label class="field"><span>隧道 UUIDs (逗号或换行)</span><textarea id="rs-uuids" class="form-control" rows="2"></textarea></label>
+                  <label class="field"><span>代理入口 InUUIDs (可选, 逗号或换行)</span><textarea id="rs-in-uuids" class="form-control" rows="2"></textarea></label>
+                </div>
+                <div class="table-responsive mt">
+                  <table class="table table-bordered table-hover">
+                    <thead><tr><th>公网端口</th><th>协议</th><th>操作</th></tr></thead>
+                    <tbody id="rs-map-tbody"></tbody>
+                  </table>
+                </div>
+                <div class="mt">
+                  <button id="btn-save-relay-rproxys" type="button" class="btn btn-primary">保存并应用转发/RproxyS</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- SHARED: SYSTEM / CERT / BACKUP / MIGRATE -->
+          <section id="tab-system" class="tab-panel">
+            <div class="card mb-3">
+              <div class="card-header">
+                <span class="card-header-title">TLS 证书管理</span>
+                <div class="row-gap">
+                  <button id="btn-cert-self-sign" type="button" class="btn btn-sm btn-secondary">重新生成自签证书</button>
+                  <button id="btn-cert-issue" type="button" class="btn btn-sm btn-primary">ACME 签发证书</button>
+                </div>
+              </div>
+              <div class="card-body">
+                <div id="cert-summary" class="kv-list"></div>
+                <div class="grid-2">
+                  <label class="field"><span>ACME 模式</span>
+                    <select id="cert-mode" class="form-control">
+                      <option value="cf">Cloudflare DNS-01 (通配符)</option>
+                      <option value="http">HTTP-01 (--standalone / --webroot)</option>
+                    </select>
+                  </label>
+                  <label class="field"><span>证书域名</span><input type="text" id="cert-domain" class="form-control"></label>
+                  <label class="field"><span>CF Email (Global Key 可选)</span><input type="email" id="cert-cf-email" class="form-control"></label>
+                  <label class="field"><span>CF Token / Global Key (留空沿用已存)</span><input type="password" id="cert-cf-token" class="form-control"></label>
+                  <label class="field"><span>Webroot 目录 (HTTP-01 可选, 留空 standalone)</span><input type="text" id="cert-webroot" class="form-control" placeholder="/var/www/html"></label>
+                  <label class="check-row mt"><input type="checkbox" id="cert-auto-renew" checked> 保留 Token 以自动续签</label>
+                </div>
+                <details class="mt">
+                  <summary>手动导入证书与私钥 PEM</summary>
+                  <div class="grid-2 mt">
+                    <label class="field"><span>证书 PEM (fullchain)</span><textarea id="cert-imp-pem" class="form-control" rows="4"></textarea></label>
+                    <label class="field"><span>私钥 PEM</span><textarea id="cert-imp-key" class="form-control" rows="4"></textarea></label>
+                  </div>
+                  <div class="row-gap mt">
+                    <label class="check-row"><input type="checkbox" id="cert-imp-allow-self"> 允许自签证书</label>
+                    <button id="btn-cert-import" type="button" class="btn btn-sm btn-primary">导入并热加载</button>
+                  </div>
+                </details>
+              </div>
+            </div>
+
+            <div class="grid-2 mb-3">
+              <div class="card">
+                <div class="card-header">
+                  <span class="card-header-title">配置备份与恢复 (含完整密钥)</span>
+                </div>
+                <div class="card-body">
+                  <div class="row-gap mb">
+                    <button id="btn-backup-download" type="button" class="btn btn-sm btn-primary">下载 JSON 全量备份</button>
+                  </div>
+                  <label class="field"><span>从 v3 备份文件恢复</span><input type="file" id="restore-file" class="form-control" accept=".json"></label>
+                  <label class="field mt"><span>或粘贴 v3 Backup JSON</span><textarea id="restore-json" class="form-control" rows="4"></textarea></label>
+                  <div class="row-gap mt">
+                    <label class="check-row"><input type="checkbox" id="restore-apply" checked> 恢复后立即 Apply</label>
+                    <button id="btn-restore-v3" type="button" class="btn btn-sm btn-primary">恢复 v3 配置</button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="card-header">
+                  <span class="card-header-title">导入旧版配置 (v2 / des / dexs)</span>
+                </div>
+                <div class="card-body">
+                  <label class="field"><span>来源类型</span>
+                    <select id="mig-kind" class="form-control">
+                      <option value="v2_client">v2 Client (/opt/de_GWD/0conf)</option>
+                      <option value="v2_server">v2 Server (本机路径)</option>
+                      <option value="des">des (/etc/des/state.json)</option>
+                      <option value="dexs">dexs (/etc/vless-lite/state.json)</option>
+                    </select>
+                  </label>
+                  <label class="field mt"><span>服务器上路径 (留空使用默认路径)</span>
+                    <input type="text" id="mig-path" class="form-control" placeholder="/opt/de_GWD/0conf">
+                  </label>
+                  <label class="field mt"><span>或直接粘贴 JSON 内容</span>
+                    <textarea id="mig-raw" class="form-control" rows="4"></textarea>
+                  </label>
+                  <div class="row-gap mt">
+                    <label class="check-row"><input type="checkbox" id="mig-apply" checked> 导入后立即 Apply</label>
+                    <button id="btn-migrate" type="button" class="btn btn-sm btn-primary">执行迁移</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="grid-2">
+              <div class="card">
+                <div class="card-header">
+                  <span class="card-header-title">组件在线更新与监听地址</span>
+                </div>
+                <div class="card-body">
+                  <div class="row-gap mb">
+                    <label class="check-row"><input type="checkbox" id="sys-auto-update-core"> 每周自动更新核心组件 (auto_update_core)</label>
+                  </div>
+                  <div class="grid-2">
+                    <label class="field"><span>设备别名 (system.hostname)</span><input type="text" id="sys-hostname" class="form-control" placeholder="例如 home-gateway"></label>
+                    <label class="field"><span>Web 面板监听地址 (修改将重启 daemon)</span><input type="text" id="auth-listen" class="form-control" placeholder=":443"></label>
+                  </div>
+                  <div class="row-gap mt"><button id="btn-save-system" type="button" class="btn btn-sm btn-primary">保存系统设置</button></div>
+                  <div class="grid-2 mt">
+                    <label class="field"><span>更新组件</span>
+                      <select id="upd-component" class="form-control">
+                        <option value="all">all (dex + xray + mosdns)</option>
+                        <option value="dex">dex</option>
+                        <option value="xray">xray</option>
+                        <option value="mosdns">mosdns</option>
+                      </select>
+                    </label>
+                    <label class="field"><span>指定版本 (留空 latest)</span><input type="text" id="upd-version" class="form-control" placeholder="latest"></label>
+                  </div>
+                  <div class="row-gap mt">
+                    <button id="btn-update-core" type="button" class="btn btn-sm btn-secondary">立即更新组件</button>
+                    <button id="btn-reboot" type="button" class="btn btn-sm btn-danger">重启主机</button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="card-header">
+                  <span class="card-header-title">修改 Web 登录密码</span>
+                </div>
+                <div class="card-body">
+                  <label class="field"><span>当前密码</span><input type="password" id="pw-old" class="form-control"></label>
+                  <label class="field mt"><span>新密码 (至少 6 位)</span><input type="password" id="pw-new" class="form-control"></label>
+                  <button id="btn-change-pw" type="button" class="btn btn-sm btn-primary mt">更新密码</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- SHARED: LOGS -->
+          <section id="tab-logs" class="tab-panel">
+            <div class="card">
+              <div class="card-header">
+                <span class="card-header-title">实时任务日志 (SSE)</span>
+                <div class="row-gap">
+                  <button id="btn-logs-toggle" type="button" class="btn btn-sm btn-secondary">暂停滚动</button>
+                  <button id="btn-logs-clear" type="button" class="btn btn-sm btn-outline-secondary">清空</button>
+                </div>
+              </div>
+              <div class="card-body">
+                <pre id="log-box" class="log-box"></pre>
+              </div>
+            </div>
+          </section>
+        </main>
+
+        <footer class="sticky-footer">
+          <span>寒月 · DEX v3 Control Plane</span>
+        </footer>
+      </div>
+    </div>
   </div>
 
   <div id="modal-backdrop" class="modal-backdrop hidden">
     <div class="card modal-card">
-      <div class="card-head">
-        <h3 id="modal-title">详情</h3>
-        <button id="modal-close" class="btn">关闭</button>
+      <div class="card-header">
+        <strong id="modal-title">详情</strong>
+        <button id="modal-close" type="button" class="btn btn-sm btn-outline-secondary">关闭</button>
       </div>
-      <div id="modal-body"></div>
+      <div id="modal-body" class="card-body"></div>
     </div>
   </div>
 

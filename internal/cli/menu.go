@@ -158,7 +158,11 @@ func runInteractiveMenu(store *state.Store, exec reconcile.SystemExecutor, stdin
 				fmt.Fprintln(stderr, "Initialize state first.")
 				continue
 			}
-			pStr := ask("Web UI port", "8443")
+			defPort := "8443"
+			if st.Role == state.RoleClient {
+				defPort = "443"
+			}
+			pStr := ask("Web UI port", defPort)
 			if p, perr := strconv.Atoi(pStr); perr == nil && p >= 1 && p <= 65535 {
 				if _, uerr := store.Update(st.Role, func(cur *state.State) error {
 					cur.Auth.ListenAddr = fmt.Sprintf(":%d", p)

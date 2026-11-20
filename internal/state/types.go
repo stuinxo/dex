@@ -287,7 +287,10 @@ func NewDefaultState(role string) *State {
 		role = RoleClient
 	}
 	listen := ":8443"
-	if role == RoleServer {
+	switch role {
+	case RoleClient:
+		listen = ":443"
+	case RoleServer:
 		listen = "127.0.0.1:8443"
 	}
 	tlsMode := "nginx"

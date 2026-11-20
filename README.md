@@ -24,12 +24,12 @@ sh install.sh
 
 ## 四种运行角色
 
-| 角色 (`role`) | 适用场景 | 核心组件 |
-| :--- | :--- | :--- |
-| `client` | 局域网旁路透明代理网关 | `dex-daemon` + `dex-xray` + `dex-mosdns` + `dex-nft` + 可选 `wg0` |
-| `server` | 完整服务端（含 `/dq` DoH 与伪装站） | `dex-daemon` + `dex-xray` + `dex-doh` + `nginx` |
-| `landing` | 128 MiB LXC 极简直连 TLS 落地 | `dex-xray`（直连 TLS，零 nginx/DoH 开销） |
-| `relay` | 纯中转节点（三引擎端口转发 + RproxyS） | `dex-nft` / `haproxy` / `dex-xray` |
+| 角色 (`role`) | 适用场景 | 默认 Web UI 监听 | 核心组件 |
+| :--- | :--- | :--- | :--- |
+| `client` | 局域网旁路透明代理网关 | `:443`（HTTPS，同时在 `:80` 自动 301 跳转 HTTPS） | `dex-daemon` + `dex-xray` + `dex-mosdns` + `dex-nft` + 可选 `wg0` |
+| `server` | 完整服务端（含 `/dq` DoH 与伪装站） | `127.0.0.1:8443`（`80`/`443` 由 Nginx 托管） | `dex-daemon` + `dex-xray` + `dex-doh` + `nginx` |
+| `landing` | 128 MiB LXC 极简直连 TLS 落地 | `:8443` | `dex-xray`（直连 TLS，零 nginx/DoH 开销） |
+| `relay` | 纯中转节点（三引擎端口转发 + RproxyS） | `:8443` | `dex-nft` / `haproxy` / `dex-xray` |
 
 ## 从旧版平滑迁移
 

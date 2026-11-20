@@ -8,6 +8,26 @@
   var probeResultsMap = {};
   var logSource = null;
   var logsPaused = false;
+  var clientAutoProbed = false;
+
+  var NODESM_META = {
+    youtube: { label: "YouTube", cls: "brand-youtube" },
+    netflix: { label: "NETFLIX", cls: "brand-netflix" },
+    hdh: { label: "HBO / Disney+ / Hulu", cls: "brand-hdh" },
+    tvb: { label: "TVB", cls: "brand-tvb" },
+    bahamut: { label: "巴哈姆特", cls: "brand-bahamut" },
+    openai: { label: "OpenAI", cls: "brand-openai" },
+    claude: { label: "Claude", cls: "brand-claude" },
+    gemini: { label: "Gemini", cls: "brand-gemini" },
+    grok: { label: "Grok", cls: "brand-grok" },
+    meta: { label: "Meta / Muse", cls: "brand-meta" },
+    telegram: { label: "Telegram", cls: "brand-telegram" },
+    twitter: { label: "X / Twitter", cls: "brand-twitter" },
+    discord: { label: "Discord", cls: "brand-discord" },
+    reddit: { label: "Reddit", cls: "brand-reddit" },
+    github: { label: "GitHub", cls: "brand-github" },
+    wikipedia: { label: "Wikipedia", cls: "brand-wikipedia" }
+  };
 
   function $(id) { return document.getElementById(id); }
 
@@ -59,6 +79,19 @@
       .filter(Boolean);
   }
 
+  function defaultListenAddrForRole(role) {
+    if (role === "client") { return ":443"; }
+    if (role === "server") { return "127.0.0.1:8443"; }
+    return ":8443";
+  }
+
+  function formatArchShort(arch) {
+    var s = String(arch || "").toUpperCase();
+    if (s.indexOf("AMD64") >= 0) { return "AMD64"; }
+    if (s.indexOf("ARM64") >= 0) { return "ARM64"; }
+    return s || "LINUX";
+  }
+
   function genUUID() {
     if (window.crypto && typeof window.crypto.randomUUID === "function") {
       return window.crypto.randomUUID();
@@ -77,9 +110,11 @@
 
   function formatDuration(sec) {
     sec = Math.max(0, Number(sec || 0));
-    var h = Math.floor(sec / 3600);
+    var d = Math.floor(sec / 86400);
+    var h = Math.floor((sec % 86400) / 3600);
     var m = Math.floor((sec % 3600) / 60);
     var s = sec % 60;
+    if (d > 0) { return d + "d " + h + "h " + m + "m"; }
     return h + "h " + m + "m " + s + "s";
   }
 
@@ -98,13 +133,13 @@
   function showQRModal(title, uri) {
     openModal(title, function (body) {
       if (!uri) {
-        body.appendChild(make("p", "muted", "暂无可用链接（请先保存并应用配置）。"));
+        body.appendChild(make("p", "text-muted", "暂无可用链接（请先保存并应用配置）。"));
         return;
       }
       var wrap = make("div", "qr-wrap");
       wrap.appendChild(window.DexQR.createSVG(uri, 220));
       body.appendChild(wrap);
-      var ta = make("textarea");
+      var ta = make("textarea", "form-control");
       ta.rows = 3;
       ta.readOnly = true;
       ta.value = uri;
@@ -113,16 +148,25 @@
   }
 
   function setTab(tabName) {
+    var titleText = "状态";
     var tabs = document.querySelectorAll("#main-tabs .tab");
     tabs.forEach(function (t) {
-      t.classList.toggle("active", t.getAttribute("data-tab") === tabName);
+      var active = t.getAttribute("data-tab") === tabName;
+      t.classList.toggle("active", active);
+      if (active) {
+        titleText = t.getAttribute("data-title") || t.textContent.trim();
+      }
     });
+    $("breadcrumb-current").textContent = tabName === "overview" ? "状态" : titleText;
     var panels = document.querySelectorAll(".tab-panel");
     panels.forEach(function (p) {
       p.classList.toggle("active", p.id === "tab-" + tabName);
     });
     if (tabName === "dns") {
       loadRulesStatus();
+    }
+    if (window.innerWidth < 768) {
+      $("app-view").classList.remove("sidebar-toggled");
     }
   }
 
@@ -135,7 +179,7 @@
     document.querySelectorAll("#main-tabs .tab").forEach(function (t) {
       var rolesAttr = t.getAttribute("data-roles") || "all";
       var allowed = rolesAttr === "all" || rolesAttr.split(",").indexOf(r) >= 0;
-      t.classList.toggle("hidden", !allowed);
+      t.closest(".nav-item").classList.toggle("hidden", !allowed);
       if (allowed && t.getAttribute("data-tab") === activeName) {
         activeVisible = true;
       }
@@ -180,11 +224,15 @@
     applyRoleVisibility(currentState.role);
     renderStatus();
     renderStateForms();
+    if (currentState && currentState.role === "client" && !clientAutoProbed) {
+      clientAutoProbed = true;
+      runConnectivityProbe(true);
+    }
   }
 
   function addKV(container, k, v) {
     var row = make("div", "kv-row");
-    row.appendChild(make("span", "muted", k));
+    row.appendChild(make("span", "text-muted", k));
     var valEl = make("span", "mono", v);
     row.appendChild(valEl);
     container.appendChild(row);
@@ -193,9 +241,39 @@
   function renderStatus() {
     if (!statusInfo) { return; }
     var alias = statusInfo.device_alias || statusInfo.hostname || "";
-    document.title = alias ? (alias + " · DEX v3") : "DEX v3 控制台";
-    $("role-badge").textContent = (statusInfo.role || "client") + (statusInfo.arch ? (" · " + statusInfo.arch) : "");
-    $("version-badge").textContent = statusInfo.version || "";
+    document.title = alias ? (alias + " · 寒月 DEX v3") : "寒月 · DEX v3";
+
+    var hostLabel = $("nav-host-label");
+    if (alias) {
+      hostLabel.textContent = alias;
+      hostLabel.classList.remove("hidden");
+    } else {
+      hostLabel.textContent = "";
+      hostLabel.classList.add("hidden");
+    }
+
+    $("role-badge").textContent = statusInfo.role || "client";
+    $("arch-badge").textContent = formatArchShort(statusInfo.arch);
+    $("kpi-version").textContent = "DEX " + (statusInfo.version || "v3");
+    $("kpi-role-arch").textContent = (statusInfo.role || "client") + " · " + formatArchShort(statusInfo.arch).toLowerCase();
+    $("kpi-uptime").textContent = formatDuration(statusInfo.uptime_sec);
+    $("kpi-kernel").textContent = statusInfo.kernel ? ("Linux " + statusInfo.kernel.split("-")[0]) : "-";
+
+    // Proxy toggle card state
+    var paused = !!statusInfo.proxy_paused;
+    var proxyStateTag = $("kpi-proxy-state");
+    var btnStop = $("btn-proxy-stop");
+    if (paused) {
+      proxyStateTag.textContent = "已暂停";
+      proxyStateTag.className = "kpi-state-tag paused";
+      btnStop.textContent = "恢复代理";
+      btnStop.className = "btn btn-warning btn-pill";
+    } else {
+      proxyStateTag.textContent = "运行中";
+      proxyStateTag.className = "kpi-state-tag";
+      btnStop.textContent = "关闭代理";
+      btnStop.className = "btn btn-light btn-pill";
+    }
 
     var svcGrid = $("svc-grid");
     clearEl(svcGrid);
@@ -203,17 +281,16 @@
     Object.keys(svcs).sort().forEach(function (name) {
       var pill = make("div", "svc-pill");
       pill.appendChild(make("span", "", name));
-      var dot = make("span", svcs[name] ? "dot on" : "dot");
-      pill.appendChild(dot);
+      pill.appendChild(make("span", svcs[name] ? "dot on" : "dot"));
       svcGrid.appendChild(pill);
     });
 
     var sysKV = $("sys-kv");
     clearEl(sysKV);
-    addKV(sysKV, "别名 / 主机", (statusInfo.device_alias || "-") + " / " + (statusInfo.hostname || "-"));
+    addKV(sysKV, "备注 / 主机名", (statusInfo.device_alias || "-") + " / " + (statusInfo.hostname || "-"));
     addKV(sysKV, "架构 / Init / 内核", (statusInfo.arch || "-") + " · " + (statusInfo.init_system || "-") + (statusInfo.kernel ? (" · " + statusInfo.kernel) : ""));
     addKV(sysKV, "内存 / 运行时长", (statusInfo.mem_mb || 0) + " MiB / " + formatDuration(statusInfo.uptime_sec));
-    if (statusInfo.proxy_paused) {
+    if (paused) {
       addKV(sysKV, "代理状态", "已暂停 (国内 MosDNS 保持运行)");
     }
     if (statusInfo.cert) {
@@ -223,7 +300,7 @@
     }
 
     if (currentState && currentState.role === "client") {
-      renderQuickNodes();
+      renderOverviewNodes();
     } else if (currentState && (currentState.role === "server" || currentState.role === "landing")) {
       var shareKV = $("server-share-kv");
       clearEl(shareKV);
@@ -241,28 +318,52 @@
     renderCertSummary();
   }
 
-  function renderQuickNodes() {
-    var box = $("quick-nodes");
-    clearEl(box);
+  function renderOverviewNodes() {
+    var tbody = $("overview-nodes-tbody");
+    clearEl(tbody);
     var nodes = (currentState && currentState.client && currentState.client.nodes) || [];
     var activeID = currentState && currentState.client && currentState.client.active_node_id;
-    nodes.forEach(function (n) {
-      var card = make("div", n.id === activeID ? "node-card active" : "node-card");
-      card.appendChild(make("div", "", (n.id === activeID ? "★ " : "") + (n.name || n.id)));
-      card.appendChild(make("div", "muted", (n.protocol || "") + " · " + n.address + ":" + n.port));
+    if (nodes.length === 0) {
+      var emptyTr = make("tr");
+      var emptyTd = make("td", "text-muted text-center", "暂无节点，请前往「节点管理」添加。");
+      emptyTd.colSpan = 6;
+      emptyTr.appendChild(emptyTd);
+      tbody.appendChild(emptyTr);
+      return;
+    }
+
+    nodes.forEach(function (n, idx) {
+      var tr = make("tr");
+      tr.appendChild(make("td", "", String(idx + 1)));
+      tr.appendChild(make("td", "mono", n.address + ":" + n.port));
+      tr.appendChild(make("td", "text-left", n.name || n.id));
+      tr.appendChild(make("td", "", n.protocol || ""));
+
+      var tdLat = make("td");
       var pr = probeResultsMap[n.id];
-      if (pr) {
-        card.appendChild(make("span", pr.healthy ? "status-badge ok mt" : "status-badge fail mt",
-          pr.healthy ? (pr.latency_ms + " ms") : (pr.error || "不可达")));
+      if (!pr) {
+        tdLat.appendChild(make("span", "text-muted", "-"));
+      } else if (pr.healthy) {
+        tdLat.appendChild(make("span", "text-success", pr.latency_ms + " ms"));
+      } else {
+        tdLat.appendChild(make("span", "text-danger", pr.error || "不可达"));
       }
-      card.addEventListener("click", async function () {
+      tr.appendChild(tdLat);
+
+      var tdAct = make("td");
+      var isActive = n.id === activeID;
+      var bSwitch = make("button", isActive ? "btn btn-success btn-sm" : "btn btn-outline-secondary btn-sm", isActive ? "当前" : "切换");
+      bSwitch.type = "button";
+      bSwitch.addEventListener("click", async function () {
         try {
           await api("POST", "/api/v1/nodes/select", { node_id: n.id });
           showToast("已切换至 " + (n.name || n.id));
           await refreshAll();
         } catch (e) { showToast(e.message, true); }
       });
-      box.appendChild(card);
+      tdAct.appendChild(bSwitch);
+      tr.appendChild(tdAct);
+      tbody.appendChild(tr);
     });
   }
 
@@ -284,7 +385,6 @@
   function renderStateForms() {
     if (!currentState) { return; }
     var role = currentState.role;
-
     if (role === "client") {
       renderClientForms();
     } else {
@@ -307,18 +407,21 @@
     $("divert-global-lan").value = (div.global_proxy_lan_ips || []).join("\n");
     $("divert-direct-lan").value = (div.direct_lan_ips || []).join("\n");
 
-    // NodeSM
+    // NodeSM with classic brand tags
     var smGrid = $("nodesm-grid");
     clearEl(smGrid);
     var services = (statusInfo && statusInfo.node_sm_services) || [];
     var smMap = c.routing.service_map || {};
     services.forEach(function (svc) {
-      var lbl = make("label", "", svc);
-      var sel = make("select");
+      var meta = NODESM_META[svc] || { label: svc, cls: "" };
+      var grp = make("div", "nodesm-group");
+      var tag = make("span", "nodesm-tag" + (meta.cls ? (" " + meta.cls) : ""), meta.label);
+      var sel = make("select", "form-control");
       sel.setAttribute("data-nodesm-svc", svc);
       renderNodeSelectOptions(sel, nodes, smMap[svc] || "", "(跟随默认)");
-      lbl.appendChild(sel);
-      smGrid.appendChild(lbl);
+      grp.appendChild(tag);
+      grp.appendChild(sel);
+      smGrid.appendChild(grp);
     });
     renderNodeSelectOptions($("apple-node"), nodes, c.routing.apple_node_id || "", "(中国直连)");
     $("steam-proxy").checked = !!c.routing.steam_proxy;
@@ -434,9 +537,11 @@
     $("cert-cf-token").placeholder = currentSecrets.has_cert_cf_token ? "已保存 Token (留空沿用)" : "输入 CF Token";
     $("cert-auto-renew").checked = cert.auto_renew !== false;
 
+    var defListen = defaultListenAddrForRole(currentState.role);
     $("sys-hostname").value = (currentState.system && currentState.system.hostname) || "";
     $("sys-auto-update-core").checked = !!(currentState.system && currentState.system.auto_update_core);
-    $("auth-listen").value = (currentState.auth && currentState.auth.listen_addr) || ":8443";
+    $("auth-listen").placeholder = defListen;
+    $("auth-listen").value = (currentState.auth && currentState.auth.listen_addr) || defListen;
   }
 
   function renderCertSummary() {
@@ -470,7 +575,7 @@
       var tdLat = make("td");
       var pr = probeResultsMap[n.id];
       if (!pr) {
-        tdLat.appendChild(make("span", "muted", "-"));
+        tdLat.appendChild(make("span", "text-muted", "-"));
       } else if (pr.healthy) {
         tdLat.appendChild(make("span", "status-badge ok", pr.latency_ms + " ms"));
       } else {
@@ -478,8 +583,10 @@
       }
       tr.appendChild(tdLat);
 
-      var tdAct = make("td", "row-gap");
-      var bSel = make("button", "btn btn-sm", "切换");
+      var tdAct = make("td");
+      var actWrap = make("div", "row-gap");
+      var bSel = make("button", n.id === activeID ? "btn btn-success btn-sm" : "btn btn-outline-secondary btn-sm", "切换");
+      bSel.type = "button";
       bSel.addEventListener("click", async function () {
         try {
           await api("POST", "/api/v1/nodes/select", { node_id: n.id });
@@ -488,6 +595,7 @@
         } catch (e) { showToast(e.message, true); }
       });
       var bUp = make("button", "btn btn-sm", "↑");
+      bUp.type = "button";
       bUp.disabled = idx === 0;
       bUp.addEventListener("click", function () {
         if (idx > 0) {
@@ -497,6 +605,7 @@
         }
       });
       var bDown = make("button", "btn btn-sm", "↓");
+      bDown.type = "button";
       bDown.disabled = idx === nodes.length - 1;
       bDown.addEventListener("click", function () {
         if (idx < nodes.length - 1) {
@@ -506,13 +615,16 @@
         }
       });
       var bEdit = make("button", "btn btn-sm", "编辑");
+      bEdit.type = "button";
       bEdit.addEventListener("click", function () { openNodeModal(n, idx); });
       var bQR = make("button", "btn btn-sm", "QR");
+      bQR.type = "button";
       bQR.addEventListener("click", function () {
         var uri = (statusInfo && statusInfo.node_uris && statusInfo.node_uris[n.id]) || "";
         showQRModal(n.name || n.id, uri);
       });
-      var bDel = make("button", "btn btn-sm danger", "删");
+      var bDel = make("button", "btn btn-sm btn-outline-danger", "删");
+      bDel.type = "button";
       bDel.addEventListener("click", function () {
         currentState.client.nodes.splice(idx, 1);
         if (currentState.client.active_node_id === n.id) {
@@ -521,12 +633,13 @@
         renderNodesTable();
       });
 
-      tdAct.appendChild(bSel);
-      tdAct.appendChild(bUp);
-      tdAct.appendChild(bDown);
-      tdAct.appendChild(bEdit);
-      tdAct.appendChild(bQR);
-      tdAct.appendChild(bDel);
+      actWrap.appendChild(bSel);
+      actWrap.appendChild(bUp);
+      actWrap.appendChild(bDown);
+      actWrap.appendChild(bEdit);
+      actWrap.appendChild(bQR);
+      actWrap.appendChild(bDel);
+      tdAct.appendChild(actWrap);
       tr.appendChild(tdAct);
       tbody.appendChild(tr);
     });
@@ -552,11 +665,12 @@
     openModal(isNew ? "添加节点" : "编辑节点: " + (node.name || node.id), function (body) {
       if (isNew) {
         var uriRow = make("div", "mb");
-        var uriInp = make("input");
+        var uriInp = make("input", "form-control");
         uriInp.type = "text";
         uriInp.placeholder = "粘贴 vless:// / vmess:// / socks5:// 链接自动解析...";
-        var btnParse = make("button", "btn btn-sm mt", "解析链接填充");
-        uriRow.appendChild(make("label", "", "从分享链接快速导入"));
+        var btnParse = make("button", "btn btn-sm btn-outline-primary mt", "解析链接填充");
+        btnParse.type = "button";
+        uriRow.appendChild(make("label", "field-label-inline", "从分享链接快速导入"));
         uriRow.appendChild(uriInp);
         uriRow.appendChild(btnParse);
         body.appendChild(uriRow);
@@ -583,7 +697,9 @@
       }
 
       function addField(labelText, inputEl) {
-        var lbl = make("label", "mt", labelText);
+        var lbl = make("label", "field mt");
+        lbl.appendChild(make("span", "", labelText));
+        inputEl.classList.add("form-control");
         lbl.appendChild(inputEl);
         body.appendChild(lbl);
         return inputEl;
@@ -621,7 +737,8 @@
       fProto.addEventListener("change", updateProtoFields);
       updateProtoFields();
 
-      var btnOK = make("button", "btn primary mt", isNew ? "添加到列表" : "确认修改");
+      var btnOK = make("button", "btn btn-primary mt", isNew ? "添加到列表" : "确认修改");
+      btnOK.type = "button";
       btnOK.addEventListener("click", function () {
         var next = {
           id: node.id,
@@ -647,6 +764,7 @@
           currentState.client.nodes[idx] = next;
         }
         renderNodesTable();
+        renderOverviewNodes();
         closeModal();
       });
       body.appendChild(btnOK);
@@ -665,7 +783,8 @@
       tr.appendChild(make("td", "", rf.proto || "tcp"));
       tr.appendChild(make("td", "", rf.engine || "nft"));
       var td = make("td");
-      var bDel = make("button", "btn btn-sm danger", "删");
+      var bDel = make("button", "btn btn-sm btn-outline-danger", "删");
+      bDel.type = "button";
       bDel.addEventListener("click", function () {
         currentState.relay.forwards.splice(idx, 1);
         renderRelayTable(tbody);
@@ -679,7 +798,12 @@
   function openRelayModal(tbody) {
     openModal("添加端口转发规则", function (body) {
       function fld(lbl, el) {
-        var l = make("label", "mt", lbl); l.appendChild(el); body.appendChild(l); return el;
+        var l = make("label", "field mt");
+        l.appendChild(make("span", "", lbl));
+        el.classList.add("form-control");
+        l.appendChild(el);
+        body.appendChild(l);
+        return el;
       }
       var fLP = fld("本机监听端口", make("input")); fLP.type = "number"; fLP.value = "10001";
       var fPP = fld("公网端口 (0 同监听端口)", make("input")); fPP.type = "number"; fPP.value = "0";
@@ -692,7 +816,8 @@
       ["nft", "haproxy", "xray"].forEach(function (e) { var o = make("option", "", e); o.value = e; fEng.appendChild(o); });
       fld("引擎", fEng);
 
-      var b = make("button", "btn primary mt", "加入列表");
+      var b = make("button", "btn btn-primary mt", "加入列表");
+      b.type = "button";
       b.addEventListener("click", function () {
         var lp = Number(fLP.value);
         if (!lp || !fTH.value.trim() || !Number(fTP.value)) {
@@ -727,7 +852,8 @@
       tr.appendChild(make("td", "", String(m.int_port)));
       tr.appendChild(make("td", "", m.proto || "tcp"));
       var td = make("td");
-      var bDel = make("button", "btn btn-sm danger", "删");
+      var bDel = make("button", "btn btn-sm btn-outline-danger", "删");
+      bDel.type = "button";
       bDel.addEventListener("click", function () {
         currentState.client.rproxyc.mappings.splice(idx, 1);
         renderRproxyCMappings();
@@ -747,7 +873,8 @@
       tr.appendChild(make("td", "", String(m.port)));
       tr.appendChild(make("td", "", m.proto || "tcp"));
       var td = make("td");
-      var bDel = make("button", "btn btn-sm danger", "删");
+      var bDel = make("button", "btn btn-sm btn-outline-danger", "删");
+      bDel.type = "button";
       bDel.addEventListener("click", function () {
         currentState.rproxys.mappings.splice(idx, 1);
         renderRproxySMappings();
@@ -767,18 +894,20 @@
       tr.appendChild(make("td", "", p.name));
       tr.appendChild(make("td", "mono", p.ip));
       tr.appendChild(make("td", "mono", (p.public_key || "").slice(0, 18) + "..."));
-      var td = make("td", "row-gap");
+      var td = make("td");
+      var wrap = make("div", "row-gap");
 
       var bCfg = make("button", "btn btn-sm", "配置 / QR");
+      bCfg.type = "button";
       bCfg.addEventListener("click", async function () {
         try {
           var resp = await fetch("/api/v1/wireguard/peers/" + encodeURIComponent(p.name) + "/config");
           var cfg = await resp.text();
           openModal("WireGuard Peer: " + p.name, function (body) {
-            var wrap = make("div", "qr-wrap");
-            wrap.appendChild(window.DexQR.createSVG(cfg, 220));
-            body.appendChild(wrap);
-            var ta = make("textarea");
+            var qrBox = make("div", "qr-wrap");
+            qrBox.appendChild(window.DexQR.createSVG(cfg, 220));
+            body.appendChild(qrBox);
+            var ta = make("textarea", "form-control");
             ta.rows = 10; ta.readOnly = true; ta.value = cfg;
             body.appendChild(ta);
           });
@@ -790,6 +919,7 @@
       bDl.download = "wg-" + p.name + ".conf";
 
       var bRegen = make("button", "btn btn-sm", "轮换密钥");
+      bRegen.type = "button";
       bRegen.addEventListener("click", async function () {
         try {
           await api("POST", "/api/v1/wireguard/peers/" + encodeURIComponent(p.name) + "/regen", {});
@@ -798,16 +928,18 @@
         } catch (e) { showToast(e.message, true); }
       });
 
-      var bDel = make("button", "btn btn-sm danger", "删");
+      var bDel = make("button", "btn btn-sm btn-outline-danger", "删");
+      bDel.type = "button";
       bDel.addEventListener("click", function () {
         currentState.client.wireguard.peers.splice(idx, 1);
         renderWGPeers();
       });
 
-      td.appendChild(bCfg);
-      td.appendChild(bDl);
-      td.appendChild(bRegen);
-      td.appendChild(bDel);
+      wrap.appendChild(bCfg);
+      wrap.appendChild(bDl);
+      wrap.appendChild(bRegen);
+      wrap.appendChild(bDel);
+      td.appendChild(wrap);
       tr.appendChild(td);
       tbody.appendChild(tr);
     });
@@ -825,9 +957,11 @@
       tr.appendChild(make("td", "", String((prof.domains || []).length)));
       tr.appendChild(make("td", "", String((prof.ips || []).length)));
       tr.appendChild(make("td", "", prof.private_bypass ? "是" : "否"));
-      var td = make("td", "row-gap");
+      var td = make("td");
+      var wrap = make("div", "row-gap");
 
       var bTest = make("button", "btn btn-sm", "测速");
+      bTest.type = "button";
       bTest.addEventListener("click", async function () {
         try {
           var res = await api("POST", "/api/v1/socks5/test", {
@@ -839,24 +973,28 @@
       });
 
       var bToggle = make("button", "btn btn-sm", prof.enabled ? "停用" : "启用");
+      bToggle.type = "button";
       bToggle.addEventListener("click", function () {
         prof.enabled = !prof.enabled;
         renderSocks5Table();
       });
 
       var bEdit = make("button", "btn btn-sm", "编辑");
+      bEdit.type = "button";
       bEdit.addEventListener("click", function () { openSocks5Modal(prof, idx); });
 
-      var bDel = make("button", "btn btn-sm danger", "删");
+      var bDel = make("button", "btn btn-sm btn-outline-danger", "删");
+      bDel.type = "button";
       bDel.addEventListener("click", function () {
         currentState.server.socks5_outbounds.splice(idx, 1);
         renderSocks5Table();
       });
 
-      td.appendChild(bTest);
-      td.appendChild(bToggle);
-      td.appendChild(bEdit);
-      td.appendChild(bDel);
+      wrap.appendChild(bTest);
+      wrap.appendChild(bToggle);
+      wrap.appendChild(bEdit);
+      wrap.appendChild(bDel);
+      td.appendChild(wrap);
       tr.appendChild(td);
       tbody.appendChild(tr);
     });
@@ -878,7 +1016,12 @@
 
     openModal(isNew ? "添加 SOCKS5 出口" : "编辑 SOCKS5: " + prof.name, function (body) {
       function fld(lbl, el) {
-        var l = make("label", "mt", lbl); l.appendChild(el); body.appendChild(l); return el;
+        var l = make("label", "field mt");
+        l.appendChild(make("span", "", lbl));
+        el.classList.add("form-control");
+        l.appendChild(el);
+        body.appendChild(l);
+        return el;
       }
       var fName = fld("配置名称", make("input")); fName.value = prof.name;
       var fAddr = fld("SOCKS5 主机/IP", make("input")); fAddr.value = prof.address;
@@ -891,7 +1034,8 @@
       var pbLbl = make("label", "check-row mt"); pbLbl.appendChild(fPB); pbLbl.appendChild(document.createTextNode(" 私有地址直连旁路 (private_bypass)"));
       body.appendChild(pbLbl);
 
-      var b = make("button", "btn primary mt", "确认");
+      var b = make("button", "btn btn-primary mt", "确认");
+      b.type = "button";
       b.addEventListener("click", function () {
         var next = {
           name: fName.value.trim(),
@@ -932,22 +1076,27 @@
       else { summary = (ex.domain || "(default)") + " " + (ex.path || "(auto)"); }
       tr.appendChild(make("td", "mono", summary));
 
-      var td = make("td", "row-gap");
+      var td = make("td");
+      var wrap = make("div", "row-gap");
       var uri = statusInfo && statusInfo.extra_uris && statusInfo.extra_uris[ex.tag];
       if (uri) {
         var bQR = make("button", "btn btn-sm", "QR");
+        bQR.type = "button";
         bQR.addEventListener("click", function () { showQRModal(ex.tag, uri); });
-        td.appendChild(bQR);
+        wrap.appendChild(bQR);
       }
       var bEdit = make("button", "btn btn-sm", "编辑");
+      bEdit.type = "button";
       bEdit.addEventListener("click", function () { openExtraModal(ex, idx); });
-      var bDel = make("button", "btn btn-sm danger", "删");
+      var bDel = make("button", "btn btn-sm btn-outline-danger", "删");
+      bDel.type = "button";
       bDel.addEventListener("click", function () {
         currentState.extra_inbounds.splice(idx, 1);
         renderExtraTable();
       });
-      td.appendChild(bEdit);
-      td.appendChild(bDel);
+      wrap.appendChild(bEdit);
+      wrap.appendChild(bDel);
+      td.appendChild(wrap);
       tr.appendChild(td);
       tbody.appendChild(tr);
     });
@@ -977,7 +1126,12 @@
 
     openModal(isNew ? "添加附加协议 (Option 55)" : "编辑: " + ex.tag, function (body) {
       function fld(lbl, el) {
-        var l = make("label", "mt", lbl); l.appendChild(el); body.appendChild(l); return el;
+        var l = make("label", "field mt");
+        l.appendChild(make("span", "", lbl));
+        el.classList.add("form-control");
+        l.appendChild(el);
+        body.appendChild(l);
+        return el;
       }
       var fProto = make("select");
       ["vless-reality", "vless-xhttp", "vless-ws", "vmess-ws", "dokodemo", "socks5"].forEach(function (p) {
@@ -1023,7 +1177,8 @@
       fProto.addEventListener("change", updateFields);
       updateFields();
 
-      var b = make("button", "btn primary mt", "确认");
+      var b = make("button", "btn btn-primary mt", "确认");
+      b.type = "button";
       b.addEventListener("click", function () {
         var p = fProto.value;
         var portNum = Number(fPort.value);
@@ -1180,6 +1335,45 @@
     } catch (e) { showToast(e.message, true); }
   }
 
+  async function runConnectivityProbe(silent) {
+    var cnEl = $("kpi-conn-cn");
+    var glEl = $("kpi-conn-global");
+    cnEl.textContent = "国内线路: 探测中...";
+    glEl.textContent = "国外线路: 探测中...";
+    try {
+      var res = await api("POST", "/api/v1/connectivity", { with_ips: true });
+      var cn = res.cn || {};
+      var gl = res.global || {};
+      var cnDetail = cn.ok ? (cn.latency_ms + "ms" + (res.cn_ip ? (" · " + res.cn_ip) : "")) : (cn.error || "不通");
+      var glDetail = gl.ok ? (gl.latency_ms + "ms" + (res.global_ip ? (" · " + res.global_ip) : "")) : (gl.error || "不通");
+      cnEl.textContent = (cn.ok ? "✓ 国内 " : "✗ 国内 ") + cnDetail;
+      glEl.textContent = (gl.ok ? "✓ 国外 " : "✗ 国外 ") + glDetail;
+    } catch (e) {
+      cnEl.textContent = "✗ 国内 探测失败";
+      glEl.textContent = "✗ 国外 探测失败";
+      if (!silent) { showToast(e.message, true); }
+    }
+  }
+
+  async function runNodesProbe() {
+    try {
+      var res = await api("POST", "/api/v1/nodes/probe", {});
+      (res.results || []).forEach(function (r) { probeResultsMap[r.node_id] = r; });
+      renderNodesTable();
+      renderOverviewNodes();
+      showToast("节点测速完成");
+    } catch (e) { showToast(e.message, true); }
+  }
+
+  async function doLogout() {
+    try { await api("POST", "/api/v1/auth/logout", {}); } catch (_) {}
+    csrfToken = "";
+    clientAutoProbed = false;
+    if (logSource) { logSource.close(); logSource = null; }
+    $("app-view").classList.add("hidden");
+    $("login-view").classList.remove("hidden");
+  }
+
   async function loadRulesStatus() {
     try {
       var res = await api("GET", "/api/v1/rules/status");
@@ -1210,10 +1404,42 @@
     };
   }
 
-  // Event bindings
+  // Navigation & Navbar events
   document.querySelectorAll("#main-tabs .tab").forEach(function (t) {
     t.addEventListener("click", function () { setTab(t.getAttribute("data-tab")); });
   });
+  $("nav-brand-link").addEventListener("click", function (ev) { ev.preventDefault(); setTab("overview"); });
+  $("breadcrumb-home").addEventListener("click", function (ev) { ev.preventDefault(); setTab("overview"); });
+  $("btn-sidebar-toggle").addEventListener("click", function () {
+    $("app-view").classList.toggle("sidebar-toggled");
+  });
+
+  $("btn-mark-host").addEventListener("click", function () {
+    openModal("备注本机", function (body) {
+      var fld = make("label", "field");
+      fld.appendChild(make("span", "", "本机备注名称 (system.hostname)"));
+      var inp = make("input", "form-control");
+      inp.type = "text";
+      inp.placeholder = "例如 home-gateway";
+      inp.value = (currentState && currentState.system && currentState.system.hostname) || "";
+      fld.appendChild(inp);
+      body.appendChild(fld);
+
+      var btn = make("button", "btn btn-success mt", "保存");
+      btn.type = "button";
+      btn.addEventListener("click", async function () {
+        try {
+          await api("PUT", "/api/v1/system", { hostname: inp.value.trim() });
+          showToast("本机备注已更新");
+          closeModal();
+          await refreshAll();
+        } catch (e) { showToast(e.message, true); }
+      });
+      body.appendChild(btn);
+      inp.focus();
+    });
+  });
+
   $("modal-close").addEventListener("click", closeModal);
   $("modal-backdrop").addEventListener("click", function (ev) {
     if (ev.target === $("modal-backdrop")) { closeModal(); }
@@ -1237,13 +1463,8 @@
     }
   });
 
-  $("btn-logout").addEventListener("click", async function () {
-    try { await api("POST", "/api/v1/auth/logout", {}); } catch (_) {}
-    csrfToken = "";
-    if (logSource) { logSource.close(); logSource = null; }
-    $("app-view").classList.add("hidden");
-    $("login-view").classList.remove("hidden");
-  });
+  $("btn-logout").addEventListener("click", doLogout);
+  $("btn-sidebar-logout").addEventListener("click", doLogout);
 
   $("btn-apply-now").addEventListener("click", async function () {
     try {
@@ -1270,37 +1491,41 @@
   });
 
   $("btn-proxy-stop").addEventListener("click", async function () {
-    if (!window.confirm("确认停止本地代理服务 (xray / mosdns / nft)?")) { return; }
+    if (statusInfo && statusInfo.proxy_paused) {
+      try {
+        var resR = await api("POST", "/api/v1/proxy/restart", {});
+        showToast("已恢复代理: " + (resR.restarted || []).join(", "));
+        await refreshAll();
+      } catch (e) { showToast(e.message, true); }
+      return;
+    }
+    if (!window.confirm("确认关闭本地代理服务 (xray / nft)?")) { return; }
     try {
       var res = await api("POST", "/api/v1/proxy/stop", {});
-      showToast("已停止: " + (res.stopped || []).join(", "));
+      showToast("已关闭: " + (res.stopped || []).join(", "));
       await refreshAll();
     } catch (e) { showToast(e.message, true); }
   });
 
-  $("btn-probe-conn").addEventListener("click", async function () {
-    var box = $("conn-results");
-    clearEl(box);
-    box.appendChild(make("div", "muted", "正在探测..."));
-    try {
-      var res = await api("POST", "/api/v1/connectivity", { with_ips: true });
-      clearEl(box);
-      [
-        { title: "国内直连 (CN Direct)", d: res.cn || {}, ip: res.cn_ip },
-        { title: "国际代理 (Global Proxy)", d: res.global || {}, ip: res.global_ip }
-      ].forEach(function (item) {
-        var el = make("div", "conn-box");
-        el.appendChild(make("div", "", item.title));
-        el.appendChild(make("span", item.d.ok ? "status-badge ok mt" : "status-badge fail mt",
-          item.d.ok ? ("正常 · " + item.d.latency_ms + " ms") : (item.d.error || "不可达")));
-        if (item.ip) { el.appendChild(make("div", "mono muted mt", "Exit IP: " + item.ip)); }
-        box.appendChild(el);
-      });
-    } catch (e) {
-      clearEl(box);
-      showToast(e.message, true);
-    }
+  $("btn-probe-conn").addEventListener("click", function (ev) {
+    ev.stopPropagation();
+    runConnectivityProbe(false);
   });
+  $("kpi-conn-card").addEventListener("click", function () {
+    runConnectivityProbe(false);
+  });
+
+  $("btn-jump-nodesm").addEventListener("click", function () {
+    setTab("routing");
+    $("card-nodesm").scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+  $("btn-jump-nodecu").addEventListener("click", function () {
+    setTab("routing");
+    $("card-nodecu").scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+  $("btn-jump-nodes").addEventListener("click", function () { setTab("nodes"); });
+
+  $("btn-probe-nodes-overview").addEventListener("click", runNodesProbe);
 
   $("btn-server-main-qr").addEventListener("click", function () {
     showQRModal("服务端主节点", statusInfo && statusInfo.server_main_uri);
@@ -1310,15 +1535,7 @@
   });
 
   $("btn-add-node").addEventListener("click", function () { openNodeModal(null, -1); });
-  $("btn-probe-nodes").addEventListener("click", async function () {
-    try {
-      var res = await api("POST", "/api/v1/nodes/probe", {});
-      (res.results || []).forEach(function (r) { probeResultsMap[r.node_id] = r; });
-      renderNodesTable();
-      renderQuickNodes();
-      showToast("节点测速完成");
-    } catch (e) { showToast(e.message, true); }
-  });
+  $("btn-probe-nodes").addEventListener("click", runNodesProbe);
   $("btn-save-nodes").addEventListener("click", function () {
     currentState.client.failover_enabled = $("failover-enabled").checked;
     saveAndApplyState("节点列表已保存并应用");
@@ -1339,7 +1556,7 @@
   $("btn-probe-doh").addEventListener("click", async function () {
     var box = $("doh-probe-results");
     clearEl(box);
-    box.appendChild(make("div", "muted", "正在探测 DoH 上游..."));
+    box.appendChild(make("div", "text-muted", "正在探测 DoH 上游..."));
     try {
       var res = await api("POST", "/api/v1/nodes/probe", { include_doh: true });
       clearEl(box);
@@ -1370,12 +1587,20 @@
   $("btn-client-add-relay").addEventListener("click", function () { openRelayModal($("client-relay-tbody")); });
   $("btn-rc-add-map").addEventListener("click", function () {
     openModal("添加 RproxyC 内网映射", function (body) {
-      function fld(lbl, el) { var l = make("label", "mt", lbl); l.appendChild(el); body.appendChild(l); return el; }
+      function fld(lbl, el) {
+        var l = make("label", "field mt");
+        l.appendChild(make("span", "", lbl));
+        el.classList.add("form-control");
+        l.appendChild(el);
+        body.appendChild(l);
+        return el;
+      }
       var fSP = fld("公网监听端口 (ext_port)", make("input")); fSP.type = "number"; fSP.value = "18080";
       var fCH = fld("内网目标主机 (int_ip)", make("input")); fCH.value = "127.0.0.1";
       var fCP = fld("内网目标端口 (int_port)", make("input")); fCP.type = "number"; fCP.value = "80";
       var fPr = make("select"); ["tcp", "udp", "tcp,udp"].forEach(function (p) { var o = make("option", "", p); o.value = p; fPr.appendChild(o); }); fld("协议", fPr);
-      var b = make("button", "btn primary mt", "加入映射");
+      var b = make("button", "btn btn-primary mt", "加入映射");
+      b.type = "button";
       b.addEventListener("click", function () {
         currentState.client.rproxyc.mappings = currentState.client.rproxyc.mappings || [];
         currentState.client.rproxyc.mappings.push({
@@ -1458,10 +1683,18 @@
   $("btn-srv-add-relay").addEventListener("click", function () { openRelayModal($("srv-relay-tbody")); });
   $("btn-rs-add-map").addEventListener("click", function () {
     openModal("添加 RproxyS 公网端口映射", function (body) {
-      function fld(lbl, el) { var l = make("label", "mt", lbl); l.appendChild(el); body.appendChild(l); return el; }
+      function fld(lbl, el) {
+        var l = make("label", "field mt");
+        l.appendChild(make("span", "", lbl));
+        el.classList.add("form-control");
+        l.appendChild(el);
+        body.appendChild(l);
+        return el;
+      }
       var fP = fld("公网监听端口", make("input")); fP.type = "number"; fP.value = "18080";
       var fPr = make("select"); ["tcp", "udp", "tcp,udp"].forEach(function (p) { var o = make("option", "", p); o.value = p; fPr.appendChild(o); }); fld("协议", fPr);
-      var b = make("button", "btn primary mt", "加入映射");
+      var b = make("button", "btn btn-primary mt", "加入映射");
+      b.type = "button";
       b.addEventListener("click", function () {
         currentState.rproxys.mappings = currentState.rproxys.mappings || [];
         currentState.rproxys.mappings.push({ port: Number(fP.value), proto: fPr.value });
@@ -1548,7 +1781,7 @@
   $("btn-save-system").addEventListener("click", function () {
     currentState.system.hostname = $("sys-hostname").value.trim();
     currentState.system.auto_update_core = $("sys-auto-update-core").checked;
-    currentState.auth.listen_addr = $("auth-listen").value.trim() || ":8443";
+    currentState.auth.listen_addr = $("auth-listen").value.trim() || defaultListenAddrForRole(currentState.role);
     saveAndApplyState("系统设置已保存并应用");
   });
   $("btn-update-core").addEventListener("click", async function () {
@@ -1564,7 +1797,7 @@
   $("btn-change-pw").addEventListener("click", async function () {
     try {
       var res = await api("POST", "/api/v1/auth/password", {
-        old_password: $("pw-old").value,
+        current_password: $("pw-old").value,
         new_password: $("pw-new").value
       });
       csrfToken = res.csrf_token || csrfToken;

@@ -2,6 +2,9 @@ package cli
 
 import (
 	"bytes"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -281,5 +284,83 @@ func TestWave2ServerExtraNodeCertWGCommands(t *testing.T) {
 	code, stOut, _ := runC("status")
 	if code != 0 || !strings.Contains(stOut, "Services:") || !strings.Contains(stOut, "Certificate:") {
 		t.Fatalf("expected Services and Certificate summary in dex status, got:\n%s", stOut)
+	}
+}
+
+func TestHTTPSRedirectHandler(t *testing.T) {
+	cases := []struct {
+		name      string
+		httpsPort string
+		host      string
+		target    string
+		wantLoc   string
+	}{
+		{
+			name:      "default 443 omits port",
+			httpsPort: "443",
+			host:      "10.0.0.230",
+			target:    "/",
+			wantLoc:   "https://10.0.0.230/",
+		},
+		{
+			name:      "empty port omits port and strips :80",
+			httpsPort: "",
+			host:      "gw.example.com:80",
+			target:    "/api/v1/status?a=1&b=2",
+			wantLoc:   "https://gw.example.com/api/v1/status?a=1&b=2",
+		},
+		{
+			name:      "custom 8443 preserves port and path+query",
+			httpsPort: "8443",
+			host:      "10.0.0.230:80",
+			target:    "/nodes?tab=1",
+			wantLoc:   "https://10.0.0.230:8443/nodes?tab=1",
+		},
+		{
+			name:      "ipv6 host with 443",
+			httpsPort: "443",
+			host:      "[fd00::1]:80",
+			target:    "/check?x=1",
+			wantLoc:   "https://[fd00::1]/check?x=1",
+		},
+		{
+			name:      "ipv6 host with 8443",
+			httpsPort: "8443",
+			host:      "[fd00::1]:80",
+			target:    "/check?x=1",
+			wantLoc:   "https://[fd00::1]:8443/check?x=1",
+		},
+		{
+			name:      "prevent //evil.com open redirect",
+			httpsPort: "443",
+			host:      "10.0.0.230",
+			target:    "//evil.com/phish?x=1",
+			wantLoc:   "https://10.0.0.230/evil.com/phish?x=1",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHTTPSRedirectHandler(tc.httpsPort)
+			req := httptest.NewRequest(http.MethodGet, "http://placeholder"+tc.target, nil)
+			req.Host = tc.host
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusMovedPermanently {
+				t.Fatalf("status = %d, want 301", rec.Code)
+			}
+			loc := rec.Header().Get("Location")
+			if loc != tc.wantLoc {
+				t.Fatalf("Location = %q, want %q", loc, tc.wantLoc)
+			}
+			u, err := url.Parse(loc)
+			if err != nil {
+				t.Fatalf("parse Location %q: %v", loc, err)
+			}
+			if u.Scheme != "https" || strings.HasPrefix(u.Path, "//") {
+				t.Fatalf("unsafe redirect target %q", loc)
+			}
+		})
 	}
 }

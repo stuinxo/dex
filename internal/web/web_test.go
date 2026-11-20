@@ -394,4 +394,16 @@ func TestWave2EndpointsAndSecurity(t *testing.T) {
 	if rec := doReq(http.MethodPost, "/api/v1/apply", `{"force":true,"restart_all":true}`, true); rec.Code != 200 {
 		t.Fatalf("apply with JSON flags failed: %d %s", rec.Code, rec.Body.String())
 	}
+
+	// PUT /api/v1/system updates hostname cleanly (CSRF enforced)
+	if rec := doReq(http.MethodPut, "/api/v1/system", `{"hostname":"gw-livingroom"}`, false); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 on PUT /api/v1/system without CSRF, got %d", rec.Code)
+	}
+	if rec := doReq(http.MethodPut, "/api/v1/system", `{"hostname":"gw-livingroom"}`, true); rec.Code != 200 || !strings.Contains(rec.Body.String(), `"gw-livingroom"`) {
+		t.Fatalf("PUT /api/v1/system failed: %d %s", rec.Code, rec.Body.String())
+	}
+	afterSys, _ := store.Load()
+	if afterSys.System.Hostname != "gw-livingroom" {
+		t.Fatalf("expected hostname gw-livingroom, got %q", afterSys.System.Hostname)
+	}
 }

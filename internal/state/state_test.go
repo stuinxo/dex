@@ -120,11 +120,25 @@ func TestStoreTransactionRollback(t *testing.T) {
 }
 
 func TestValidationRules(t *testing.T) {
+	// Role default listen_addr check
+	if got := NewDefaultState(RoleClient).Auth.ListenAddr; got != ":443" {
+		t.Fatalf("client default listen_addr = %q, want :443", got)
+	}
+	if got := NewDefaultState(RoleServer).Auth.ListenAddr; got != "127.0.0.1:8443" {
+		t.Fatalf("server default listen_addr = %q, want 127.0.0.1:8443", got)
+	}
+	if got := NewDefaultState(RoleLanding).Auth.ListenAddr; got != ":8443" {
+		t.Fatalf("landing default listen_addr = %q, want :8443", got)
+	}
+	if got := NewDefaultState(RoleRelay).Auth.ListenAddr; got != ":8443" {
+		t.Fatalf("relay default listen_addr = %q, want :8443", got)
+	}
+
 	// Port conflict check
 	c := NewDefaultState(RoleClient)
 	c.Client.FWD0 = FWD0Config{
 		Enabled: true,
-		Port:    8443, // conflicts with client web-ui :8443
+		Port:    443, // conflicts with client default web-ui :443
 		UUIDs:   []string{"11111111-1111-4111-8111-111111111111"},
 	}
 	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "port conflict") {

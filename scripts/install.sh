@@ -324,6 +324,7 @@ main() {
       install_xray_core
       install_mosdns_and_rules
       "$INSTALL_BIN" init --role client --apply
+      say "[+] Client Web UI listening on :443 (HTTPS) with :80 -> HTTPS redirect."
       ;;
     server|landing)
       if [ "$role" = "server" ]; then
