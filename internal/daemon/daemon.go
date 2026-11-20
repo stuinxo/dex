@@ -56,11 +56,7 @@ func (r *Runner) RunLoops(ctx context.Context) {
 			r.Hub.Log("INFO", "daemon", "background loops stopping")
 			return
 		case <-failoverTicker.C:
-			st, err := r.Store.Load()
-			if err != nil {
-				continue
-			}
-			r.Failover.Step(ctx, st)
+			r.runFailoverTick(ctx)
 		case <-ddnsTicker.C:
 			st, err := r.Store.Load()
 			if err != nil || st.Role != state.RoleClient || !st.Client.DDNS.Enabled {
@@ -71,4 +67,17 @@ func (r *Runner) RunLoops(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (r *Runner) runFailoverTick(ctx context.Context) {
+	st, err := r.Store.Load()
+	if err != nil {
+		return
+	}
+	if st.Role == state.RoleClient && r.Exec != nil {
+		if !r.Exec.ServiceIsActive(ctx, r.Exec.DetectInitSystem(), "dex-xray") {
+			return
+		}
+	}
+	r.Failover.Step(ctx, st)
 }

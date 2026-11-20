@@ -189,3 +189,97 @@ func TestCertImportReloadsConsumersAndRefreshRespectsManualGuard(t *testing.T) {
 		t.Fatalf("unexpected cert reload actions: reloaded=%v restarted=%v", exec.reloaded, exec.restarted)
 	}
 }
+
+func TestWave2ServerExtraNodeCertWGCommands(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+
+	run := func(args ...string) (int, string, string) {
+		var out, errBuf bytes.Buffer
+		full := append([]string{"--state-dir", stateDir}, args...)
+		code := Run(full, strings.NewReader(""), &out, &errBuf)
+		return code, out.String(), errBuf.String()
+	}
+
+	// 1. Server init + server set + server show
+	if code, _, errOut := run("init", "--role", "server", "--domain", "s1.example.com", "--port", "443", "--tls-mode", "nginx"); code != 0 {
+		t.Fatalf("server init failed: %s", errOut)
+	}
+	if code, _, errOut := run("server", "set", "--protocol", "vmess-ws", "--path", "/ws-custom", "--enable-doh"); code != 0 {
+		t.Fatalf("server set failed: %s", errOut)
+	}
+	code, out, errOut := run("server", "show")
+	if code != 0 || !strings.Contains(out, "vmess-ws") || !strings.Contains(out, "/ws-custom") || !strings.Contains(out, "vmess://") {
+		t.Fatalf("server show mismatch: code=%d out=%q err=%q", code, out, errOut)
+	}
+
+	// 2. Extra protocols + disable-all
+	if code, _, errOut := run("extra", "add-xhttp", "--port", "8443", "--domain", "x.example.com"); code != 0 {
+		t.Fatalf("extra add-xhttp failed: %s", errOut)
+	}
+	if code, _, errOut := run("extra", "add-vless-ws", "--port", "8444", "--domain", "v.example.com"); code != 0 {
+		t.Fatalf("extra add-vless-ws failed: %s", errOut)
+	}
+	if code, _, errOut := run("extra", "add-vmess-ws", "--port", "8445", "--domain", "m.example.com"); code != 0 {
+		t.Fatalf("extra add-vmess-ws failed: %s", errOut)
+	}
+	if code, _, errOut := run("extra", "add-dokodemo", "--port", "10053", "--target", "1.1.1.1:53", "--network", "udp"); code != 0 {
+		t.Fatalf("extra add-dokodemo failed: %s", errOut)
+	}
+	code, out, _ = run("extra", "list")
+	if code != 0 || !strings.Contains(out, "vless-xhttp") || !strings.Contains(out, "dokodemo") || !strings.Contains(out, "1.1.1.1:53 (udp)") {
+		t.Fatalf("extra list mismatch: %q", out)
+	}
+	if code, _, errOut := run("extra", "disable-all"); code != 0 {
+		t.Fatalf("extra disable-all failed: %s", errOut)
+	}
+
+	// 3. Cert self-sign --force
+	if code, _, errOut := run("cert", "self-sign", "--force", "forced.example.com"); code != 0 {
+		t.Fatalf("cert self-sign --force failed: %s", errOut)
+	}
+	code, out, _ = run("cert", "inspect")
+	if code != 0 || !strings.Contains(out, "forced.example.com") {
+		t.Fatalf("expected forced CN in cert inspect, got %q", out)
+	}
+
+	// 4. Client role: node add --from-uri, edit, move, status, wg keygen-server & peer-regen
+	clientDir := filepath.Join(dir, "client-state")
+	runC := func(args ...string) (int, string, string) {
+		var o, e bytes.Buffer
+		full := append([]string{"--state-dir", clientDir}, args...)
+		return Run(full, strings.NewReader(""), &o, &e), o.String(), e.String()
+	}
+	if code, _, errOut := runC("init", "--role", "client"); code != 0 {
+		t.Fatalf("client init failed: %s", errOut)
+	}
+	if code, _, errOut := runC("node", "add", "--id", "n1", "--from-uri", "vless://11111111-1111-4111-8111-111111111111@hk1.example.com:443?type=xhttp&security=tls&sni=hk1.example.com&path=%2Fhk#HK1"); code != 0 {
+		t.Fatalf("node add --from-uri failed: %s", errOut)
+	}
+	if code, _, errOut := runC("node", "add", "--id", "n2", "--proto", "socks5", "--address", "127.0.0.1", "--port", "1080", "--username", "u", "--password", "p"); code != 0 {
+		t.Fatalf("node add socks5 failed: %s", errOut)
+	}
+	if code, _, errOut := runC("node", "edit", "n1", "--name", "HK-Renamed"); code != 0 {
+		t.Fatalf("node edit failed: %s", errOut)
+	}
+	if code, _, errOut := runC("node", "move", "n2", "up"); code != 0 {
+		t.Fatalf("node move up failed: %s", errOut)
+	}
+	_, out, _ = runC("node", "list")
+	if strings.Index(out, "[n2]") > strings.Index(out, "[n1]") {
+		t.Fatalf("expected n2 moved before n1, got:\n%s", out)
+	}
+	if code, _, errOut := runC("wg", "peer-add", "phone"); code != 0 {
+		t.Fatalf("wg peer-add failed: %s", errOut)
+	}
+	if code, out, errOut := runC("wg", "peer-regen", "phone"); code != 0 || !strings.Contains(out, "[Interface]") {
+		t.Fatalf("wg peer-regen failed: code=%d out=%q err=%s", code, out, errOut)
+	}
+	if code, _, errOut := runC("wg", "keygen-server"); code != 0 {
+		t.Fatalf("wg keygen-server failed: %s", errOut)
+	}
+	code, stOut, _ := runC("status")
+	if code != 0 || !strings.Contains(stOut, "Services:") || !strings.Contains(stOut, "Certificate:") {
+		t.Fatalf("expected Services and Certificate summary in dex status, got:\n%s", stOut)
+	}
+}

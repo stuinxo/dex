@@ -1,315 +1,776 @@
 (function () {
   "use strict";
 
-  var appState = null;
-  var statusInfo = null;
   var csrfToken = "";
+  var currentState = null;
+  var currentSecrets = {};
+  var statusInfo = null;
+  var probeResultsMap = {};
   var logSource = null;
+  var logsPaused = false;
 
-  function el(id) { return document.getElementById(id); }
-  function clearNode(node) {
-    while (node.firstChild) node.removeChild(node.firstChild);
-  }
+  function $(id) { return document.getElementById(id); }
+
   function make(tag, cls, text) {
-    var n = document.createElement(tag);
-    if (cls) n.className = cls;
-    if (text !== undefined && text !== null) n.textContent = String(text);
-    return n;
+    var el = document.createElement(tag);
+    if (cls) { el.className = cls; }
+    if (text !== undefined && text !== null) { el.textContent = String(text); }
+    return el;
+  }
+
+  function clearEl(el) {
+    while (el.firstChild) { el.removeChild(el.firstChild); }
   }
 
   function showToast(msg, isErr) {
-    var t = el("toast");
+    var t = $("toast");
     t.textContent = msg;
     t.className = isErr ? "toast err" : "toast";
-    setTimeout(function () { t.classList.add("hidden"); }, 4000);
+    setTimeout(function () { t.classList.add("hidden"); }, 3500);
   }
 
-  function openModal(title, builderFn) {
-    el("modal-title").textContent = title;
-    var body = el("modal-body");
-    clearNode(body);
-    builderFn(body);
-    el("modal-backdrop").classList.remove("hidden");
-  }
-  function closeModal() {
-    el("modal-backdrop").classList.add("hidden");
-  }
-
-  async function apiFetch(url, opts) {
-    opts = opts || {};
-    opts.headers = opts.headers || {};
-    if (opts.method && opts.method !== "GET" && csrfToken) {
+  async function api(method, path, body) {
+    var opts = {
+      method: method,
+      credentials: "same-origin",
+      headers: {}
+    };
+    if (csrfToken && method !== "GET") {
       opts.headers["X-CSRF-Token"] = csrfToken;
     }
-    if (opts.body && typeof opts.body === "object") {
+    if (body !== undefined) {
       opts.headers["Content-Type"] = "application/json";
-      opts.body = JSON.stringify(opts.body);
+      opts.body = JSON.stringify(body);
     }
-    var resp = await fetch(url, opts);
+    var resp = await fetch(path, opts);
     var text = await resp.text();
-    var data = null;
-    try { data = JSON.parse(text); } catch (_) { data = { raw: text }; }
-    if (resp.status === 401 && url !== "/api/v1/auth/login") {
-      showLogin();
-      throw new Error("未登录或会话已过期");
-    }
+    var data = {};
+    try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { error: text }; }
     if (!resp.ok) {
-      throw new Error((data && data.error) ? data.error : ("HTTP " + resp.status));
+      throw new Error(data.error || ("HTTP " + resp.status));
     }
     return data;
   }
 
-  function showLogin() {
-    if (logSource) { logSource.close(); logSource = null; }
-    el("app-view").classList.add("hidden");
-    el("login-view").classList.remove("hidden");
+  function splitList(raw) {
+    return String(raw || "")
+      .split(/[\n,]+/)
+      .map(function (s) { return s.trim(); })
+      .filter(Boolean);
   }
 
-  function showApp() {
-    el("login-view").classList.add("hidden");
-    el("app-view").classList.remove("hidden");
-    startLogStream();
+  function genUUID() {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+      return window.crypto.randomUUID();
+    }
+    var hex = "0123456789abcdef";
+    var out = "";
+    for (var i = 0; i < 36; i++) {
+      if (i === 8 || i === 13 || i === 18 || i === 23) { out += "-"; continue; }
+      var r = Math.floor(Math.random() * 16);
+      if (i === 14) { r = 4; }
+      if (i === 19) { r = (r & 3) | 8; }
+      out += hex[r];
+    }
+    return out;
   }
 
-  function linesToArr(txt) {
-    return txt.split("\n").map(function (s) { return s.trim(); }).filter(Boolean);
-  }
-  function arrToLines(arr) {
-    return Array.isArray(arr) ? arr.join("\n") : "";
+  function formatDuration(sec) {
+    sec = Math.max(0, Number(sec || 0));
+    var h = Math.floor(sec / 3600);
+    var m = Math.floor((sec % 3600) / 60);
+    var s = sec % 60;
+    return h + "h " + m + "m " + s + "s";
   }
 
-  function fillNodeSelect(selectEl, nodes, selectedId) {
-    clearNode(selectEl);
-    var emptyOpt = make("option", "", "默认 / 直连");
-    emptyOpt.value = "";
-    selectEl.appendChild(emptyOpt);
-    (nodes || []).forEach(function (n) {
-      var opt = make("option", "", (n.name || n.address) + " (" + n.protocol + ")");
-      opt.value = n.id;
-      selectEl.appendChild(opt);
+  function openModal(title, builder) {
+    $("modal-title").textContent = title;
+    var body = $("modal-body");
+    clearEl(body);
+    builder(body);
+    $("modal-backdrop").classList.remove("hidden");
+  }
+
+  function closeModal() {
+    $("modal-backdrop").classList.add("hidden");
+  }
+
+  function showQRModal(title, uri) {
+    openModal(title, function (body) {
+      if (!uri) {
+        body.appendChild(make("p", "muted", "暂无可用链接（请先保存并应用配置）。"));
+        return;
+      }
+      var wrap = make("div", "qr-wrap");
+      wrap.appendChild(window.DexQR.createSVG(uri, 220));
+      body.appendChild(wrap);
+      var ta = make("textarea");
+      ta.rows = 3;
+      ta.readOnly = true;
+      ta.value = uri;
+      body.appendChild(ta);
     });
-    selectEl.value = selectedId || "";
   }
 
-  function renderOverview() {
-    if (!statusInfo || !appState) return;
-    el("badge-version").textContent = statusInfo.version || "v3";
-    el("badge-role").textContent = statusInfo.role || appState.role;
-    el("header-host").textContent = (statusInfo.hostname || "") + " (" + (statusInfo.mem_mb || 0) + " MiB)";
+  function setTab(tabName) {
+    var tabs = document.querySelectorAll("#main-tabs .tab");
+    tabs.forEach(function (t) {
+      t.classList.toggle("active", t.getAttribute("data-tab") === tabName);
+    });
+    var panels = document.querySelectorAll(".tab-panel");
+    panels.forEach(function (p) {
+      p.classList.toggle("active", p.id === "tab-" + tabName);
+    });
+    if (tabName === "dns") {
+      loadRulesStatus();
+    }
+  }
 
-    var sg = el("services-grid");
-    clearNode(sg);
+  function applyRoleVisibility(role) {
+    var r = role || "client";
+    var activeVisible = false;
+    var activeTab = document.querySelector("#main-tabs .tab.active");
+    var activeName = activeTab ? activeTab.getAttribute("data-tab") : "overview";
+
+    document.querySelectorAll("#main-tabs .tab").forEach(function (t) {
+      var rolesAttr = t.getAttribute("data-roles") || "all";
+      var allowed = rolesAttr === "all" || rolesAttr.split(",").indexOf(r) >= 0;
+      t.classList.toggle("hidden", !allowed);
+      if (allowed && t.getAttribute("data-tab") === activeName) {
+        activeVisible = true;
+      }
+    });
+    if (!activeVisible) {
+      setTab("overview");
+    }
+
+    var isClient = r === "client";
+    var isSrvOrLanding = r === "server" || r === "landing";
+    $("overview-client-nodes").classList.toggle("hidden", !isClient);
+    $("overview-server-share").classList.toggle("hidden", !isSrvOrLanding);
+
+    var migKind = $("mig-kind");
+    if (migKind && !isClient && migKind.value === "v2_client") {
+      migKind.value = "v2_server";
+    }
+  }
+
+  async function initSession() {
+    try {
+      var res = await api("GET", "/api/v1/auth/session");
+      if (res.authenticated) {
+        csrfToken = res.csrf_token || "";
+        $("login-view").classList.add("hidden");
+        $("app-view").classList.remove("hidden");
+        await refreshAll();
+        connectLogs();
+        return;
+      }
+    } catch (_) {}
+    $("app-view").classList.add("hidden");
+    $("login-view").classList.remove("hidden");
+  }
+
+  async function refreshAll() {
+    var stRes = await api("GET", "/api/v1/status");
+    statusInfo = stRes;
+    var stateRes = await api("GET", "/api/v1/state");
+    currentState = stateRes.state;
+    currentSecrets = stateRes.secrets || {};
+    applyRoleVisibility(currentState.role);
+    renderStatus();
+    renderStateForms();
+  }
+
+  function addKV(container, k, v) {
+    var row = make("div", "kv-row");
+    row.appendChild(make("span", "muted", k));
+    var valEl = make("span", "mono", v);
+    row.appendChild(valEl);
+    container.appendChild(row);
+  }
+
+  function renderStatus() {
+    if (!statusInfo) { return; }
+    var alias = statusInfo.device_alias || statusInfo.hostname || "";
+    document.title = alias ? (alias + " · DEX v3") : "DEX v3 控制台";
+    $("role-badge").textContent = (statusInfo.role || "client") + (statusInfo.arch ? (" · " + statusInfo.arch) : "");
+    $("version-badge").textContent = statusInfo.version || "";
+
+    var svcGrid = $("svc-grid");
+    clearEl(svcGrid);
     var svcs = statusInfo.services || {};
-    Object.keys(svcs).sort().forEach(function (k) {
+    Object.keys(svcs).sort().forEach(function (name) {
       var pill = make("div", "svc-pill");
-      pill.appendChild(make("span", "", k));
-      var dot = make("span", svcs[k] ? "dot on" : "dot");
+      pill.appendChild(make("span", "", name));
+      var dot = make("span", svcs[name] ? "dot on" : "dot");
       pill.appendChild(dot);
-      sg.appendChild(pill);
+      svcGrid.appendChild(pill);
     });
 
-    var sum = el("system-summary");
-    clearNode(sum);
-    var rows = [
-      ["运行角色", appState.role],
-      ["Init / 容器", (statusInfo.init_system || "-") + (statusInfo.is_container ? " (Container)" : "")],
-      ["运行时长", (statusInfo.uptime_sec || 0) + " s"],
-      ["当前激活节点", statusInfo.active_node_id || "-"]
-    ];
-    if (statusInfo.server_main_uri) rows.push(["服务端链接", statusInfo.server_main_uri]);
-    rows.forEach(function (pair) {
-      var r = make("div", "kv-row");
-      r.appendChild(make("span", "muted", pair[0]));
-      r.appendChild(make("span", "", pair[1]));
-      sum.appendChild(r);
-    });
+    var sysKV = $("sys-kv");
+    clearEl(sysKV);
+    addKV(sysKV, "别名 / 主机", (statusInfo.device_alias || "-") + " / " + (statusInfo.hostname || "-"));
+    addKV(sysKV, "架构 / Init / 内核", (statusInfo.arch || "-") + " · " + (statusInfo.init_system || "-") + (statusInfo.kernel ? (" · " + statusInfo.kernel) : ""));
+    addKV(sysKV, "内存 / 运行时长", (statusInfo.mem_mb || 0) + " MiB / " + formatDuration(statusInfo.uptime_sec));
+    if (statusInfo.proxy_paused) {
+      addKV(sysKV, "代理状态", "已暂停 (国内 MosDNS 保持运行)");
+    }
+    if (statusInfo.cert) {
+      var c = statusInfo.cert;
+      addKV(sysKV, "证书 CN / 到期", (c.common_name || "-") + " (" + String(c.not_after || "").slice(0, 10) + ")");
+      addKV(sysKV, "证书状态", c.self_signed ? "自签" : (c.chain_valid ? "CA 有效" : "待验证"));
+    }
 
-    var qn = el("quick-nodes");
-    clearNode(qn);
-    (appState.client.nodes || []).forEach(function (n) {
-      var c = make("div", "node-card" + (n.id === appState.client.active_node_id ? " active" : ""));
-      c.appendChild(make("div", "", n.name || n.id));
-      c.appendChild(make("div", "muted", n.protocol + " · " + n.address + ":" + n.port));
-      var lat = make("div", "muted", "");
-      lat.id = "probe-" + n.id;
-      c.appendChild(lat);
-      c.addEventListener("click", async function () {
+    if (currentState && currentState.role === "client") {
+      renderQuickNodes();
+    } else if (currentState && (currentState.role === "server" || currentState.role === "landing")) {
+      var shareKV = $("server-share-kv");
+      clearEl(shareKV);
+      addKV(shareKV, "主入站协议", (currentState.server.protocol || "vless-xhttp") + " (" + (currentState.server.tls_mode || "nginx") + ")");
+      addKV(shareKV, "主节点 URI", statusInfo.server_main_uri || "-");
+      var btnDoh = $("btn-server-doh-qr");
+      if (statusInfo.doh_url) {
+        addKV(shareKV, "DoH 端点", statusInfo.doh_url);
+        btnDoh.classList.remove("hidden");
+      } else {
+        btnDoh.classList.add("hidden");
+      }
+    }
+
+    renderCertSummary();
+  }
+
+  function renderQuickNodes() {
+    var box = $("quick-nodes");
+    clearEl(box);
+    var nodes = (currentState && currentState.client && currentState.client.nodes) || [];
+    var activeID = currentState && currentState.client && currentState.client.active_node_id;
+    nodes.forEach(function (n) {
+      var card = make("div", n.id === activeID ? "node-card active" : "node-card");
+      card.appendChild(make("div", "", (n.id === activeID ? "★ " : "") + (n.name || n.id)));
+      card.appendChild(make("div", "muted", (n.protocol || "") + " · " + n.address + ":" + n.port));
+      var pr = probeResultsMap[n.id];
+      if (pr) {
+        card.appendChild(make("span", pr.healthy ? "status-badge ok mt" : "status-badge fail mt",
+          pr.healthy ? (pr.latency_ms + " ms") : (pr.error || "不可达")));
+      }
+      card.addEventListener("click", async function () {
         try {
-          await apiFetch("/api/v1/nodes/select", { method: "POST", body: { node_id: n.id } });
-          appState.client.active_node_id = n.id;
-          showToast("已切换主节点：" + (n.name || n.id));
+          await api("POST", "/api/v1/nodes/select", { node_id: n.id });
+          showToast("已切换至 " + (n.name || n.id));
           await refreshAll();
         } catch (e) { showToast(e.message, true); }
       });
-      qn.appendChild(c);
+      box.appendChild(card);
     });
   }
 
-  function renderNodesAndRouting() {
-    var c = appState.client;
-    el("chk-failover").checked = !!c.failover_enabled;
+  function renderNodeSelectOptions(sel, nodes, selectedID, includeEmptyLabel) {
+    clearEl(sel);
+    if (includeEmptyLabel !== null) {
+      var empty = make("option", "", includeEmptyLabel);
+      empty.value = "";
+      sel.appendChild(empty);
+    }
+    nodes.forEach(function (n) {
+      var opt = make("option", "", (n.name || n.id) + " (" + n.protocol + ")");
+      opt.value = n.id;
+      if (n.id === selectedID) { opt.selected = true; }
+      sel.appendChild(opt);
+    });
+  }
 
-    var tbody = el("nodes-tbody");
-    clearNode(tbody);
-    (c.nodes || []).forEach(function (n, idx) {
-      var tr = document.createElement("tr");
+  function renderStateForms() {
+    if (!currentState) { return; }
+    var role = currentState.role;
+
+    if (role === "client") {
+      renderClientForms();
+    } else {
+      renderServerRelayForms();
+    }
+    renderSharedSystemForms();
+  }
+
+  function renderClientForms() {
+    var c = currentState.client;
+    var nodes = c.nodes || [];
+    $("failover-enabled").checked = !!c.failover_enabled;
+    renderNodesTable();
+
+    // NodeDT
+    var div = c.routing.divert || {};
+    $("divert-enabled").checked = !!div.enabled;
+    renderNodeSelectOptions($("divert-node"), nodes, div.node_id || "", "(同主节点)");
+    $("divert-chn-lan").value = (div.chn_proxy_lan_ips || []).join("\n");
+    $("divert-global-lan").value = (div.global_proxy_lan_ips || []).join("\n");
+    $("divert-direct-lan").value = (div.direct_lan_ips || []).join("\n");
+
+    // NodeSM
+    var smGrid = $("nodesm-grid");
+    clearEl(smGrid);
+    var services = (statusInfo && statusInfo.node_sm_services) || [];
+    var smMap = c.routing.service_map || {};
+    services.forEach(function (svc) {
+      var lbl = make("label", "", svc);
+      var sel = make("select");
+      sel.setAttribute("data-nodesm-svc", svc);
+      renderNodeSelectOptions(sel, nodes, smMap[svc] || "", "(跟随默认)");
+      lbl.appendChild(sel);
+      smGrid.appendChild(lbl);
+    });
+    renderNodeSelectOptions($("apple-node"), nodes, c.routing.apple_node_id || "", "(中国直连)");
+    $("steam-proxy").checked = !!c.routing.steam_proxy;
+
+    // NodeCU
+    var cu = c.routing.custom || {};
+    $("custom-enabled").checked = !!cu.enabled;
+    renderNodeSelectOptions($("custom-node"), nodes, cu.node_id || "", "(同主节点)");
+    $("custom-domains").value = (cu.domains || []).join("\n");
+    $("custom-ips").value = (cu.ips || []).join("\n");
+
+    // DNS
+    var dns = c.dns || {};
+    $("dns-block-ads").checked = !!dns.block_ads;
+    $("dns-block53").checked = !!dns.block_external_53;
+    $("dns-ipv6").checked = !!(currentState.system && currentState.system.enable_ipv6);
+    $("dns-auto-rules").checked = !!(currentState.system && currentState.system.auto_update_rules);
+    $("dns-china").value = (dns.china_servers || []).join("\n");
+    $("dns-doh").value = (dns.doh_servers || []).join("\n");
+    var hostsLines = [];
+    Object.keys(dns.hosts || {}).sort().forEach(function (k) {
+      hostsLines.push(k + " = " + dns.hosts[k]);
+    });
+    $("dns-hosts").value = hostsLines.join("\n");
+    $("dns-white-dom").value = (dns.whitelist_domains || []).join("\n");
+    $("dns-black-dom").value = (dns.blacklist_domains || []).join("\n");
+    $("dns-white-ip").value = (dns.whitelist_ips || []).join("\n");
+    $("dns-black-ip").value = (dns.blacklist_ips || []).join("\n");
+
+    // FWD0 / FWD1
+    var f0 = c.fwd0 || {};
+    $("fwd0-enabled").checked = !!f0.enabled;
+    $("fwd0-proto").value = f0.protocol || "vless-xhttp";
+    $("fwd0-port").value = f0.port || 9800;
+    $("fwd0-path").value = f0.path || "";
+    $("fwd0-uuids").value = (f0.uuids || []).join("\n");
+
+    var f1 = c.fwd1 || {};
+    $("fwd1-enabled").checked = !!f1.enabled;
+    $("fwd1-proto").value = f1.protocol || "vless-xhttp";
+    $("fwd1-port").value = f1.port || 9801;
+    renderNodeSelectOptions($("fwd1-upstream"), nodes, f1.upstream_node_id || "", "(跟随默认)");
+    $("fwd1-path").value = f1.path || "";
+    $("fwd1-uuids").value = (f1.uuids || []).join("\n");
+
+    renderRelayTable($("client-relay-tbody"));
+
+    // RproxyC
+    var rc = c.rproxyc || {};
+    $("rc-enabled").checked = !!rc.enabled;
+    $("rc-domain").value = rc.tunnel_address || "";
+    $("rc-port").value = rc.tunnel_port || 20000;
+    $("rc-uuid").value = rc.tunnel_uuid || "";
+    $("rc-security").value = rc.security || "tls";
+    $("rc-sni").value = rc.server_name || "";
+    $("rc-pin").value = rc.pinned_peer_cert_sha256 || "";
+    $("rc-out-direct").checked = !!rc.out_direct;
+    renderRproxyCMappings();
+
+    // WG
+    var wg = c.wireguard || {};
+    $("wg-enabled").checked = !!wg.enabled;
+    $("wg-endpoint").value = wg.endpoint_host || "";
+    $("wg-port").value = wg.listen_port || 51820;
+    $("wg-subnet").value = wg.subnet_cidr || "172.16.66.1/24";
+    $("wg-server-pub").value = wg.server_public_key || "";
+    renderWGPeers();
+
+    // DDNS
+    var ddns = c.ddns || {};
+    $("ddns-enabled").checked = !!ddns.enabled;
+    $("ddns-domain").value = ddns.domain || "";
+    $("ddns-email").value = ddns.cf_email || "";
+    $("ddns-token").value = "";
+    $("ddns-token").placeholder = currentSecrets.has_ddns_cf_token ? "已保存 Token (留空不变)" : "输入 CF API Token";
+    $("ddns-v6").checked = !!ddns.enable_ipv6;
+  }
+
+  function renderServerRelayForms() {
+    var role = currentState.role;
+    if (role === "server" || role === "landing") {
+      var srv = currentState.server || {};
+      $("srv-proto").value = srv.protocol || "vless-xhttp";
+      $("srv-tls-mode").value = srv.tls_mode || "nginx";
+      $("srv-domain").value = srv.domain || "";
+      $("srv-connect-host").value = srv.connect_host || "";
+      $("srv-port").value = srv.listen_port || 443;
+      $("srv-pub-port").value = srv.public_port || 0;
+      $("srv-path").value = srv.path || "";
+      $("srv-camo-dir").value = srv.camouflage_dir || "";
+      $("srv-uuids").value = (srv.uuids || []).join("\n");
+      $("srv-enable-doh").checked = !!srv.enable_doh;
+      renderSocks5Table();
+    }
+    renderExtraTable();
+    renderRelayTable($("srv-relay-tbody"));
+
+    var rs = currentState.rproxys || {};
+    $("rs-enabled").checked = !!rs.enabled;
+    $("rs-domain").value = rs.domain || "";
+    $("rs-port").value = rs.listen_port || 20000;
+    $("rs-security").value = rs.security || "tls";
+    $("rs-uuids").value = (rs.uuids || []).join("\n");
+    $("rs-in-uuids").value = (rs.in_uuids || []).join("\n");
+    renderRproxySMappings();
+  }
+
+  function renderSharedSystemForms() {
+    var cert = currentState.cert || {};
+    $("cert-domain").value = cert.domain || (currentState.server && currentState.server.domain) || "";
+    $("cert-cf-email").value = cert.cf_email || "";
+    $("cert-cf-token").value = "";
+    $("cert-cf-token").placeholder = currentSecrets.has_cert_cf_token ? "已保存 Token (留空沿用)" : "输入 CF Token";
+    $("cert-auto-renew").checked = cert.auto_renew !== false;
+
+    $("sys-hostname").value = (currentState.system && currentState.system.hostname) || "";
+    $("sys-auto-update-core").checked = !!(currentState.system && currentState.system.auto_update_core);
+    $("auth-listen").value = (currentState.auth && currentState.auth.listen_addr) || ":8443";
+  }
+
+  function renderCertSummary() {
+    var box = $("cert-summary");
+    if (!box) { return; }
+    clearEl(box);
+    var c = statusInfo && statusInfo.cert;
+    if (!c) {
+      addKV(box, "状态", "尚未检测到有效证书文件");
+      return;
+    }
+    addKV(box, "CN / SANs", (c.common_name || "-") + " | " + (c.sans || []).join(", "));
+    addKV(box, "有效期至", String(c.not_after || "").slice(0, 19).replace("T", " "));
+    addKV(box, "类型", c.self_signed ? "自签证书" : (c.chain_valid ? "受信任 CA 证书" : "证书链异常"));
+  }
+
+  function renderNodesTable() {
+    var tbody = $("nodes-tbody");
+    clearEl(tbody);
+    var nodes = (currentState && currentState.client && currentState.client.nodes) || [];
+    var activeID = currentState && currentState.client && currentState.client.active_node_id;
+
+    nodes.forEach(function (n, idx) {
+      var tr = make("tr");
+      tr.appendChild(make("td", "", n.id === activeID ? "★ 活动" : ""));
       tr.appendChild(make("td", "", n.name || n.id));
-      tr.appendChild(make("td", "", n.protocol));
-      tr.appendChild(make("td", "", n.address + ":" + n.port));
-      tr.appendChild(make("td", "", n.tls_sni || n.address));
+      tr.appendChild(make("td", "", n.protocol || ""));
+      tr.appendChild(make("td", "mono", n.address + ":" + n.port));
+      tr.appendChild(make("td", "mono", n.tls_sni || n.address));
+
+      var tdLat = make("td");
+      var pr = probeResultsMap[n.id];
+      if (!pr) {
+        tdLat.appendChild(make("span", "muted", "-"));
+      } else if (pr.healthy) {
+        tdLat.appendChild(make("span", "status-badge ok", pr.latency_ms + " ms"));
+      } else {
+        tdLat.appendChild(make("span", "status-badge fail", pr.error || "失败"));
+      }
+      tr.appendChild(tdLat);
+
       var tdAct = make("td", "row-gap");
-      var btnQR = make("button", "btn", "链接/QR");
-      btnQR.addEventListener("click", function () {
+      var bSel = make("button", "btn btn-sm", "切换");
+      bSel.addEventListener("click", async function () {
+        try {
+          await api("POST", "/api/v1/nodes/select", { node_id: n.id });
+          showToast("已切换主节点");
+          await refreshAll();
+        } catch (e) { showToast(e.message, true); }
+      });
+      var bUp = make("button", "btn btn-sm", "↑");
+      bUp.disabled = idx === 0;
+      bUp.addEventListener("click", function () {
+        if (idx > 0) {
+          var arr = currentState.client.nodes;
+          var tmp = arr[idx - 1]; arr[idx - 1] = arr[idx]; arr[idx] = tmp;
+          renderNodesTable();
+        }
+      });
+      var bDown = make("button", "btn btn-sm", "↓");
+      bDown.disabled = idx === nodes.length - 1;
+      bDown.addEventListener("click", function () {
+        if (idx < nodes.length - 1) {
+          var arr = currentState.client.nodes;
+          var tmp = arr[idx + 1]; arr[idx + 1] = arr[idx]; arr[idx] = tmp;
+          renderNodesTable();
+        }
+      });
+      var bEdit = make("button", "btn btn-sm", "编辑");
+      bEdit.addEventListener("click", function () { openNodeModal(n, idx); });
+      var bQR = make("button", "btn btn-sm", "QR");
+      bQR.addEventListener("click", function () {
         var uri = (statusInfo && statusInfo.node_uris && statusInfo.node_uris[n.id]) || "";
-        openModal(n.name || n.id, function (body) {
-          if (uri) {
-            var wrap = make("div", "qr-wrap");
-            wrap.appendChild(window.DexQR.createSVG(uri, 210));
-            body.appendChild(wrap);
-            var ta = make("textarea");
-            ta.rows = 3;
-            ta.readOnly = true;
-            ta.value = uri;
-            body.appendChild(ta);
-          } else {
-            body.appendChild(make("p", "muted", "应用保存后可生成标准分享链接。"));
-          }
-        });
+        showQRModal(n.name || n.id, uri);
       });
-      var btnDel = make("button", "btn danger", "删除");
-      btnDel.addEventListener("click", function () {
-        c.nodes.splice(idx, 1);
-        renderNodesAndRouting();
+      var bDel = make("button", "btn btn-sm danger", "删");
+      bDel.addEventListener("click", function () {
+        currentState.client.nodes.splice(idx, 1);
+        if (currentState.client.active_node_id === n.id) {
+          currentState.client.active_node_id = currentState.client.nodes[0] ? currentState.client.nodes[0].id : "";
+        }
+        renderNodesTable();
       });
-      tdAct.appendChild(btnQR);
-      tdAct.appendChild(btnDel);
+
+      tdAct.appendChild(bSel);
+      tdAct.appendChild(bUp);
+      tdAct.appendChild(bDown);
+      tdAct.appendChild(bEdit);
+      tdAct.appendChild(bQR);
+      tdAct.appendChild(bDel);
       tr.appendChild(tdAct);
       tbody.appendChild(tr);
     });
-
-    // NodeSM 16 services + Apple + Steam
-    var smGrid = el("nodesm-grid");
-    clearNode(smGrid);
-    var svcs = (statusInfo && statusInfo.node_sm_services) || [];
-    var smMap = c.routing.service_map || {};
-    svcs.forEach(function (svc) {
-      var f = make("label", "field");
-      f.appendChild(make("span", "", svc.toUpperCase()));
-      var sel = document.createElement("select");
-      fillNodeSelect(sel, c.nodes, smMap[svc] || "");
-      sel.addEventListener("change", function () {
-        if (!c.routing.service_map) c.routing.service_map = {};
-        if (sel.value) c.routing.service_map[svc] = sel.value;
-        else delete c.routing.service_map[svc];
-      });
-      f.appendChild(sel);
-      smGrid.appendChild(f);
-    });
-    var fApple = make("label", "field");
-    fApple.appendChild(make("span", "", "APPLE (默认直连)"));
-    var selApple = document.createElement("select");
-    fillNodeSelect(selApple, c.nodes, c.routing.apple_node_id || "");
-    selApple.addEventListener("change", function () { c.routing.apple_node_id = selApple.value; });
-    fApple.appendChild(selApple);
-    smGrid.appendChild(fApple);
-
-    var fSteam = make("label", "inline-check");
-    var chkSteam = document.createElement("input");
-    chkSteam.type = "checkbox";
-    chkSteam.checked = !!c.routing.steam_proxy;
-    chkSteam.addEventListener("change", function () { c.routing.steam_proxy = chkSteam.checked; });
-    fSteam.appendChild(chkSteam);
-    fSteam.appendChild(make("span", "", "Steam 走代理（取消则直连）"));
-    smGrid.appendChild(fSteam);
-
-    // NodeDT & NodeCU
-    var dt = c.routing.divert || {};
-    el("chk-nodedt").checked = !!dt.enabled;
-    fillNodeSelect(el("sel-nodedt-node"), c.nodes, dt.node_id || "");
-    el("txt-nodedt-global").value = arrToLines(dt.global_proxy_lan_ips);
-    el("txt-nodedt-direct").value = arrToLines(dt.direct_lan_ips);
-
-    var cu = c.routing.custom || {};
-    el("chk-nodecu").checked = !!cu.enabled;
-    fillNodeSelect(el("sel-nodecu-node"), c.nodes, cu.node_id || "");
-    el("txt-nodecu-domains").value = arrToLines(cu.domains);
-    el("txt-nodecu-ips").value = arrToLines(cu.ips);
   }
 
-  function renderDNSAndLists() {
-    var d = appState.client.dns || {};
-    el("chk-block-ads").checked = !!d.block_ads;
-    el("chk-enable-ipv6").checked = !!appState.system.enable_ipv6;
-    el("txt-dns-china").value = arrToLines(d.china_servers);
-    el("txt-dns-doh").value = arrToLines(d.doh_servers);
-    var hostLines = [];
-    Object.keys(d.hosts || {}).sort().forEach(function (k) {
-      hostLines.push(k + " " + d.hosts[k]);
+  function openNodeModal(existing, idx) {
+    var isNew = !existing;
+    var node = existing ? JSON.parse(JSON.stringify(existing)) : {
+      id: "node-" + Date.now().toString().slice(-6),
+      name: "",
+      protocol: "vless-xhttp",
+      address: "",
+      port: 443,
+      uuid: genUUID(),
+      tls_sni: "",
+      path: "",
+      reality_pubkey: "",
+      reality_shortid: "",
+      username: "",
+      password: ""
+    };
+
+    openModal(isNew ? "添加节点" : "编辑节点: " + (node.name || node.id), function (body) {
+      if (isNew) {
+        var uriRow = make("div", "mb");
+        var uriInp = make("input");
+        uriInp.type = "text";
+        uriInp.placeholder = "粘贴 vless:// / vmess:// / socks5:// 链接自动解析...";
+        var btnParse = make("button", "btn btn-sm mt", "解析链接填充");
+        uriRow.appendChild(make("label", "", "从分享链接快速导入"));
+        uriRow.appendChild(uriInp);
+        uriRow.appendChild(btnParse);
+        body.appendChild(uriRow);
+
+        btnParse.addEventListener("click", async function () {
+          try {
+            var res = await api("POST", "/api/v1/nodes/parse-uri", { uri: uriInp.value });
+            var parsed = res.node || {};
+            if (parsed.protocol) { fProto.value = parsed.protocol; }
+            if (parsed.name) { fName.value = parsed.name; }
+            if (parsed.address) { fAddr.value = parsed.address; }
+            if (parsed.port) { fPort.value = parsed.port; }
+            if (parsed.uuid) { fUUID.value = parsed.uuid; }
+            if (parsed.tls_sni) { fSNI.value = parsed.tls_sni; }
+            if (parsed.path) { fPath.value = parsed.path; }
+            if (parsed.reality_pubkey) { fPBK.value = parsed.reality_pubkey; }
+            if (parsed.reality_shortid) { fSID.value = parsed.reality_shortid; }
+            if (parsed.username) { fUser.value = parsed.username; }
+            if (parsed.password) { fPass.value = parsed.password; }
+            updateProtoFields();
+            showToast("解析成功");
+          } catch (e) { showToast(e.message, true); }
+        });
+      }
+
+      function addField(labelText, inputEl) {
+        var lbl = make("label", "mt", labelText);
+        lbl.appendChild(inputEl);
+        body.appendChild(lbl);
+        return inputEl;
+      }
+
+      var fName = addField("名称", make("input")); fName.value = node.name || "";
+      var fProto = make("select");
+      ["vless-xhttp", "vless-reality", "vless-ws", "vmess-ws", "vmess-tcp", "socks5"].forEach(function (p) {
+        var o = make("option", "", p); o.value = p;
+        if (p === node.protocol) { o.selected = true; }
+        fProto.appendChild(o);
+      });
+      addField("协议", fProto);
+
+      var fAddr = addField("服务器地址", make("input")); fAddr.value = node.address || "";
+      var fPort = addField("端口", make("input")); fPort.type = "number"; fPort.value = node.port || 443;
+      var fUUID = addField("UUID", make("input")); fUUID.value = node.uuid || "";
+      var fSNI = addField("TLS SNI (留空同地址)", make("input")); fSNI.value = node.tls_sni || "";
+      var fPath = addField("Path (XHTTP / WS)", make("input")); fPath.value = node.path || "";
+      var fPBK = addField("Reality PublicKey", make("input")); fPBK.value = node.reality_pubkey || "";
+      var fSID = addField("Reality ShortID", make("input")); fSID.value = node.reality_shortid || "";
+      var fUser = addField("SOCKS5 用户名", make("input")); fUser.value = node.username || "";
+      var fPass = addField("SOCKS5 密码", make("input")); fPass.type = "password"; fPass.value = node.password || "";
+
+      function updateProtoFields() {
+        var p = fProto.value;
+        fUUID.parentElement.classList.toggle("hidden", p === "socks5");
+        fSNI.parentElement.classList.toggle("hidden", p === "vmess-tcp" || p === "socks5");
+        fPath.parentElement.classList.toggle("hidden", p !== "vless-xhttp" && p !== "vless-ws" && p !== "vmess-ws");
+        fPBK.parentElement.classList.toggle("hidden", p !== "vless-reality");
+        fSID.parentElement.classList.toggle("hidden", p !== "vless-reality");
+        fUser.parentElement.classList.toggle("hidden", p !== "socks5");
+        fPass.parentElement.classList.toggle("hidden", p !== "socks5");
+      }
+      fProto.addEventListener("change", updateProtoFields);
+      updateProtoFields();
+
+      var btnOK = make("button", "btn primary mt", isNew ? "添加到列表" : "确认修改");
+      btnOK.addEventListener("click", function () {
+        var next = {
+          id: node.id,
+          name: fName.value.trim() || fAddr.value.trim(),
+          protocol: fProto.value,
+          address: fAddr.value.trim(),
+          port: Number(fPort.value || 443),
+          uuid: fUUID.value.trim(),
+          tls_sni: fSNI.value.trim(),
+          path: fPath.value.trim(),
+          reality_pubkey: fPBK.value.trim(),
+          reality_shortid: fSID.value.trim(),
+          username: fUser.value,
+          password: fPass.value
+        };
+        if (!next.address) { showToast("地址不能为空", true); return; }
+        if (isNew) {
+          currentState.client.nodes.push(next);
+          if (!currentState.client.active_node_id) {
+            currentState.client.active_node_id = next.id;
+          }
+        } else {
+          currentState.client.nodes[idx] = next;
+        }
+        renderNodesTable();
+        closeModal();
+      });
+      body.appendChild(btnOK);
     });
-    el("txt-dns-hosts").value = hostLines.join("\n");
-    el("txt-list-b-dom").value = arrToLines(d.blacklist_domains);
-    el("txt-list-w-dom").value = arrToLines(d.whitelist_domains);
-    el("txt-list-b-ip").value = arrToLines(d.blacklist_ips);
-    el("txt-list-w-ip").value = arrToLines(d.whitelist_ips);
   }
 
-  function renderForwardAndRproxy() {
-    var c = appState.client;
-    el("chk-fwd0").checked = !!c.fwd0.enabled;
-    el("inp-fwd0-port").value = c.fwd0.port || "";
-    el("inp-fwd0-path").value = c.fwd0.path || "";
-    el("txt-fwd0-uuids").value = arrToLines(c.fwd0.uuids);
-
-    el("chk-fwd1").checked = !!c.fwd1.enabled;
-    el("inp-fwd1-port").value = c.fwd1.port || "";
-    el("inp-fwd1-path").value = c.fwd1.path || "";
-    el("txt-fwd1-uuids").value = arrToLines(c.fwd1.uuids);
-    fillNodeSelect(el("sel-fwd1-node"), c.nodes, c.fwd1.upstream_node_id || "");
-
-    el("chk-rproxyc").checked = !!c.rproxyc.enabled;
-    el("inp-rpc-addr").value = c.rproxyc.tunnel_address || "";
-    el("inp-rpc-port").value = c.rproxyc.tunnel_port || "";
-    el("inp-rpc-uuid").value = c.rproxyc.tunnel_uuid || "";
-    el("txt-rpc-maps").value = (c.rproxyc.mappings || []).map(function (m) {
-      return m.ext_port + " " + (m.proto || "tcp") + " " + m.int_ip + ":" + m.int_port;
-    }).join("\n");
-
-    var rbody = el("relay-tbody");
-    clearNode(rbody);
-    ((appState.relay && appState.relay.forwards) || []).forEach(function (fwd, idx) {
-      var tr = document.createElement("tr");
-      tr.appendChild(make("td", "", String(fwd.listen_port)));
-      tr.appendChild(make("td", "", fwd.target_host + ":" + fwd.target_port));
-      tr.appendChild(make("td", "", fwd.proto));
-      tr.appendChild(make("td", "", fwd.engine));
-      var td = make("td", "");
-      var del = make("button", "btn danger", "删除");
-      del.addEventListener("click", function () {
-        appState.relay.forwards.splice(idx, 1);
-        renderForwardAndRproxy();
+  function renderRelayTable(tbody) {
+    clearEl(tbody);
+    var rules = (currentState && currentState.relay && currentState.relay.forwards) || [];
+    rules.forEach(function (rf, idx) {
+      var tr = make("tr");
+      tr.appendChild(make("td", "mono", rf.id));
+      tr.appendChild(make("td", "", String(rf.listen_port)));
+      tr.appendChild(make("td", "", String(rf.public_port || rf.listen_port)));
+      tr.appendChild(make("td", "mono", rf.target_host + ":" + rf.target_port));
+      tr.appendChild(make("td", "", rf.proto || "tcp"));
+      tr.appendChild(make("td", "", rf.engine || "nft"));
+      var td = make("td");
+      var bDel = make("button", "btn btn-sm danger", "删");
+      bDel.addEventListener("click", function () {
+        currentState.relay.forwards.splice(idx, 1);
+        renderRelayTable(tbody);
       });
-      td.appendChild(del);
+      td.appendChild(bDel);
       tr.appendChild(td);
-      rbody.appendChild(tr);
+      tbody.appendChild(tr);
     });
   }
 
-  function renderWGAndDDNS() {
-    var wg = appState.client.wireguard || {};
-    el("chk-wg-enabled").checked = !!wg.enabled;
-    el("inp-wg-host").value = wg.endpoint_host || "";
-    el("inp-wg-port").value = wg.listen_port || 51820;
-    el("inp-wg-subnet").value = wg.subnet_cidr || "172.16.66.1/24";
+  function openRelayModal(tbody) {
+    openModal("添加端口转发规则", function (body) {
+      function fld(lbl, el) {
+        var l = make("label", "mt", lbl); l.appendChild(el); body.appendChild(l); return el;
+      }
+      var fLP = fld("本机监听端口", make("input")); fLP.type = "number"; fLP.value = "10001";
+      var fPP = fld("公网端口 (0 同监听端口)", make("input")); fPP.type = "number"; fPP.value = "0";
+      var fTH = fld("目标主机/域名", make("input"));
+      var fTP = fld("目标端口", make("input")); fTP.type = "number"; fTP.value = "443";
+      var fProto = make("select");
+      ["tcp", "udp", "tcp,udp"].forEach(function (p) { var o = make("option", "", p); o.value = p; fProto.appendChild(o); });
+      fld("协议", fProto);
+      var fEng = make("select");
+      ["nft", "haproxy", "xray"].forEach(function (e) { var o = make("option", "", e); o.value = e; fEng.appendChild(o); });
+      fld("引擎", fEng);
 
-    var tbody = el("wg-peers-tbody");
-    clearNode(tbody);
-    (wg.peers || []).forEach(function (p, idx) {
-      var tr = document.createElement("tr");
+      var b = make("button", "btn primary mt", "加入列表");
+      b.addEventListener("click", function () {
+        var lp = Number(fLP.value);
+        if (!lp || !fTH.value.trim() || !Number(fTP.value)) {
+          showToast("请填写完整端口和目标地址", true);
+          return;
+        }
+        currentState.relay.forwards = currentState.relay.forwards || [];
+        currentState.relay.forwards.push({
+          id: "fwd-" + lp,
+          listen_port: lp,
+          public_port: Number(fPP.value || 0),
+          target_host: fTH.value.trim(),
+          target_port: Number(fTP.value),
+          proto: fProto.value,
+          engine: fEng.value
+        });
+        renderRelayTable(tbody);
+        closeModal();
+      });
+      body.appendChild(b);
+    });
+  }
+
+  function renderRproxyCMappings() {
+    var tbody = $("rc-map-tbody");
+    clearEl(tbody);
+    var maps = (currentState && currentState.client && currentState.client.rproxyc && currentState.client.rproxyc.mappings) || [];
+    maps.forEach(function (m, idx) {
+      var tr = make("tr");
+      tr.appendChild(make("td", "", String(m.ext_port)));
+      tr.appendChild(make("td", "mono", m.int_ip));
+      tr.appendChild(make("td", "", String(m.int_port)));
+      tr.appendChild(make("td", "", m.proto || "tcp"));
+      var td = make("td");
+      var bDel = make("button", "btn btn-sm danger", "删");
+      bDel.addEventListener("click", function () {
+        currentState.client.rproxyc.mappings.splice(idx, 1);
+        renderRproxyCMappings();
+      });
+      td.appendChild(bDel);
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    });
+  }
+
+  function renderRproxySMappings() {
+    var tbody = $("rs-map-tbody");
+    clearEl(tbody);
+    var maps = (currentState && currentState.rproxys && currentState.rproxys.mappings) || [];
+    maps.forEach(function (m, idx) {
+      var tr = make("tr");
+      tr.appendChild(make("td", "", String(m.port)));
+      tr.appendChild(make("td", "", m.proto || "tcp"));
+      var td = make("td");
+      var bDel = make("button", "btn btn-sm danger", "删");
+      bDel.addEventListener("click", function () {
+        currentState.rproxys.mappings.splice(idx, 1);
+        renderRproxySMappings();
+      });
+      td.appendChild(bDel);
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    });
+  }
+
+  function renderWGPeers() {
+    var tbody = $("wg-peers-tbody");
+    clearEl(tbody);
+    var peers = (currentState && currentState.client && currentState.client.wireguard && currentState.client.wireguard.peers) || [];
+    peers.forEach(function (p, idx) {
+      var tr = make("tr");
       tr.appendChild(make("td", "", p.name));
-      tr.appendChild(make("td", "", p.ip));
+      tr.appendChild(make("td", "mono", p.ip));
+      tr.appendChild(make("td", "mono", (p.public_key || "").slice(0, 18) + "..."));
       var td = make("td", "row-gap");
-      var btnCfg = make("button", "btn", "配置 / QR");
-      btnCfg.addEventListener("click", async function () {
+
+      var bCfg = make("button", "btn btn-sm", "配置 / QR");
+      bCfg.addEventListener("click", async function () {
         try {
           var resp = await fetch("/api/v1/wireguard/peers/" + encodeURIComponent(p.name) + "/config");
           var cfg = await resp.text();
@@ -318,354 +779,812 @@
             wrap.appendChild(window.DexQR.createSVG(cfg, 220));
             body.appendChild(wrap);
             var ta = make("textarea");
-            ta.rows = 10;
-            ta.readOnly = true;
-            ta.value = cfg;
+            ta.rows = 10; ta.readOnly = true; ta.value = cfg;
             body.appendChild(ta);
           });
         } catch (e) { showToast(e.message, true); }
       });
-      var btnDel = make("button", "btn danger", "删除");
-      btnDel.addEventListener("click", function () {
-        wg.peers.splice(idx, 1);
-        renderWGAndDDNS();
+
+      var bDl = make("a", "btn btn-sm", "下载 .conf");
+      bDl.href = "/api/v1/wireguard/peers/" + encodeURIComponent(p.name) + "/config?download=1";
+      bDl.download = "wg-" + p.name + ".conf";
+
+      var bRegen = make("button", "btn btn-sm", "轮换密钥");
+      bRegen.addEventListener("click", async function () {
+        try {
+          await api("POST", "/api/v1/wireguard/peers/" + encodeURIComponent(p.name) + "/regen", {});
+          showToast("已重新生成 Peer 密钥: " + p.name);
+          await refreshAll();
+        } catch (e) { showToast(e.message, true); }
       });
-      td.appendChild(btnCfg);
-      td.appendChild(btnDel);
+
+      var bDel = make("button", "btn btn-sm danger", "删");
+      bDel.addEventListener("click", function () {
+        currentState.client.wireguard.peers.splice(idx, 1);
+        renderWGPeers();
+      });
+
+      td.appendChild(bCfg);
+      td.appendChild(bDl);
+      td.appendChild(bRegen);
+      td.appendChild(bDel);
       tr.appendChild(td);
       tbody.appendChild(tr);
     });
-
-    var ddns = appState.client.ddns || {};
-    el("chk-ddns-enabled").checked = !!ddns.enabled;
-    el("chk-ddns-v6").checked = !!ddns.enable_ipv6;
-    el("inp-ddns-domain").value = ddns.domain || "";
-    el("inp-ddns-token").value = ddns.cf_token || "";
   }
 
-  function renderSystem() {
-    var box = el("cert-info");
-    clearNode(box);
-    var cert = statusInfo && statusInfo.cert;
-    if (!cert) {
-      box.appendChild(make("div", "muted", "暂无已安装证书"));
-      return;
-    }
-    var rows = [
-      ["Common Name", cert.common_name || "-"],
-      ["SAN 域名", (cert.sans || []).join(", ")],
-      ["到期时间", cert.not_after || "-"],
-      ["类型", cert.self_signed ? "自签证书" : (cert.chain_valid ? "受信任证书链" : "链未完整校验")]
-    ];
-    rows.forEach(function (pair) {
-      var r = make("div", "kv-row");
-      r.appendChild(make("span", "muted", pair[0]));
-      r.appendChild(make("span", "", pair[1]));
-      box.appendChild(r);
+  function renderSocks5Table() {
+    var tbody = $("socks5-tbody");
+    clearEl(tbody);
+    var list = (currentState && currentState.server && currentState.server.socks5_outbounds) || [];
+    list.forEach(function (prof, idx) {
+      var tr = make("tr");
+      tr.appendChild(make("td", "", prof.name));
+      tr.appendChild(make("td", "", prof.enabled ? "启用" : "停用"));
+      tr.appendChild(make("td", "mono", prof.address + ":" + prof.port));
+      tr.appendChild(make("td", "", String((prof.domains || []).length)));
+      tr.appendChild(make("td", "", String((prof.ips || []).length)));
+      tr.appendChild(make("td", "", prof.private_bypass ? "是" : "否"));
+      var td = make("td", "row-gap");
+
+      var bTest = make("button", "btn btn-sm", "测速");
+      bTest.addEventListener("click", async function () {
+        try {
+          var res = await api("POST", "/api/v1/socks5/test", {
+            address: prof.address, port: prof.port, username: prof.username || "", password: prof.password || ""
+          });
+          var r = res.result || {};
+          showToast(prof.name + ": 出口 " + (r.exit_ip || "?") + " (" + (r.location || "-") + ") " + (r.latency_ms || 0) + "ms");
+        } catch (e) { showToast(e.message, true); }
+      });
+
+      var bToggle = make("button", "btn btn-sm", prof.enabled ? "停用" : "启用");
+      bToggle.addEventListener("click", function () {
+        prof.enabled = !prof.enabled;
+        renderSocks5Table();
+      });
+
+      var bEdit = make("button", "btn btn-sm", "编辑");
+      bEdit.addEventListener("click", function () { openSocks5Modal(prof, idx); });
+
+      var bDel = make("button", "btn btn-sm danger", "删");
+      bDel.addEventListener("click", function () {
+        currentState.server.socks5_outbounds.splice(idx, 1);
+        renderSocks5Table();
+      });
+
+      td.appendChild(bTest);
+      td.appendChild(bToggle);
+      td.appendChild(bEdit);
+      td.appendChild(bDel);
+      tr.appendChild(td);
+      tbody.appendChild(tr);
     });
   }
 
-  function collectFormIntoState() {
-    if (!appState) return;
-    var c = appState.client;
-    c.failover_enabled = el("chk-failover").checked;
-    c.routing.divert.enabled = el("chk-nodedt").checked;
-    c.routing.divert.node_id = el("sel-nodedt-node").value;
-    c.routing.divert.global_proxy_lan_ips = linesToArr(el("txt-nodedt-global").value);
-    c.routing.divert.direct_lan_ips = linesToArr(el("txt-nodedt-direct").value);
+  function openSocks5Modal(existing, idx) {
+    var isNew = !existing;
+    var prof = existing ? JSON.parse(JSON.stringify(existing)) : {
+      name: "exit-" + (((currentState.server.socks5_outbounds || []).length) + 1),
+      enabled: true,
+      address: "",
+      port: 1080,
+      username: "",
+      password: "",
+      domains: [],
+      ips: [],
+      private_bypass: true
+    };
 
-    c.routing.custom.enabled = el("chk-nodecu").checked;
-    c.routing.custom.node_id = el("sel-nodecu-node").value;
-    c.routing.custom.domains = linesToArr(el("txt-nodecu-domains").value);
-    c.routing.custom.ips = linesToArr(el("txt-nodecu-ips").value);
+    openModal(isNew ? "添加 SOCKS5 出口" : "编辑 SOCKS5: " + prof.name, function (body) {
+      function fld(lbl, el) {
+        var l = make("label", "mt", lbl); l.appendChild(el); body.appendChild(l); return el;
+      }
+      var fName = fld("配置名称", make("input")); fName.value = prof.name;
+      var fAddr = fld("SOCKS5 主机/IP", make("input")); fAddr.value = prof.address;
+      var fPort = fld("端口", make("input")); fPort.type = "number"; fPort.value = prof.port || 1080;
+      var fUser = fld("用户名 (可选)", make("input")); fUser.value = prof.username || "";
+      var fPass = fld("密码 (可选)", make("input")); fPass.type = "password"; fPass.value = prof.password || "";
+      var fDom = fld("域名规则 (每行或逗号，如 geosite:openai)", make("textarea")); fDom.rows = 3; fDom.value = (prof.domains || []).join("\n");
+      var fIP = fld("IP/CIDR 规则 (每行或逗号，留空为全局兜底)", make("textarea")); fIP.rows = 2; fIP.value = (prof.ips || []).join("\n");
+      var fPB = make("input"); fPB.type = "checkbox"; fPB.checked = prof.private_bypass !== false;
+      var pbLbl = make("label", "check-row mt"); pbLbl.appendChild(fPB); pbLbl.appendChild(document.createTextNode(" 私有地址直连旁路 (private_bypass)"));
+      body.appendChild(pbLbl);
 
-    c.dns.block_ads = el("chk-block-ads").checked;
-    appState.system.enable_ipv6 = el("chk-enable-ipv6").checked;
-    c.dns.china_servers = linesToArr(el("txt-dns-china").value);
-    c.dns.doh_servers = linesToArr(el("txt-dns-doh").value);
+      var b = make("button", "btn primary mt", "确认");
+      b.addEventListener("click", function () {
+        var next = {
+          name: fName.value.trim(),
+          enabled: prof.enabled !== false,
+          address: fAddr.value.trim(),
+          port: Number(fPort.value || 1080),
+          username: fUser.value,
+          password: fPass.value,
+          domains: splitList(fDom.value),
+          ips: splitList(fIP.value),
+          private_bypass: fPB.checked
+        };
+        if (!next.name || !next.address) { showToast("名称和地址必填", true); return; }
+        currentState.server.socks5_outbounds = currentState.server.socks5_outbounds || [];
+        if (isNew) { currentState.server.socks5_outbounds.push(next); }
+        else { currentState.server.socks5_outbounds[idx] = next; }
+        renderSocks5Table();
+        closeModal();
+      });
+      body.appendChild(b);
+    });
+  }
+
+  function renderExtraTable() {
+    var tbody = $("extra-tbody");
+    clearEl(tbody);
+    var list = (currentState && currentState.extra_inbounds) || [];
+    list.forEach(function (ex, idx) {
+      var tr = make("tr");
+      tr.appendChild(make("td", "mono", ex.tag));
+      tr.appendChild(make("td", "", ex.protocol));
+      tr.appendChild(make("td", "", String(ex.listen_port)));
+      tr.appendChild(make("td", "", ex.via_nginx ? "是" : "否"));
+      var summary = "";
+      if (ex.protocol === "vless-reality") { summary = "SNI=" + (ex.reality_sni || "-"); }
+      else if (ex.protocol === "dokodemo") { summary = (ex.target_addr || "") + ":" + (ex.target_port || 0) + " (" + (ex.network || "tcp,udp") + ")"; }
+      else if (ex.protocol === "socks5") { summary = ex.socks_user ? ("auth:" + ex.socks_user) : "no-auth"; }
+      else { summary = (ex.domain || "(default)") + " " + (ex.path || "(auto)"); }
+      tr.appendChild(make("td", "mono", summary));
+
+      var td = make("td", "row-gap");
+      var uri = statusInfo && statusInfo.extra_uris && statusInfo.extra_uris[ex.tag];
+      if (uri) {
+        var bQR = make("button", "btn btn-sm", "QR");
+        bQR.addEventListener("click", function () { showQRModal(ex.tag, uri); });
+        td.appendChild(bQR);
+      }
+      var bEdit = make("button", "btn btn-sm", "编辑");
+      bEdit.addEventListener("click", function () { openExtraModal(ex, idx); });
+      var bDel = make("button", "btn btn-sm danger", "删");
+      bDel.addEventListener("click", function () {
+        currentState.extra_inbounds.splice(idx, 1);
+        renderExtraTable();
+      });
+      td.appendChild(bEdit);
+      td.appendChild(bDel);
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    });
+  }
+
+  function openExtraModal(existing, idx) {
+    var isNew = !existing;
+    var ex = existing ? JSON.parse(JSON.stringify(existing)) : {
+      tag: "",
+      protocol: "vless-reality",
+      listen_port: 2443,
+      uuid: genUUID(),
+      path: "",
+      domain: "",
+      reality_sni: "www.apple.com",
+      reality_dest: "www.apple.com:443",
+      reality_privkey: "",
+      reality_pubkey: "",
+      reality_shortid: "",
+      socks_user: "",
+      socks_pass: "",
+      target_addr: "",
+      target_port: 0,
+      network: "tcp,udp",
+      via_nginx: false
+    };
+
+    openModal(isNew ? "添加附加协议 (Option 55)" : "编辑: " + ex.tag, function (body) {
+      function fld(lbl, el) {
+        var l = make("label", "mt", lbl); l.appendChild(el); body.appendChild(l); return el;
+      }
+      var fProto = make("select");
+      ["vless-reality", "vless-xhttp", "vless-ws", "vmess-ws", "dokodemo", "socks5"].forEach(function (p) {
+        var o = make("option", "", p); o.value = p;
+        if (p === ex.protocol) { o.selected = true; }
+        fProto.appendChild(o);
+      });
+      fld("协议", fProto);
+      var fTag = fld("Tag (留空自动生成)", make("input")); fTag.value = ex.tag || "";
+      var fPort = fld("监听端口", make("input")); fPort.type = "number"; fPort.value = ex.listen_port || 2443;
+      var fUUID = fld("UUID (Reality/XHTTP/WS)", make("input")); fUUID.value = ex.uuid || "";
+      var fDom = fld("域名/SNI (XHTTP/WS 可选)", make("input")); fDom.value = ex.domain || "";
+      var fPath = fld("Path (XHTTP/WS 留空自动派生)", make("input")); fPath.value = ex.path || "";
+      var fVN = make("input"); fVN.type = "checkbox"; fVN.checked = !!ex.via_nginx;
+      var vnLbl = make("label", "check-row mt"); vnLbl.appendChild(fVN); vnLbl.appendChild(document.createTextNode(" 经 Nginx 前置代理 (via_nginx)"));
+      body.appendChild(vnLbl);
+
+      var fRSNI = fld("Reality SNI", make("input")); fRSNI.value = ex.reality_sni || "www.apple.com";
+      var fRDest = fld("Reality Dest (host:port)", make("input")); fRDest.value = ex.reality_dest || "www.apple.com:443";
+      var fSU = fld("SOCKS5 用户名", make("input")); fSU.value = ex.socks_user || "";
+      var fSP = fld("SOCKS5 密码", make("input")); fSP.type = "password"; fSP.value = ex.socks_pass || "";
+      var fTAddr = fld("Dokodemo 目标主机", make("input")); fTAddr.value = ex.target_addr || "";
+      var fTPort = fld("Dokodemo 目标端口", make("input")); fTPort.type = "number"; fTPort.value = ex.target_port || 0;
+      var fNet = make("select");
+      ["tcp,udp", "tcp", "udp"].forEach(function (n) { var o = make("option", "", n); o.value = n; if (n === (ex.network || "tcp,udp")) { o.selected = true; } fNet.appendChild(o); });
+      fld("Dokodemo 网络", fNet);
+
+      function updateFields() {
+        var p = fProto.value;
+        var isTLS = p === "vless-xhttp" || p === "vless-ws" || p === "vmess-ws";
+        fUUID.parentElement.classList.toggle("hidden", p === "socks5" || p === "dokodemo");
+        fDom.parentElement.classList.toggle("hidden", !isTLS);
+        fPath.parentElement.classList.toggle("hidden", !isTLS);
+        vnLbl.classList.toggle("hidden", !isTLS);
+        fRSNI.parentElement.classList.toggle("hidden", p !== "vless-reality");
+        fRDest.parentElement.classList.toggle("hidden", p !== "vless-reality");
+        fSU.parentElement.classList.toggle("hidden", p !== "socks5");
+        fSP.parentElement.classList.toggle("hidden", p !== "socks5");
+        fTAddr.parentElement.classList.toggle("hidden", p !== "dokodemo");
+        fTPort.parentElement.classList.toggle("hidden", p !== "dokodemo");
+        fNet.parentElement.classList.toggle("hidden", p !== "dokodemo");
+      }
+      fProto.addEventListener("change", updateFields);
+      updateFields();
+
+      var b = make("button", "btn primary mt", "确认");
+      b.addEventListener("click", function () {
+        var p = fProto.value;
+        var portNum = Number(fPort.value);
+        if (!portNum) { showToast("端口无效", true); return; }
+        var tag = fTag.value.trim() || ("inbound-" + p.replace("vless-", "") + "-" + portNum);
+        var next = {
+          tag: tag,
+          protocol: p,
+          listen_port: portNum,
+          uuid: fUUID.value.trim(),
+          path: fPath.value.trim(),
+          domain: fDom.value.trim(),
+          via_nginx: fVN.checked,
+          reality_sni: fRSNI.value.trim(),
+          reality_dest: fRDest.value.trim(),
+          reality_privkey: ex.reality_privkey || "",
+          reality_pubkey: ex.reality_pubkey || "",
+          reality_shortid: ex.reality_shortid || "",
+          socks_user: fSU.value,
+          socks_pass: fSP.value,
+          target_addr: fTAddr.value.trim(),
+          target_port: Number(fTPort.value || 0),
+          network: fNet.value
+        };
+        currentState.extra_inbounds = currentState.extra_inbounds || [];
+        if (isNew) { currentState.extra_inbounds.push(next); }
+        else { currentState.extra_inbounds[idx] = next; }
+        renderExtraTable();
+        closeModal();
+      });
+      body.appendChild(b);
+    });
+  }
+
+  function collectRoutingFromUI() {
+    var c = currentState.client;
+    c.routing.divert.enabled = $("divert-enabled").checked;
+    c.routing.divert.node_id = $("divert-node").value;
+    c.routing.divert.chn_proxy_lan_ips = splitList($("divert-chn-lan").value);
+    c.routing.divert.global_proxy_lan_ips = splitList($("divert-global-lan").value);
+    c.routing.divert.direct_lan_ips = splitList($("divert-direct-lan").value);
+
+    var sm = {};
+    document.querySelectorAll("[data-nodesm-svc]").forEach(function (sel) {
+      if (sel.value) { sm[sel.getAttribute("data-nodesm-svc")] = sel.value; }
+    });
+    c.routing.service_map = sm;
+    c.routing.apple_node_id = $("apple-node").value;
+    c.routing.steam_proxy = $("steam-proxy").checked;
+
+    c.routing.custom.enabled = $("custom-enabled").checked;
+    c.routing.custom.node_id = $("custom-node").value;
+    c.routing.custom.domains = splitList($("custom-domains").value);
+    c.routing.custom.ips = splitList($("custom-ips").value);
+  }
+
+  function collectDNSFromUI() {
+    var d = currentState.client.dns;
+    d.block_ads = $("dns-block-ads").checked;
+    d.block_external_53 = $("dns-block53").checked;
+    currentState.system.enable_ipv6 = $("dns-ipv6").checked;
+    currentState.system.auto_update_rules = $("dns-auto-rules").checked;
+    d.china_servers = splitList($("dns-china").value);
+    d.doh_servers = splitList($("dns-doh").value);
     var hosts = {};
-    linesToArr(el("txt-dns-hosts").value).forEach(function (line) {
-      var parts = line.split(/\s+/);
-      if (parts.length >= 2) hosts[parts[0]] = parts[1];
+    splitList($("dns-hosts").value).forEach(function (line) {
+      var parts = line.split(/[=\s]+/).filter(Boolean);
+      if (parts.length >= 2) { hosts[parts[0]] = parts[1]; }
     });
-    c.dns.hosts = hosts;
-    c.dns.blacklist_domains = linesToArr(el("txt-list-b-dom").value);
-    c.dns.whitelist_domains = linesToArr(el("txt-list-w-dom").value);
-    c.dns.blacklist_ips = linesToArr(el("txt-list-b-ip").value);
-    c.dns.whitelist_ips = linesToArr(el("txt-list-w-ip").value);
-
-    c.fwd0.enabled = el("chk-fwd0").checked;
-    c.fwd0.port = parseInt(el("inp-fwd0-port").value, 10) || 0;
-    c.fwd0.path = el("inp-fwd0-path").value.trim();
-    c.fwd0.uuids = linesToArr(el("txt-fwd0-uuids").value);
-
-    c.fwd1.enabled = el("chk-fwd1").checked;
-    c.fwd1.port = parseInt(el("inp-fwd1-port").value, 10) || 0;
-    c.fwd1.path = el("inp-fwd1-path").value.trim();
-    c.fwd1.uuids = linesToArr(el("txt-fwd1-uuids").value);
-    c.fwd1.upstream_node_id = el("sel-fwd1-node").value;
-
-    c.rproxyc.enabled = el("chk-rproxyc").checked;
-    c.rproxyc.tunnel_address = el("inp-rpc-addr").value.trim();
-    c.rproxyc.tunnel_port = parseInt(el("inp-rpc-port").value, 10) || 443;
-    c.rproxyc.tunnel_uuid = el("inp-rpc-uuid").value.trim();
-    c.rproxyc.mappings = linesToArr(el("txt-rpc-maps").value).map(function (line) {
-      var ps = line.split(/\s+/);
-      var hp = (ps[2] || "").split(":");
-      return {
-        ext_port: parseInt(ps[0], 10) || 0,
-        proto: ps[1] || "tcp",
-        int_ip: hp[0] || "",
-        int_port: parseInt(hp[1], 10) || 0
-      };
-    });
-
-    c.wireguard.enabled = el("chk-wg-enabled").checked;
-    c.wireguard.endpoint_host = el("inp-wg-host").value.trim();
-    c.wireguard.listen_port = parseInt(el("inp-wg-port").value, 10) || 51820;
-    c.wireguard.subnet_cidr = el("inp-wg-subnet").value.trim();
-
-    c.ddns.enabled = el("chk-ddns-enabled").checked;
-    c.ddns.enable_ipv6 = el("chk-ddns-v6").checked;
-    c.ddns.domain = el("inp-ddns-domain").value.trim();
-    c.ddns.cf_token = el("inp-ddns-token").value.trim();
+    d.hosts = hosts;
+    d.whitelist_domains = splitList($("dns-white-dom").value);
+    d.blacklist_domains = splitList($("dns-black-dom").value);
+    d.whitelist_ips = splitList($("dns-white-ip").value);
+    d.blacklist_ips = splitList($("dns-black-ip").value);
   }
 
-  async function refreshAll() {
-    var stRes = await apiFetch("/api/v1/status");
-    var stateRes = await apiFetch("/api/v1/state");
-    statusInfo = stRes;
-    appState = stateRes.state;
-    renderOverview();
-    renderNodesAndRouting();
-    renderDNSAndLists();
-    renderForwardAndRproxy();
-    renderWGAndDDNS();
-    renderSystem();
+  function collectForwardFromUI() {
+    var c = currentState.client;
+    c.fwd0 = {
+      enabled: $("fwd0-enabled").checked,
+      protocol: $("fwd0-proto").value,
+      port: Number($("fwd0-port").value || 9800),
+      path: $("fwd0-path").value.trim(),
+      uuids: splitList($("fwd0-uuids").value)
+    };
+    c.fwd1 = {
+      enabled: $("fwd1-enabled").checked,
+      protocol: $("fwd1-proto").value,
+      port: Number($("fwd1-port").value || 9801),
+      upstream_node_id: $("fwd1-upstream").value,
+      path: $("fwd1-path").value.trim(),
+      uuids: splitList($("fwd1-uuids").value)
+    };
+    c.rproxyc.enabled = $("rc-enabled").checked;
+    c.rproxyc.tunnel_address = $("rc-domain").value.trim();
+    c.rproxyc.tunnel_port = Number($("rc-port").value || 20000);
+    c.rproxyc.tunnel_uuid = $("rc-uuid").value.trim();
+    c.rproxyc.security = $("rc-security").value;
+    c.rproxyc.server_name = $("rc-sni").value.trim();
+    c.rproxyc.pinned_peer_cert_sha256 = $("rc-pin").value.trim();
+    c.rproxyc.out_direct = $("rc-out-direct").checked;
   }
 
-  function startLogStream() {
-    if (logSource) logSource.close();
-    var box = el("log-stream");
+  function collectWGFromUI() {
+    var wg = currentState.client.wireguard;
+    wg.enabled = $("wg-enabled").checked;
+    wg.endpoint_host = $("wg-endpoint").value.trim();
+    wg.listen_port = Number($("wg-port").value || 51820);
+    wg.subnet_cidr = $("wg-subnet").value.trim();
+  }
+
+  function collectDDNSFromUI() {
+    var ddns = currentState.client.ddns;
+    ddns.enabled = $("ddns-enabled").checked;
+    ddns.domain = $("ddns-domain").value.trim();
+    ddns.cf_email = $("ddns-email").value.trim();
+    if ($("ddns-token").value.trim()) {
+      ddns.cf_token = $("ddns-token").value.trim();
+    }
+    ddns.enable_ipv6 = $("ddns-v6").checked;
+  }
+
+  function collectServerFromUI() {
+    var srv = currentState.server;
+    srv.protocol = $("srv-proto").value;
+    srv.tls_mode = $("srv-tls-mode").value;
+    srv.domain = $("srv-domain").value.trim();
+    srv.connect_host = $("srv-connect-host").value.trim();
+    srv.listen_port = Number($("srv-port").value || 443);
+    srv.public_port = Number($("srv-pub-port").value || 0);
+    srv.path = $("srv-path").value.trim();
+    srv.camouflage_dir = $("srv-camo-dir").value.trim();
+    srv.uuids = splitList($("srv-uuids").value);
+    srv.enable_doh = $("srv-enable-doh").checked;
+  }
+
+  function collectRproxySFromUI() {
+    var rs = currentState.rproxys;
+    rs.enabled = $("rs-enabled").checked;
+    rs.domain = $("rs-domain").value.trim();
+    rs.listen_port = Number($("rs-port").value || 20000);
+    rs.security = $("rs-security").value;
+    rs.uuids = splitList($("rs-uuids").value);
+    rs.in_uuids = splitList($("rs-in-uuids").value);
+  }
+
+  async function saveAndApplyState(msg) {
+    try {
+      var res = await api("PUT", "/api/v1/state", currentState);
+      currentState = res.state;
+      currentSecrets = res.secrets || {};
+      showToast(res.restarted_daemon ? "监听地址已变更，daemon 正在重启，请使用新端口刷新" : (msg || "已保存并应用"));
+      await refreshAll();
+    } catch (e) { showToast(e.message, true); }
+  }
+
+  async function loadRulesStatus() {
+    try {
+      var res = await api("GET", "/api/v1/rules/status");
+      var tbody = $("rules-tbody");
+      clearEl(tbody);
+      (res.files || []).forEach(function (f) {
+        var tr = make("tr");
+        tr.appendChild(make("td", "mono", f.name));
+        tr.appendChild(make("td", "", f.exists ? "已就绪" : "缺失"));
+        tr.appendChild(make("td", "", f.exists ? (Math.round(f.size_bytes / 1024) + " KB") : "-"));
+        tr.appendChild(make("td", "mono", f.mod_time ? f.mod_time.slice(0, 19).replace("T", " ") : "-"));
+        tbody.appendChild(tr);
+      });
+    } catch (_) {}
+  }
+
+  function connectLogs() {
+    if (logSource) { logSource.close(); }
     logSource = new EventSource("/api/v1/logs/stream");
     logSource.onmessage = function (ev) {
+      if (logsPaused) { return; }
       try {
         var entry = JSON.parse(ev.data);
-        var line = "[" + entry.time + "] [" + entry.level + "] [" + entry.subsystem + "] " + entry.message + "\n";
-        box.textContent += line;
+        var box = $("log-box");
+        box.textContent += "[" + (entry.time || "").slice(11, 19) + "] " + entry.level + " [" + entry.source + "] " + entry.message + "\n";
         box.scrollTop = box.scrollHeight;
       } catch (_) {}
     };
   }
 
-  function bindEvents() {
-    el("modal-close").addEventListener("click", closeModal);
+  // Event bindings
+  document.querySelectorAll("#main-tabs .tab").forEach(function (t) {
+    t.addEventListener("click", function () { setTab(t.getAttribute("data-tab")); });
+  });
+  $("modal-close").addEventListener("click", closeModal);
+  $("modal-backdrop").addEventListener("click", function (ev) {
+    if (ev.target === $("modal-backdrop")) { closeModal(); }
+  });
 
-    document.querySelectorAll("#nav-tabs .tab").forEach(function (btn) {
-      btn.addEventListener("click", function () {
-        document.querySelectorAll("#nav-tabs .tab").forEach(function (b) { b.classList.remove("active"); });
-        document.querySelectorAll(".tab-panel").forEach(function (p) { p.classList.remove("active"); });
-        btn.classList.add("active");
-        el("tab-" + btn.getAttribute("data-tab")).classList.add("active");
-      });
-    });
-
-    el("login-form").addEventListener("submit", async function (ev) {
-      ev.preventDefault();
-      el("login-error").classList.add("hidden");
-      try {
-        var res = await apiFetch("/api/v1/auth/login", {
-          method: "POST",
-          body: { password: el("login-password").value }
-        });
-        csrfToken = res.csrf_token || "";
-        el("login-password").value = "";
-        showApp();
-        await refreshAll();
-      } catch (e) {
-        el("login-error").textContent = e.message;
-        el("login-error").classList.remove("hidden");
-      }
-    });
-
-    el("btn-logout").addEventListener("click", async function () {
-      try { await apiFetch("/api/v1/auth/logout", { method: "POST" }); } catch (_) {}
-      csrfToken = "";
-      showLogin();
-    });
-
-    el("btn-apply").addEventListener("click", async function () {
-      try {
-        collectFormIntoState();
-        await apiFetch("/api/v1/state", { method: "PUT", body: appState });
-        showToast("配置已验证并成功应用");
-        await refreshAll();
-      } catch (e) { showToast(e.message, true); }
-    });
-
-    el("btn-refresh-status").addEventListener("click", function () {
-      refreshAll().catch(function (e) { showToast(e.message, true); });
-    });
-
-    el("btn-probe-all").addEventListener("click", async function () {
-      try {
-        var res = await apiFetch("/api/v1/nodes/probe", { method: "POST", body: {} });
-        (res.results || []).forEach(function (r) {
-          var target = el("probe-" + r.node_id);
-          if (target) {
-            target.textContent = r.healthy ? ("健康 " + r.latency_ms + "ms") : ("不可达 (" + (r.error || r.status_code) + ")");
-          }
-        });
-        showToast("节点探活完成");
-      } catch (e) { showToast(e.message, true); }
-    });
-
-    el("btn-add-node").addEventListener("click", function () {
-      openModal("添加出站节点", function (body) {
-        var fields = [
-          ["name", "名称", "text", "新节点"],
-          ["protocol", "协议 (vless-xhttp / vless-reality / vless-ws / vmess-ws / socks5)", "text", "vless-xhttp"],
-          ["address", "服务器地址", "text", ""],
-          ["port", "端口", "number", "443"],
-          ["uuid", "UUID", "text", ""],
-          ["tls_sni", "TLS SNI (可选)", "text", ""],
-          ["path", "Path (可选)", "text", ""]
-        ];
-        var inputs = {};
-        fields.forEach(function (f) {
-          var lbl = make("label", "field");
-          lbl.appendChild(make("span", "", f[1]));
-          var inp = document.createElement("input");
-          inp.type = f[2];
-          inp.value = f[3];
-          lbl.appendChild(inp);
-          body.appendChild(lbl);
-          inputs[f[0]] = inp;
-        });
-        var okBtn = make("button", "btn primary", "添加到列表（点击顶部 Apply 生效）");
-        okBtn.addEventListener("click", function () {
-          appState.client.nodes.push({
-            id: "node-" + Date.now(),
-            name: inputs.name.value.trim(),
-            protocol: inputs.protocol.value.trim() || "vless-xhttp",
-            address: inputs.address.value.trim(),
-            port: parseInt(inputs.port.value, 10) || 443,
-            uuid: inputs.uuid.value.trim(),
-            tls_sni: inputs.tls_sni.value.trim(),
-            path: inputs.path.value.trim()
-          });
-          if (!appState.client.active_node_id && appState.client.nodes.length > 0) {
-            appState.client.active_node_id = appState.client.nodes[0].id;
-          }
-          renderNodesAndRouting();
-          closeModal();
-        });
-        body.appendChild(okBtn);
-      });
-    });
-
-    el("btn-add-relay").addEventListener("click", function () {
-      openModal("添加端口转发规则", function (body) {
-        var fields = [
-          ["listen", "本机监听端口", "number", "10001"],
-          ["target_host", "目标主机", "text", ""],
-          ["target_port", "目标端口", "number", "443"],
-          ["proto", "协议 (tcp / udp / tcp,udp)", "text", "tcp"],
-          ["engine", "引擎 (nft / haproxy / xray)", "text", "nft"]
-        ];
-        var inputs = {};
-        fields.forEach(function (f) {
-          var lbl = make("label", "field");
-          lbl.appendChild(make("span", "", f[1]));
-          var inp = document.createElement("input");
-          inp.type = f[2];
-          inp.value = f[3];
-          lbl.appendChild(inp);
-          body.appendChild(lbl);
-          inputs[f[0]] = inp;
-        });
-        var okBtn = make("button", "btn primary", "添加规则");
-        okBtn.addEventListener("click", function () {
-          if (!appState.relay) appState.relay = { forwards: [] };
-          if (!appState.relay.forwards) appState.relay.forwards = [];
-          appState.relay.forwards.push({
-            id: "fwd-" + Date.now(),
-            listen_port: parseInt(inputs.listen.value, 10) || 0,
-            target_host: inputs.target_host.value.trim(),
-            target_port: parseInt(inputs.target_port.value, 10) || 443,
-            proto: inputs.proto.value.trim() || "tcp",
-            engine: inputs.engine.value.trim() || "nft"
-          });
-          renderForwardAndRproxy();
-          closeModal();
-        });
-        body.appendChild(okBtn);
-      });
-    });
-
-    el("btn-add-wg-peer").addEventListener("click", async function () {
-      var name = window.prompt("请输入新 WireGuard 客户端名称（例如 laptop）：", "peer-" + ((appState.client.wireguard.peers || []).length + 1));
-      if (!name) return;
-      try {
-        await apiFetch("/api/v1/wireguard/peers", { method: "POST", body: { name: name } });
-        showToast("已生成 WireGuard 客户端 " + name);
-        await refreshAll();
-      } catch (e) { showToast(e.message, true); }
-    });
-
-    el("btn-ddns-sync").addEventListener("click", async function () {
-      try {
-        var res = await apiFetch("/api/v1/ddns/sync", { method: "POST", body: {} });
-        showToast("DDNS 同步成功: " + (res.sync && res.sync.ipv4 ? res.sync.ipv4 : "OK"));
-      } catch (e) { showToast(e.message, true); }
-    });
-
-    el("btn-change-pw").addEventListener("click", async function () {
-      try {
-        var res = await apiFetch("/api/v1/auth/password", {
-          method: "POST",
-          body: { current_password: el("inp-pw-cur").value, new_password: el("inp-pw-new").value }
-        });
-        if (res.csrf_token) csrfToken = res.csrf_token;
-        el("inp-pw-cur").value = "";
-        el("inp-pw-new").value = "";
-        showToast("登录密码已更新");
-      } catch (e) { showToast(e.message, true); }
-    });
-
-    async function doMigrate(apply) {
-      try {
-        var res = await apiFetch("/api/v1/migrate", {
-          method: "POST",
-          body: {
-            kind: el("sel-mig-kind").value,
-            path: el("inp-mig-path").value.trim(),
-            raw_json: el("txt-mig-json").value,
-            apply: apply
-          }
-        });
-        showToast("导入成功（" + (res.notes ? res.notes.length : 0) + " 条迁移说明）");
-        await refreshAll();
-      } catch (e) { showToast(e.message, true); }
-    }
-    el("btn-mig-import").addEventListener("click", function () { doMigrate(false); });
-    el("btn-mig-apply").addEventListener("click", function () { doMigrate(true); });
-    el("btn-clear-logs").addEventListener("click", function () { el("log-stream").textContent = ""; });
-  }
-
-  async function boot() {
-    bindEvents();
+  $("login-form").addEventListener("submit", async function (ev) {
+    ev.preventDefault();
+    var errBox = $("login-error");
+    errBox.classList.add("hidden");
     try {
-      var sess = await apiFetch("/api/v1/auth/session");
-      if (sess.authenticated) {
-        csrfToken = sess.csrf_token || "";
-        showApp();
-        await refreshAll();
-        return;
-      }
-    } catch (_) {}
-    showLogin();
-  }
+      var res = await api("POST", "/api/v1/auth/login", { password: $("login-password").value });
+      csrfToken = res.csrf_token || "";
+      $("login-password").value = "";
+      $("login-view").classList.add("hidden");
+      $("app-view").classList.remove("hidden");
+      await refreshAll();
+      connectLogs();
+    } catch (e) {
+      errBox.textContent = e.message;
+      errBox.classList.remove("hidden");
+    }
+  });
 
-  boot();
+  $("btn-logout").addEventListener("click", async function () {
+    try { await api("POST", "/api/v1/auth/logout", {}); } catch (_) {}
+    csrfToken = "";
+    if (logSource) { logSource.close(); logSource = null; }
+    $("app-view").classList.add("hidden");
+    $("login-view").classList.remove("hidden");
+  });
+
+  $("btn-apply-now").addEventListener("click", async function () {
+    try {
+      await api("POST", "/api/v1/apply", {});
+      showToast("配置已应用");
+      await refreshAll();
+    } catch (e) { showToast(e.message, true); }
+  });
+
+  $("btn-force-restart-apply").addEventListener("click", async function () {
+    try {
+      await api("POST", "/api/v1/apply?force=1&restart_all=1", {});
+      showToast("已全量重启并应用配置");
+      await refreshAll();
+    } catch (e) { showToast(e.message, true); }
+  });
+
+  $("btn-proxy-restart").addEventListener("click", async function () {
+    try {
+      var res = await api("POST", "/api/v1/proxy/restart", {});
+      showToast("已重启: " + (res.restarted || []).join(", "));
+      await refreshAll();
+    } catch (e) { showToast(e.message, true); }
+  });
+
+  $("btn-proxy-stop").addEventListener("click", async function () {
+    if (!window.confirm("确认停止本地代理服务 (xray / mosdns / nft)?")) { return; }
+    try {
+      var res = await api("POST", "/api/v1/proxy/stop", {});
+      showToast("已停止: " + (res.stopped || []).join(", "));
+      await refreshAll();
+    } catch (e) { showToast(e.message, true); }
+  });
+
+  $("btn-probe-conn").addEventListener("click", async function () {
+    var box = $("conn-results");
+    clearEl(box);
+    box.appendChild(make("div", "muted", "正在探测..."));
+    try {
+      var res = await api("POST", "/api/v1/connectivity", { with_ips: true });
+      clearEl(box);
+      [
+        { title: "国内直连 (CN Direct)", d: res.cn || {}, ip: res.cn_ip },
+        { title: "国际代理 (Global Proxy)", d: res.global || {}, ip: res.global_ip }
+      ].forEach(function (item) {
+        var el = make("div", "conn-box");
+        el.appendChild(make("div", "", item.title));
+        el.appendChild(make("span", item.d.ok ? "status-badge ok mt" : "status-badge fail mt",
+          item.d.ok ? ("正常 · " + item.d.latency_ms + " ms") : (item.d.error || "不可达")));
+        if (item.ip) { el.appendChild(make("div", "mono muted mt", "Exit IP: " + item.ip)); }
+        box.appendChild(el);
+      });
+    } catch (e) {
+      clearEl(box);
+      showToast(e.message, true);
+    }
+  });
+
+  $("btn-server-main-qr").addEventListener("click", function () {
+    showQRModal("服务端主节点", statusInfo && statusInfo.server_main_uri);
+  });
+  $("btn-server-doh-qr").addEventListener("click", function () {
+    showQRModal("服务端 DoH 端点", statusInfo && statusInfo.doh_url);
+  });
+
+  $("btn-add-node").addEventListener("click", function () { openNodeModal(null, -1); });
+  $("btn-probe-nodes").addEventListener("click", async function () {
+    try {
+      var res = await api("POST", "/api/v1/nodes/probe", {});
+      (res.results || []).forEach(function (r) { probeResultsMap[r.node_id] = r; });
+      renderNodesTable();
+      renderQuickNodes();
+      showToast("节点测速完成");
+    } catch (e) { showToast(e.message, true); }
+  });
+  $("btn-save-nodes").addEventListener("click", function () {
+    currentState.client.failover_enabled = $("failover-enabled").checked;
+    saveAndApplyState("节点列表已保存并应用");
+  });
+
+  $("btn-nodesm-reset").addEventListener("click", function () {
+    var activeID = currentState.client.active_node_id || (currentState.client.nodes[0] && currentState.client.nodes[0].id) || "";
+    document.querySelectorAll("[data-nodesm-svc]").forEach(function (sel) { sel.value = activeID; });
+  });
+  $("btn-nodesm-clear").addEventListener("click", function () {
+    document.querySelectorAll("[data-nodesm-svc]").forEach(function (sel) { sel.value = ""; });
+  });
+  $("btn-save-routing").addEventListener("click", function () {
+    collectRoutingFromUI();
+    saveAndApplyState("分流规则已保存并应用");
+  });
+
+  $("btn-probe-doh").addEventListener("click", async function () {
+    var box = $("doh-probe-results");
+    clearEl(box);
+    box.appendChild(make("div", "muted", "正在探测 DoH 上游..."));
+    try {
+      var res = await api("POST", "/api/v1/nodes/probe", { include_doh: true });
+      clearEl(box);
+      (res.doh_results || []).forEach(function (r) {
+        var el = make("div", "conn-box");
+        el.appendChild(make("div", "mono", r.url));
+        el.appendChild(make("span", r.ok ? "status-badge ok mt" : "status-badge fail mt",
+          r.ok ? ("正常 · " + r.latency_ms + " ms") : (r.error || "失败")));
+        box.appendChild(el);
+      });
+    } catch (e) { clearEl(box); showToast(e.message, true); }
+  });
+  $("btn-save-dns").addEventListener("click", function () {
+    collectDNSFromUI();
+    saveAndApplyState("DNS 配置已保存并应用");
+  });
+  $("btn-refresh-rules-status").addEventListener("click", loadRulesStatus);
+  $("btn-update-rules").addEventListener("click", async function () {
+    try {
+      await api("POST", "/api/v1/rules/update", { include_ads: $("rules-include-ads").checked });
+      showToast("规则库热更新成功");
+      await loadRulesStatus();
+    } catch (e) { showToast(e.message, true); }
+  });
+
+  $("btn-fwd0-qr").addEventListener("click", function () { showQRModal("FWD0 分享链接", statusInfo && statusInfo.fwd0_uri); });
+  $("btn-fwd1-qr").addEventListener("click", function () { showQRModal("FWD1 分享链接", statusInfo && statusInfo.fwd1_uri); });
+  $("btn-client-add-relay").addEventListener("click", function () { openRelayModal($("client-relay-tbody")); });
+  $("btn-rc-add-map").addEventListener("click", function () {
+    openModal("添加 RproxyC 内网映射", function (body) {
+      function fld(lbl, el) { var l = make("label", "mt", lbl); l.appendChild(el); body.appendChild(l); return el; }
+      var fSP = fld("公网监听端口 (ext_port)", make("input")); fSP.type = "number"; fSP.value = "18080";
+      var fCH = fld("内网目标主机 (int_ip)", make("input")); fCH.value = "127.0.0.1";
+      var fCP = fld("内网目标端口 (int_port)", make("input")); fCP.type = "number"; fCP.value = "80";
+      var fPr = make("select"); ["tcp", "udp", "tcp,udp"].forEach(function (p) { var o = make("option", "", p); o.value = p; fPr.appendChild(o); }); fld("协议", fPr);
+      var b = make("button", "btn primary mt", "加入映射");
+      b.addEventListener("click", function () {
+        currentState.client.rproxyc.mappings = currentState.client.rproxyc.mappings || [];
+        currentState.client.rproxyc.mappings.push({
+          ext_port: Number(fSP.value),
+          int_ip: fCH.value.trim(),
+          int_port: Number(fCP.value),
+          proto: fPr.value
+        });
+        renderRproxyCMappings();
+        closeModal();
+      });
+      body.appendChild(b);
+    });
+  });
+  $("btn-save-forward").addEventListener("click", function () {
+    collectForwardFromUI();
+    saveAndApplyState("转发与 RproxyC 已保存并应用");
+  });
+
+  $("btn-wg-regen-server").addEventListener("click", async function () {
+    if (!window.confirm("重新生成服务端密钥将导致现有客户端配置失效，确认继续？")) { return; }
+    try {
+      await api("POST", "/api/v1/wireguard/regen-server", {});
+      showToast("服务端 WireGuard 密钥已更新");
+      await refreshAll();
+    } catch (e) { showToast(e.message, true); }
+  });
+  $("btn-wg-add-peer").addEventListener("click", async function () {
+    var name = $("wg-peer-name").value.trim();
+    if (!name) { showToast("请输入 Peer 名称", true); return; }
+    try {
+      await api("POST", "/api/v1/wireguard/peers", { name: name });
+      $("wg-peer-name").value = "";
+      showToast("已添加 WireGuard Peer " + name);
+      await refreshAll();
+    } catch (e) { showToast(e.message, true); }
+  });
+  $("btn-save-wg").addEventListener("click", function () {
+    collectWGFromUI();
+    saveAndApplyState("WireGuard 配置已保存并应用");
+  });
+
+  $("btn-save-ddns").addEventListener("click", function () {
+    collectDDNSFromUI();
+    saveAndApplyState("DDNS 配置已保存并应用");
+  });
+  $("btn-ddns-sync").addEventListener("click", async function () {
+    try {
+      var res = await api("POST", "/api/v1/ddns/sync", {});
+      var s = res.sync || {};
+      showToast("DDNS 同步完成 (" + (s.ipv4 || "-") + " / " + (s.ipv6 || "-") + ")");
+    } catch (e) { showToast(e.message, true); }
+  });
+  $("btn-ddns-check-ips").addEventListener("click", async function () {
+    try {
+      var res = await api("POST", "/api/v1/connectivity", { with_ips: true });
+      $("ddns-ip-result").textContent = "本机直连 IPv4: " + (res.cn_ip || "未知") + " | 代理出口 IP: " + (res.global_ip || "未知");
+    } catch (e) { showToast(e.message, true); }
+  });
+
+  // Server / Landing / Relay handlers
+  $("btn-srv-gen-uuid").addEventListener("click", function () {
+    var cur = splitList($("srv-uuids").value);
+    cur.push(genUUID());
+    $("srv-uuids").value = cur.join("\n");
+  });
+  $("btn-save-server").addEventListener("click", function () {
+    collectServerFromUI();
+    saveAndApplyState("服务端主入站已保存并应用");
+  });
+  $("btn-add-socks5").addEventListener("click", function () { openSocks5Modal(null, -1); });
+  $("btn-save-socks5").addEventListener("click", function () { saveAndApplyState("SOCKS5 出口配置已保存并应用"); });
+  $("btn-add-extra").addEventListener("click", function () { openExtraModal(null, -1); });
+  $("btn-disable-all-extra").addEventListener("click", function () {
+    currentState.extra_inbounds = [];
+    renderExtraTable();
+  });
+  $("btn-save-extra").addEventListener("click", function () { saveAndApplyState("附加协议配置已保存并应用"); });
+
+  $("btn-srv-add-relay").addEventListener("click", function () { openRelayModal($("srv-relay-tbody")); });
+  $("btn-rs-add-map").addEventListener("click", function () {
+    openModal("添加 RproxyS 公网端口映射", function (body) {
+      function fld(lbl, el) { var l = make("label", "mt", lbl); l.appendChild(el); body.appendChild(l); return el; }
+      var fP = fld("公网监听端口", make("input")); fP.type = "number"; fP.value = "18080";
+      var fPr = make("select"); ["tcp", "udp", "tcp,udp"].forEach(function (p) { var o = make("option", "", p); o.value = p; fPr.appendChild(o); }); fld("协议", fPr);
+      var b = make("button", "btn primary mt", "加入映射");
+      b.addEventListener("click", function () {
+        currentState.rproxys.mappings = currentState.rproxys.mappings || [];
+        currentState.rproxys.mappings.push({ port: Number(fP.value), proto: fPr.value });
+        renderRproxySMappings();
+        closeModal();
+      });
+      body.appendChild(b);
+    });
+  });
+  $("btn-save-relay-rproxys").addEventListener("click", function () {
+    collectRproxySFromUI();
+    saveAndApplyState("端口转发与 RproxyS 已保存并应用");
+  });
+
+  // System / Cert / Backup / Migrate
+  $("btn-cert-issue").addEventListener("click", async function () {
+    try {
+      await api("POST", "/api/v1/cert/issue", {
+        mode: $("cert-mode").value,
+        domain: $("cert-domain").value.trim(),
+        cf_email: $("cert-cf-email").value.trim(),
+        cf_token: $("cert-cf-token").value.trim(),
+        webroot: $("cert-webroot").value.trim(),
+        auto_renew: $("cert-auto-renew").checked
+      });
+      showToast("ACME 证书签发并加载成功");
+      await refreshAll();
+    } catch (e) { showToast(e.message, true); }
+  });
+  $("btn-cert-self-sign").addEventListener("click", async function () {
+    try {
+      await api("POST", "/api/v1/cert/self-sign", { cn: $("cert-domain").value.trim() || "localhost", force: true });
+      showToast("已重新生成自签证书");
+      await refreshAll();
+    } catch (e) { showToast(e.message, true); }
+  });
+  $("btn-cert-import").addEventListener("click", async function () {
+    try {
+      await api("POST", "/api/v1/cert/import", {
+        cert_pem: $("cert-imp-pem").value,
+        key_pem: $("cert-imp-key").value,
+        allow_self_signed: $("cert-imp-allow-self").checked
+      });
+      showToast("证书导入并热加载完成");
+      await refreshAll();
+    } catch (e) { showToast(e.message, true); }
+  });
+
+  $("btn-backup-download").addEventListener("click", function () {
+    window.location.href = "/api/v1/backup";
+  });
+  $("restore-file").addEventListener("change", function (ev) {
+    var f = ev.target.files && ev.target.files[0];
+    if (!f) { return; }
+    var reader = new FileReader();
+    reader.onload = function () { $("restore-json").value = String(reader.result || ""); };
+    reader.readAsText(f);
+  });
+  $("btn-restore-v3").addEventListener("click", async function () {
+    try {
+      var res = await api("POST", "/api/v1/migrate", {
+        kind: "v3_state",
+        raw_json: $("restore-json").value,
+        apply: $("restore-apply").checked
+      });
+      showToast("备份恢复成功 (" + (res.notes || []).length + " 提示)");
+      await refreshAll();
+    } catch (e) { showToast(e.message, true); }
+  });
+
+  $("btn-migrate").addEventListener("click", async function () {
+    try {
+      var res = await api("POST", "/api/v1/migrate", {
+        kind: $("mig-kind").value,
+        path: $("mig-path").value.trim(),
+        raw_json: $("mig-raw").value,
+        apply: $("mig-apply").checked
+      });
+      showToast("导入成功 (" + (res.notes || []).length + " 条迁移提示)");
+      await refreshAll();
+    } catch (e) { showToast(e.message, true); }
+  });
+
+  $("btn-save-system").addEventListener("click", function () {
+    currentState.system.hostname = $("sys-hostname").value.trim();
+    currentState.system.auto_update_core = $("sys-auto-update-core").checked;
+    currentState.auth.listen_addr = $("auth-listen").value.trim() || ":8443";
+    saveAndApplyState("系统设置已保存并应用");
+  });
+  $("btn-update-core").addEventListener("click", async function () {
+    try {
+      await api("POST", "/api/v1/update", {
+        component: $("upd-component").value,
+        version: $("upd-version").value.trim()
+      });
+      showToast("组件更新完成");
+      await refreshAll();
+    } catch (e) { showToast(e.message, true); }
+  });
+  $("btn-change-pw").addEventListener("click", async function () {
+    try {
+      var res = await api("POST", "/api/v1/auth/password", {
+        old_password: $("pw-old").value,
+        new_password: $("pw-new").value
+      });
+      csrfToken = res.csrf_token || csrfToken;
+      $("pw-old").value = ""; $("pw-new").value = "";
+      showToast("密码已更新");
+    } catch (e) { showToast(e.message, true); }
+  });
+  $("btn-reboot").addEventListener("click", async function () {
+    if (!window.confirm("确认立即重启主机？")) { return; }
+    try {
+      await api("POST", "/api/v1/system/reboot", {});
+      showToast("已下发重启指令");
+    } catch (e) { showToast(e.message, true); }
+  });
+
+  $("btn-logs-toggle").addEventListener("click", function () {
+    logsPaused = !logsPaused;
+    $("btn-logs-toggle").textContent = logsPaused ? "恢复滚动" : "暂停滚动";
+  });
+  $("btn-logs-clear").addEventListener("click", function () { $("log-box").textContent = ""; });
+
+  initSession();
 })();

@@ -496,7 +496,7 @@ func TestReconcileSelectiveRestarts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile with RestartAll=true failed: %v", err)
 	}
-	wantAll := []string{"dex-nft", "dex-mosdns", "dex-xray", "wg-quick@wg0", "dex-rules-update.timer"}
+	wantAll := []string{"dex-nft", "dex-mosdns", "dex-xray", "wg-quick@wg0", "dex-refresh.timer", "dex-rules-update.timer"}
 	if !reflect.DeepEqual(exec.startedSvcs, wantAll) || !reflect.DeepEqual(resAll.ServicesRestarted, wantAll) {
 		t.Fatalf("expected RestartAll to restart %v, got started=%v res=%v", wantAll, exec.startedSvcs, resAll.ServicesRestarted)
 	}
@@ -658,6 +658,7 @@ func TestReconcileRollbackStopsNewlyStartedServicesBeforeDeletingUnits(t *testin
 			"dex-mosdns":             true,
 			"dex-xray":               true,
 			"dex-daemon":             true,
+			"dex-refresh.timer":      true,
 			"dex-rules-update.timer": true,
 		},
 	}
@@ -694,7 +695,7 @@ func TestReconcileRollbackStopsNewlyStartedServicesBeforeDeletingUnits(t *testin
 	}
 
 	// All newly started services must be stopped/disabled before their unit files are deleted.
-	expectedStopped := []string{"dex-nft", "dex-mosdns", "dex-xray", "dex-rules-update.timer", "dex-daemon"}
+	expectedStopped := []string{"dex-nft", "dex-mosdns", "dex-xray", "dex-refresh.timer", "dex-rules-update.timer", "dex-daemon"}
 	for _, svc := range expectedStopped {
 		found := false
 		for _, stopped := range exec.stoppedSvcs {

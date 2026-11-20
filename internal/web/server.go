@@ -1,9 +1,11 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"crypto/tls"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
@@ -13,9 +15,11 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
-	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +30,7 @@ import (
 	"github.com/stuinxo/de_GWD/v3/internal/migrate"
 	"github.com/stuinxo/de_GWD/v3/internal/reconcile"
 	"github.com/stuinxo/de_GWD/v3/internal/render"
+	"github.com/stuinxo/de_GWD/v3/internal/socks5out"
 	"github.com/stuinxo/de_GWD/v3/internal/state"
 	"github.com/stuinxo/de_GWD/v3/internal/version"
 )
@@ -47,6 +52,15 @@ type sessionRecord struct {
 	expiresAt time.Time
 }
 
+// DoHProbeResult reports reachability and RTT for a DoH/DoT/DoQ upstream URL.
+type DoHProbeResult struct {
+	URL       string `json:"url"`
+	OK        bool   `json:"ok"`
+	Status    int    `json:"status_code,omitempty"`
+	LatencyMS int64  `json:"latency_ms"`
+	Error     string `json:"error,omitempty"`
+}
+
 // Server serves the embedded Web UI and fail-closed REST/SSE API.
 type Server struct {
 	Store     *state.Store
@@ -56,7 +70,15 @@ type Server struct {
 	ApplyOpts reconcile.ApplyOptions
 	StartedAt time.Time
 
-	ProbeNodeFn func(ctx context.Context, n state.OutboundNode) daemon.ProbeNodeResult
+	ProbeNodeFn         func(ctx context.Context, n state.OutboundNode) daemon.ProbeNodeResult
+	ProbeDoHFn          func(ctx context.Context, rawURL string) DoHProbeResult
+	ProbeConnectivityFn func(ctx context.Context) (cn, global daemon.ConnectivityCheck)
+	ProbeSocks5Fn       func(ctx context.Context, host string, port int, user, pass string, testURLs []string) (*socks5out.ProbeResult, error)
+	UpdateRulesFn       func(ctx context.Context, includeAds bool, w io.Writer) error
+	UpdateComponentsFn  func(ctx context.Context, component, ver string, w io.Writer) error
+	ReloadCertFn        func(ctx context.Context)
+	CertReloadCmd       string
+	CertRunner          cert.ACMERunner
 
 	sessMu   sync.RWMutex
 	sessions map[string]*sessionRecord
@@ -88,8 +110,10 @@ func NewServer(store *state.Store, exec reconcile.SystemExecutor, hub *daemon.Ta
 		ProbeNodeFn: func(ctx context.Context, n state.OutboundNode) daemon.ProbeNodeResult {
 			return daemon.ProbeNodeHealth(ctx, n, 5*time.Second, false)
 		},
-		sessions: make(map[string]*sessionRecord),
-		failures: make(map[string][]time.Time),
+		ProbeConnectivityFn: daemon.ProbeConnectivity,
+		ProbeSocks5Fn:       socks5out.ProbeProfile,
+		sessions:            make(map[string]*sessionRecord),
+		failures:            make(map[string][]time.Time),
 	}
 	s.handler = s.buildRouter()
 	return s
@@ -114,11 +138,26 @@ func (s *Server) buildRouter() http.Handler {
 	mux.HandleFunc("PUT /api/v1/state", s.requireAuth(true, s.handlePutState))
 	mux.HandleFunc("POST /api/v1/nodes/select", s.requireAuth(true, s.handleSelectNode))
 	mux.HandleFunc("POST /api/v1/nodes/probe", s.requireAuth(true, s.handleProbeNodes))
+	mux.HandleFunc("POST /api/v1/nodes/parse-uri", s.requireAuth(true, s.handleParseNodeURI))
+	mux.HandleFunc("POST /api/v1/connectivity", s.requireAuth(true, s.handleConnectivity))
+	mux.HandleFunc("POST /api/v1/proxy/stop", s.requireAuth(true, s.handleProxyStop))
+	mux.HandleFunc("POST /api/v1/proxy/restart", s.requireAuth(true, s.handleProxyRestart))
+	mux.HandleFunc("POST /api/v1/socks5/test", s.requireAuth(true, s.handleTestSocks5))
+	mux.HandleFunc("GET /api/v1/rules/status", s.requireAuth(false, s.handleRulesStatus))
+	mux.HandleFunc("POST /api/v1/rules/update", s.requireAuth(true, s.handleRulesUpdate))
+	mux.HandleFunc("POST /api/v1/update", s.requireAuth(true, s.handleUpdateComponents))
+	mux.HandleFunc("POST /api/v1/cert/issue", s.requireAuth(true, s.handleCertIssue))
+	mux.HandleFunc("POST /api/v1/cert/import", s.requireAuth(true, s.handleCertImport))
+	mux.HandleFunc("POST /api/v1/cert/self-sign", s.requireAuth(true, s.handleCertSelfSign))
+	mux.HandleFunc("POST /api/v1/wireguard/regen-server", s.requireAuth(true, s.handleRegenWGServer))
 	mux.HandleFunc("POST /api/v1/wireguard/peers", s.requireAuth(true, s.handleAddWGPeer))
+	mux.HandleFunc("POST /api/v1/wireguard/peers/{name}/regen", s.requireAuth(true, s.handleRegenWGPeer))
 	mux.HandleFunc("GET /api/v1/wireguard/peers/{name}/config", s.requireAuth(false, s.handleWGPeerConfig))
 	mux.HandleFunc("POST /api/v1/ddns/sync", s.requireAuth(true, s.handleDDNSSync))
+	mux.HandleFunc("GET /api/v1/backup", s.requireAuth(false, s.handleBackup))
 	mux.HandleFunc("POST /api/v1/migrate", s.requireAuth(true, s.handleMigrate))
 	mux.HandleFunc("POST /api/v1/apply", s.requireAuth(true, s.handleApply))
+	mux.HandleFunc("POST /api/v1/system/reboot", s.requireAuth(true, s.handleSystemReboot))
 	mux.HandleFunc("GET /api/v1/logs/stream", s.requireAuth(false, s.handleLogsStream))
 
 	// Embedded UI static assets
@@ -425,6 +464,69 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request, se
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "csrf_token": sess.csrfToken})
 }
 
+func firstNonEmptyStr(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func buildExtraURI(st *state.State, ex state.ExtraInbound) string {
+	host := strings.TrimSpace(ex.Domain)
+	if host == "" && st != nil {
+		host = st.Server.EffectiveConnectHost()
+	}
+	if host == "" {
+		host = "node.example.com"
+	}
+	path := ex.Path
+	if ex.Protocol == "vless-xhttp" || ex.Protocol == "vless-ws" || ex.Protocol == "vmess-ws" {
+		path = render.NormalizePath(ex.Path, ex.UUID)
+	}
+	return render.BuildNodeURI(state.OutboundNode{
+		Name:           ex.Tag,
+		Protocol:       ex.Protocol,
+		Address:        host,
+		Port:           ex.ListenPort,
+		UUID:           ex.UUID,
+		TLSSNI:         firstNonEmptyStr(ex.RealitySNI, ex.Domain, host),
+		Path:           path,
+		RealityPubKey:  ex.RealityPubKey,
+		RealityShortID: ex.RealityShortID,
+		Username:       ex.SocksUser,
+		Password:       ex.SocksPass,
+	})
+}
+
+func readHostUptimeSec(fallback time.Time) int64 {
+	if b, err := os.ReadFile("/proc/uptime"); err == nil {
+		fields := strings.Fields(string(b))
+		if len(fields) > 0 {
+			if f, ferr := strconv.ParseFloat(fields[0], 64); ferr == nil && f >= 0 {
+				return int64(f)
+			}
+		}
+	}
+	return int64(time.Since(fallback).Seconds())
+}
+
+func (s *Server) scheduleDaemonRestart(reason string) {
+	if s.Exec == nil {
+		return
+	}
+	initSys := s.Exec.DetectInitSystem()
+	if !s.Exec.ServiceIsActive(context.Background(), initSys, "dex-daemon") {
+		return
+	}
+	s.Hub.Log("INFO", "daemon", reason+"; scheduling async dex-daemon restart")
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		_ = s.Exec.ServiceRestart(context.Background(), initSys, "dex-daemon")
+	}()
+}
+
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
 	st, err := s.Store.Load()
 	if err != nil {
@@ -433,15 +535,50 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, _ *session
 	}
 
 	initSys := s.Exec.DetectInitSystem()
-	svcs := map[string]bool{
-		"dex-xray":   s.Exec.ServiceIsActive(r.Context(), initSys, "dex-xray"),
-		"dex-mosdns": s.Exec.ServiceIsActive(r.Context(), initSys, "dex-mosdns"),
-		"dex-nft":    s.Exec.ServiceIsActive(r.Context(), initSys, "dex-nft"),
-		"dex-doh":    s.Exec.ServiceIsActive(r.Context(), initSys, "dex-doh"),
-		"haproxy":    s.Exec.ServiceIsActive(r.Context(), initSys, "haproxy"),
-		"nginx":      s.Exec.ServiceIsActive(r.Context(), initSys, "nginx"),
-		"wireguard":  s.Exec.ServiceIsActive(r.Context(), initSys, "wg-quick@wg0"),
+	wgUnit := "wg-quick@wg0"
+	if initSys == "openrc" {
+		wgUnit = "wg-quick.wg0"
 	}
+	checkSvc := func(unit string) bool {
+		return s.Exec.ServiceIsActive(r.Context(), initSys, unit)
+	}
+	svcs := map[string]bool{
+		"dex-xray":   checkSvc("dex-xray"),
+		"dex-daemon": checkSvc("dex-daemon"),
+	}
+	if st.Role == state.RoleClient {
+		svcs["dex-mosdns"] = checkSvc("dex-mosdns")
+		svcs["dex-nft"] = checkSvc("dex-nft")
+		if st.Client.WireGuard.Enabled || checkSvc(wgUnit) {
+			svcs["wireguard"] = checkSvc(wgUnit)
+		}
+		for _, opt := range []string{"haproxy", "nginx", "dex-doh"} {
+			if checkSvc(opt) {
+				svcs[opt] = true
+			}
+		}
+	} else {
+		needsNginx := st.Role == state.RoleServer && st.Server.TLSMode == "nginx"
+		for _, ex := range st.ExtraInbounds {
+			if ex.ViaNginx {
+				needsNginx = true
+				break
+			}
+		}
+		if needsNginx || checkSvc("nginx") {
+			svcs["nginx"] = checkSvc("nginx")
+		}
+		if (st.Role == state.RoleServer && st.Server.TLSMode == "nginx" && st.Server.EnableDoH) || checkSvc("dex-doh") {
+			svcs["dex-doh"] = checkSvc("dex-doh")
+		}
+		if len(st.Relay.Forwards) > 0 || checkSvc("dex-nft") {
+			svcs["dex-nft"] = checkSvc("dex-nft")
+		}
+		if checkSvc("haproxy") {
+			svcs["haproxy"] = true
+		}
+	}
+	proxyPaused := st.Role == state.RoleClient && !svcs["dex-xray"] && !svcs["dex-nft"]
 
 	var certSummary any
 	certPath := s.Store.DefaultCert()
@@ -462,23 +599,50 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, _ *session
 	for _, n := range st.Client.Nodes {
 		nodeURIs[n.ID] = render.BuildNodeURI(n)
 	}
+	extraURIs := make(map[string]string, len(st.ExtraInbounds))
+	for _, ex := range st.ExtraInbounds {
+		if u := buildExtraURI(st, ex); u != "" {
+			extraURIs[ex.Tag] = u
+		}
+	}
 	serverMainURI := ""
 	if st.Role == state.RoleServer || st.Role == state.RoleLanding {
 		serverMainURI = render.BuildServerMainURI(st)
 	}
-
 	hostname, _ := os.Hostname()
+	dohURL := ""
+	if st.Role == state.RoleServer && st.Server.TLSMode == "nginx" && st.Server.EnableDoH {
+		dohHost := firstNonEmptyStr(st.Server.Domain, st.Server.EffectiveConnectHost(), hostname, "localhost")
+		if st.Server.EffectivePublicPort() == 443 {
+			dohURL = fmt.Sprintf("https://%s/dq", dohHost)
+		} else {
+			dohURL = fmt.Sprintf("https://%s:%d/dq", dohHost, st.Server.EffectivePublicPort())
+		}
+	}
+
+	kernelRel := ""
+	if kb, kerr := os.ReadFile("/proc/sys/kernel/osrelease"); kerr == nil {
+		kernelRel = strings.TrimSpace(string(kb))
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":          version.Summary(),
 		"role":             st.Role,
 		"hostname":         hostname,
+		"device_alias":     st.System.Hostname,
+		"arch":             runtime.GOOS + "/" + runtime.GOARCH,
+		"kernel":           kernelRel,
 		"mem_mb":           s.Exec.DetectMemMB(),
 		"init_system":      initSys,
 		"is_container":     s.Exec.DetectIsContainer(),
-		"uptime_sec":       int64(time.Since(s.StartedAt).Seconds()),
+		"uptime_sec":       readHostUptimeSec(s.StartedAt),
+		"proxy_paused":     proxyPaused,
 		"services":         svcs,
 		"active_node_id":   st.Client.ActiveNodeID,
 		"node_uris":        nodeURIs,
+		"extra_uris":       extraURIs,
+		"fwd0_uri":         render.BuildFWDURI(st, "fwd0", ""),
+		"fwd1_uri":         render.BuildFWDURI(st, "fwd1", ""),
+		"doh_url":          dohURL,
 		"server_main_uri":  serverMainURI,
 		"node_sm_services": state.NodeSMServices,
 		"cert":             certSummary,
@@ -540,6 +704,31 @@ func (s *Server) handlePutState(w http.ResponseWriter, r *http.Request, _ *sessi
 			incoming.Client.DDNS.CFToken = cur.Client.DDNS.CFToken
 		}
 	}
+	for i := range incoming.ExtraInbounds {
+		ex := &incoming.ExtraInbounds[i]
+		if ex.Protocol == "vless-reality" {
+			if strings.TrimSpace(ex.UUID) == "" {
+				ex.UUID, _ = cryptoext.GenerateUUID()
+			}
+			if strings.TrimSpace(ex.RealityPrivKey) == "" {
+				if priv, pub, kerr := cryptoext.GenerateRealityKeypair(); kerr == nil {
+					ex.RealityPrivKey = priv
+					ex.RealityPubKey = pub
+				}
+			}
+			if strings.TrimSpace(ex.RealityShortID) == "" {
+				ex.RealityShortID, _ = cryptoext.GenerateHexToken(4)
+			}
+			if strings.TrimSpace(ex.RealitySNI) == "" {
+				ex.RealitySNI = "www.apple.com"
+			}
+			if strings.TrimSpace(ex.RealityDest) == "" {
+				ex.RealityDest = ex.RealitySNI + ":443"
+			}
+		} else if (ex.Protocol == "vless-xhttp" || ex.Protocol == "vless-ws" || ex.Protocol == "vmess-ws") && strings.TrimSpace(ex.UUID) == "" {
+			ex.UUID, _ = cryptoext.GenerateUUID()
+		}
+	}
 	if err := incoming.Validate(); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -559,6 +748,7 @@ func (s *Server) handlePutState(w http.ResponseWriter, r *http.Request, _ *sessi
 		return
 	}
 
+	listenChanged := cur != nil && strings.TrimSpace(cur.Auth.ListenAddr) != strings.TrimSpace(incoming.Auth.ListenAddr)
 	updated, applyRes, err := reconcile.UpdateAndReconcile(r.Context(), s.Store, incoming.Role, s.Exec, opts, func(dst *state.State) error {
 		*dst = incoming
 		return nil
@@ -569,12 +759,20 @@ func (s *Server) handlePutState(w http.ResponseWriter, r *http.Request, _ *sessi
 		return
 	}
 	s.Hub.Log("INFO", "apply", fmt.Sprintf("reconciled role=%s (%d files)", updated.Role, len(applyRes.FilesWritten)))
+	if listenChanged {
+		s.Hub.Log("INFO", "daemon", fmt.Sprintf("web listen_addr changed to %s; restarting dex-daemon", updated.Auth.ListenAddr))
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			_ = s.Exec.ServiceRestart(context.Background(), s.Exec.DetectInitSystem(), "dex-daemon")
+		}()
+	}
 	redacted, secrets := redactStateForAPI(updated)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"state":   redacted,
-		"secrets": secrets,
-		"result":  applyRes,
+		"ok":               true,
+		"state":            redacted,
+		"secrets":          secrets,
+		"result":           applyRes,
+		"restarted_daemon": listenChanged,
 	})
 }
 
@@ -601,9 +799,92 @@ func (s *Server) handleSelectNode(w http.ResponseWriter, r *http.Request, _ *ses
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "active_node_id": updated.Client.ActiveNodeID})
 }
 
+func (s *Server) probeDoHURL(ctx context.Context, raw string) DoHProbeResult {
+	if s.ProbeDoHFn != nil {
+		return s.ProbeDoHFn(ctx, raw)
+	}
+	norm := strings.TrimSpace(raw)
+	if norm == "" {
+		return DoHProbeResult{URL: raw, Error: "empty URL"}
+	}
+	if !strings.Contains(norm, "://") {
+		if strings.Contains(norm, "/") {
+			norm = "https://" + norm
+		} else {
+			norm = "https://" + norm + "/dq"
+		}
+	}
+	u, err := url.Parse(norm)
+	if err != nil {
+		return DoHProbeResult{URL: raw, Error: err.Error()}
+	}
+	start := time.Now()
+	switch u.Scheme {
+	case "http", "https":
+		sep := "?"
+		if strings.Contains(norm, "?") {
+			sep = "&"
+		}
+		probeURL := norm + sep + "dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB"
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+		if rerr != nil {
+			return DoHProbeResult{URL: raw, Error: rerr.Error(), LatencyMS: time.Since(start).Milliseconds()}
+		}
+		req.Header.Set("Accept", "application/dns-message")
+		c := &http.Client{Timeout: 5 * time.Second}
+		resp, derr := c.Do(req)
+		lat := time.Since(start).Milliseconds()
+		if derr != nil {
+			return DoHProbeResult{URL: raw, LatencyMS: lat, Error: derr.Error()}
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+		ok := resp.StatusCode >= 200 && resp.StatusCode < 500
+		errStr := ""
+		if !ok {
+			errStr = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		}
+		return DoHProbeResult{URL: raw, OK: ok, Status: resp.StatusCode, LatencyMS: lat, Error: errStr}
+	case "tls", "quic", "h3", "tcp":
+		host := u.Hostname()
+		port := u.Port()
+		if port == "" {
+			if u.Scheme == "tls" {
+				port = "853"
+			} else {
+				port = "443"
+			}
+		}
+		dialer := &net.Dialer{Timeout: 5 * time.Second}
+		if u.Scheme == "tls" {
+			conn, derr := tls.DialWithDialer(dialer, "tcp", net.JoinHostPort(host, port), &tls.Config{ServerName: host})
+			lat := time.Since(start).Milliseconds()
+			if derr != nil {
+				return DoHProbeResult{URL: raw, LatencyMS: lat, Error: derr.Error()}
+			}
+			_ = conn.Close()
+			return DoHProbeResult{URL: raw, OK: true, LatencyMS: lat}
+		}
+		netProto := "tcp"
+		if u.Scheme == "quic" || u.Scheme == "h3" {
+			netProto = "udp"
+		}
+		conn, derr := dialer.DialContext(ctx, netProto, net.JoinHostPort(host, port))
+		lat := time.Since(start).Milliseconds()
+		if derr != nil {
+			return DoHProbeResult{URL: raw, LatencyMS: lat, Error: derr.Error()}
+		}
+		_ = conn.Close()
+		return DoHProbeResult{URL: raw, OK: true, LatencyMS: lat}
+	default:
+		return DoHProbeResult{URL: raw, Error: "unsupported scheme " + u.Scheme}
+	}
+}
+
 func (s *Server) handleProbeNodes(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
 	var req struct {
-		NodeID string `json:"node_id"`
+		NodeID     string `json:"node_id"`
+		IncludeDoH bool   `json:"include_doh"`
 	}
 	_ = decodeJSONBody(r, &req, 4096)
 
@@ -634,30 +915,39 @@ func (s *Server) handleProbeNodes(w http.ResponseWriter, r *http.Request, _ *ses
 			results[idx] = s.ProbeNodeFn(r.Context(), node)
 		}(i, n)
 	}
+	var dohResults []DoHProbeResult
+	if req.IncludeDoH && len(st.Client.DNS.DoHServers) > 0 {
+		dohResults = make([]DoHProbeResult, len(st.Client.DNS.DoHServers))
+		for i, u := range st.Client.DNS.DoHServers {
+			wg.Add(1)
+			go func(idx int, raw string) {
+				defer wg.Done()
+				dohResults[idx] = s.probeDoHURL(r.Context(), raw)
+			}(i, u)
+		}
+	}
 	wg.Wait()
-	writeJSON(w, http.StatusOK, map[string]any{"results": results})
+	resp := map[string]any{"results": results}
+	if req.IncludeDoH {
+		resp["doh_results"] = dohResults
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
-func nextWireGuardPeerIP(wg state.WireGuardConfig) (string, error) {
-	prefix, err := netip.ParsePrefix(strings.TrimSpace(wg.SubnetCIDR))
+func (s *Server) handleParseNodeURI(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
+	var req struct {
+		URI string `json:"uri"`
+	}
+	if err := decodeJSONBody(r, &req, 16384); err != nil || strings.TrimSpace(req.URI) == "" {
+		writeJSONError(w, http.StatusBadRequest, "uri is required")
+		return
+	}
+	node, err := render.ParseNodeURI(req.URI)
 	if err != nil {
-		prefix = netip.MustParsePrefix("172.16.66.1/24")
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
 	}
-	used := map[netip.Addr]bool{prefix.Addr(): true}
-	for _, p := range wg.Peers {
-		raw := strings.TrimSpace(strings.Split(p.IP, "/")[0])
-		if a, err := netip.ParseAddr(raw); err == nil {
-			used[a] = true
-		}
-	}
-	base4 := prefix.Addr().As4()
-	for lastOctet := 11; lastOctet <= 254; lastOctet++ {
-		cand := netip.AddrFrom4([4]byte{base4[0], base4[1], base4[2], byte(lastOctet)})
-		if prefix.Contains(cand) && !used[cand] {
-			return cand.String(), nil
-		}
-	}
-	return "", errors.New("no free WireGuard peer IP available in subnet")
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "node": node})
 }
 
 func (s *Server) handleAddWGPeer(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
@@ -711,7 +1001,7 @@ func (s *Server) handleAddWGPeer(w http.ResponseWriter, r *http.Request, _ *sess
 				cur.Client.WireGuard.EndpointHost = "vpn.example.com"
 			}
 		}
-		ip, iperr := nextWireGuardPeerIP(cur.Client.WireGuard)
+		ip, iperr := render.NextAvailableWGIP(cur.Client.WireGuard.SubnetCIDR, cur.Client.WireGuard.Peers)
 		if iperr != nil {
 			return iperr
 		}
@@ -739,6 +1029,77 @@ func (s *Server) handleAddWGPeer(w http.ResponseWriter, r *http.Request, _ *sess
 	})
 }
 
+func (s *Server) handleRegenWGServer(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
+	priv, pub, err := cryptoext.GenerateWireGuardKeypair()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	updated, _, err := reconcile.UpdateAndReconcile(r.Context(), s.Store, state.RoleClient, s.Exec, s.ApplyOpts, func(cur *state.State) error {
+		cur.Client.WireGuard.ServerPrivateKey = priv
+		cur.Client.WireGuard.ServerPublicKey = pub
+		return nil
+	})
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.Hub.Log("INFO", "wireguard", "regenerated WireGuard server keypair")
+	redacted, secrets := redactStateForAPI(updated)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":                true,
+		"server_public_key": pub,
+		"state":             redacted,
+		"secrets":           secrets,
+	})
+}
+
+func (s *Server) handleRegenWGPeer(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
+	name := r.PathValue("name")
+	priv, pub, err := cryptoext.GenerateWireGuardKeypair()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var updatedPeer state.WGPeer
+	var updatedWG state.WireGuardConfig
+	_, _, err = reconcile.UpdateAndReconcile(r.Context(), s.Store, state.RoleClient, s.Exec, s.ApplyOpts, func(cur *state.State) error {
+		for i := range cur.Client.WireGuard.Peers {
+			if cur.Client.WireGuard.Peers[i].Name == name {
+				cur.Client.WireGuard.Peers[i].PrivateKey = priv
+				cur.Client.WireGuard.Peers[i].PublicKey = pub
+				updatedPeer = cur.Client.WireGuard.Peers[i]
+				updatedWG = cur.Client.WireGuard
+				return nil
+			}
+		}
+		return fmt.Errorf("peer %q not found", name)
+	})
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	s.Hub.Log("INFO", "wireguard", fmt.Sprintf("regenerated WireGuard peer %s", name))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"peer":   updatedPeer,
+		"config": render.BuildWGPeerConfig(updatedWG, updatedPeer),
+	})
+}
+
+func sanitizeFilenamePart(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "peer"
+	}
+	return b.String()
+}
+
 func (s *Server) handleWGPeerConfig(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
 	name := r.PathValue("name")
 	st, err := s.Store.Load()
@@ -749,6 +1110,9 @@ func (s *Server) handleWGPeerConfig(w http.ResponseWriter, r *http.Request, _ *s
 	for _, p := range st.Client.WireGuard.Peers {
 		if p.Name == name {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			if r.URL.Query().Get("download") == "1" {
+				w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="wg-%s.conf"`, sanitizeFilenamePart(p.Name)))
+			}
 			_, _ = io.WriteString(w, render.BuildWGPeerConfig(st.Client.WireGuard, p))
 			return
 		}
@@ -806,8 +1170,19 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request, _ *sessio
 			imported, notes, err = migrate.ImportDES(tmpFile)
 		case "dexs":
 			imported, notes, err = migrate.ImportDEXS(tmpFile)
+		case "v3_state":
+			var restored state.State
+			if uerr := json.Unmarshal([]byte(req.RawJSON), &restored); uerr != nil {
+				err = fmt.Errorf("parse v3 backup JSON: %w", uerr)
+			} else {
+				if restored.Version == 0 {
+					restored.Version = state.CurrentSchemaVersion
+				}
+				imported = &restored
+				notes = append(notes, "restored full v3 state JSON")
+			}
 		default:
-			writeJSONError(w, http.StatusBadRequest, "raw_json requires kind v2_client, des, or dexs")
+			writeJSONError(w, http.StatusBadRequest, "raw_json requires kind v2_client, des, dexs, or v3_state")
 			return
 		}
 	} else {
@@ -833,6 +1208,24 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request, _ *sessio
 				p = "/etc/vless-lite/state.json"
 			}
 			imported, notes, err = migrate.ImportDEXS(p)
+		case "v3_state":
+			if p == "" {
+				p = "/etc/dex/state.json"
+			}
+			var raw []byte
+			raw, err = os.ReadFile(p)
+			if err == nil {
+				var restored state.State
+				if uerr := json.Unmarshal(raw, &restored); uerr != nil {
+					err = fmt.Errorf("parse v3 backup JSON: %w", uerr)
+				} else {
+					if restored.Version == 0 {
+						restored.Version = state.CurrentSchemaVersion
+					}
+					imported = &restored
+					notes = append(notes, "restored full v3 state JSON from "+p)
+				}
+			}
 		default:
 			writeJSONError(w, http.StatusBadRequest, "unknown migration kind")
 			return
@@ -883,8 +1276,19 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request, _ *sessio
 
 func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
 	opts := s.ApplyOpts
-	if r.URL.Query().Get("force") == "1" {
+	var req struct {
+		Force      bool `json:"force"`
+		RestartAll bool `json:"restart_all"`
+	}
+	if err := decodeJSONBody(r, &req, 4096); err != nil && !errors.Is(err, io.EOF) {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if r.URL.Query().Get("force") == "1" || req.Force {
 		opts.Force = true
+	}
+	if r.URL.Query().Get("restart_all") == "1" || req.RestartAll {
+		opts.RestartAll = true
 	}
 	res, err := reconcile.Reconcile(r.Context(), s.Store, s.Exec, opts)
 	if err != nil {
@@ -894,6 +1298,477 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, _ *sessionR
 	}
 	s.Hub.Log("INFO", "apply", fmt.Sprintf("applied %d generated files", len(res.FilesWritten)))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": res})
+}
+
+type hubLogWriter struct {
+	hub *daemon.TaskHub
+	tag string
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (w *hubLogWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf.Write(p)
+	for {
+		line, err := w.buf.ReadString('\n')
+		if err != nil {
+			// Put partial line back for the next Write
+			w.buf.WriteString(line)
+			break
+		}
+		if t := strings.TrimSpace(line); t != "" {
+			w.hub.Log("INFO", w.tag, t)
+		}
+	}
+	return len(p), nil
+}
+
+func (s *Server) handleConnectivity(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
+	var req struct {
+		WithIPs bool `json:"with_ips"`
+	}
+	_ = decodeJSONBody(r, &req, 1024)
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	var cnCheck, globalCheck daemon.ConnectivityCheck
+	var cnIP, globalIP string
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		cnCheck, globalCheck = s.ProbeConnectivityFn(ctx)
+	}()
+	if req.WithIPs {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if s.DDNS != nil && s.DDNS.FetchPublic4 != nil {
+				cnIP, _ = s.DDNS.FetchPublic4(ctx)
+			} else {
+				cnIP, _ = daemon.FetchCNPublicIP(ctx)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			globalIP, _ = daemon.FetchGlobalPublicIP(ctx)
+		}()
+	}
+	wg.Wait()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"cn":        cnCheck,
+		"global":    globalCheck,
+		"cn_ip":     cnIP,
+		"global_ip": globalIP,
+	})
+}
+
+func (s *Server) handleProxyStop(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
+	st, err := s.Store.Load()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	initSys := s.Exec.DetectInitSystem()
+	// On client gateway, keep dex-mosdns running so domestic DNS continues working while proxy is paused.
+	targets := []string{"dex-xray", "dex-nft"}
+	var stopped []string
+	for _, svc := range targets {
+		if s.Exec.ServiceIsActive(r.Context(), initSys, svc) {
+			if err := s.Exec.ServiceStopDisable(r.Context(), initSys, svc); err != nil {
+				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("stop %s: %v", svc, err))
+				return
+			}
+			stopped = append(stopped, svc)
+		}
+	}
+	if st.Role == state.RoleClient && s.Exec.HasCommand("ip") {
+		for _, family := range []string{"-4", "-6"} {
+			for i := 0; i < 4; i++ {
+				if _, err := s.Exec.RunCommand(r.Context(), nil, "ip", family, "rule", "del", "fwmark", "0x9", "table", "220"); err != nil {
+					break
+				}
+			}
+			_, _ = s.Exec.RunCommand(r.Context(), nil, "ip", family, "route", "flush", "table", "220")
+		}
+	}
+	s.Hub.Log("INFO", "proxy", fmt.Sprintf("stopped proxy services: %v", stopped))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "stopped": stopped})
+}
+
+func (s *Server) handleProxyRestart(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
+	opts := s.ApplyOpts
+	opts.RestartAll = true
+	res, err := reconcile.Reconcile(r.Context(), s.Store, s.Exec, opts)
+	if err != nil {
+		s.Hub.Log("ERROR", "proxy", err.Error())
+		writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	s.Hub.Log("INFO", "proxy", fmt.Sprintf("restarted proxy services: %v", res.ServicesRestarted))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restarted": res.ServicesRestarted, "result": res})
+}
+
+func (s *Server) handleTestSocks5(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
+	var req struct {
+		ProfileName string `json:"profile_name"`
+		Address     string `json:"address"`
+		Port        int    `json:"port"`
+		Username    string `json:"username"`
+		Password    string `json:"password"`
+	}
+	if err := decodeJSONBody(r, &req, 4096); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	addr, port, user, pass := strings.TrimSpace(req.Address), req.Port, req.Username, req.Password
+	if req.ProfileName != "" {
+		st, err := s.Store.Load()
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		found := false
+		for _, p := range st.Server.Socks5Outbounds {
+			if p.Name == req.ProfileName {
+				addr = p.Address
+				port = p.Port
+				user = p.Username
+				pass = p.Password
+				found = true
+				break
+			}
+		}
+		if !found {
+			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("profile %q not found", req.ProfileName))
+			return
+		}
+	}
+	if addr == "" || port <= 0 {
+		writeJSONError(w, http.StatusBadRequest, "address and port (or valid profile_name) are required")
+		return
+	}
+	res, err := s.ProbeSocks5Fn(r.Context(), addr, port, user, pass, nil)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ok := res.StatusCode >= 200 && res.StatusCode < 400
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": ok,
+		"result": map[string]any{
+			"status_code": res.StatusCode,
+			"exit_ip":     res.ExitIP,
+			"location":    res.Location,
+			"latency_ms":  res.Latency.Milliseconds(),
+		},
+	})
+}
+
+func (s *Server) handleRulesStatus(w http.ResponseWriter, _ *http.Request, _ *sessionRecord) {
+	rulesDir := filepath.Join(s.Store.Dir, "rules")
+	names := []string{"geoip.dat", "geosite.dat", "IPchnroute", "Domains.chn.txt", "Domains.apple.txt", "Domains.games.txt", "Domains.ads.txt"}
+	type fileInfo struct {
+		Name      string `json:"name"`
+		Exists    bool   `json:"exists"`
+		SizeBytes int64  `json:"size_bytes"`
+		ModTime   string `json:"mod_time,omitempty"`
+	}
+	files := make([]fileInfo, 0, len(names))
+	for _, n := range names {
+		fi := fileInfo{Name: n}
+		if info, err := os.Stat(filepath.Join(rulesDir, n)); err == nil {
+			fi.Exists = true
+			fi.SizeBytes = info.Size()
+			fi.ModTime = info.ModTime().UTC().Format(time.RFC3339)
+		}
+		files = append(files, fi)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"rules_dir": rulesDir,
+		"files":     files,
+	})
+}
+
+func (s *Server) handleRulesUpdate(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
+	if s.UpdateRulesFn == nil {
+		writeJSONError(w, http.StatusNotImplemented, "rules updater not configured")
+		return
+	}
+	var req struct {
+		IncludeAds bool `json:"include_ads"`
+	}
+	_ = decodeJSONBody(r, &req, 1024)
+	wLog := &hubLogWriter{hub: s.Hub, tag: "rules"}
+	if err := s.UpdateRulesFn(r.Context(), req.IncludeAds, wLog); err != nil {
+		s.Hub.Log("ERROR", "rules", err.Error())
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.Hub.Log("INFO", "rules", "rules update completed")
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleUpdateComponents(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
+	if s.UpdateComponentsFn == nil {
+		writeJSONError(w, http.StatusNotImplemented, "component updater not configured")
+		return
+	}
+	var req struct {
+		Component string `json:"component"`
+		Version   string `json:"version"`
+	}
+	_ = decodeJSONBody(r, &req, 1024)
+	comp := strings.TrimSpace(req.Component)
+	if comp == "" {
+		comp = "all"
+	}
+	wLog := &hubLogWriter{hub: s.Hub, tag: "update"}
+	if err := s.UpdateComponentsFn(r.Context(), comp, strings.TrimSpace(req.Version), wLog); err != nil {
+		s.Hub.Log("ERROR", "update", err.Error())
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.Hub.Log("INFO", "update", fmt.Sprintf("updated component=%s", comp))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "component": comp})
+	if comp == "dex" || comp == "all" {
+		s.scheduleDaemonRestart("dex binary updated")
+	}
+}
+
+func (s *Server) handleCertIssue(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
+	var req struct {
+		Mode      string `json:"mode"`
+		Domain    string `json:"domain"`
+		CFToken   string `json:"cf_token"`
+		CFEmail   string `json:"cf_email"`
+		Webroot   string `json:"webroot"`
+		AutoRenew *bool  `json:"auto_renew"`
+	}
+	if err := decodeJSONBody(r, &req, 16384); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	st, err := s.Store.Load()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	dom := strings.TrimSpace(req.Domain)
+	if dom == "" {
+		dom = firstNonEmptyStr(st.Cert.Domain, st.Server.Domain)
+	}
+	tok := strings.TrimSpace(req.CFToken)
+	if tok == "" || tok == secretKeepSentinel {
+		tok = st.Cert.CFToken
+	}
+	email := strings.TrimSpace(req.CFEmail)
+	if email == "" {
+		email = st.Cert.CFEmail
+	}
+	autoRenew := st.Cert.AutoRenew
+	if req.AutoRenew != nil {
+		autoRenew = *req.AutoRenew
+	} else {
+		autoRenew = true
+	}
+
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	if mode == "" {
+		mode = "cf"
+	}
+	cfg := cert.ACMEConfig{
+		Domain:    dom,
+		CFToken:   tok,
+		CFEmail:   email,
+		Webroot:   strings.TrimSpace(req.Webroot),
+		AutoRenew: autoRenew,
+		CertPath:  s.Store.DefaultCert(),
+		KeyPath:   s.Store.DefaultKey(),
+		ReloadCmd: s.CertReloadCmd,
+	}
+	var rep *cert.CertReport
+	switch mode {
+	case "cf", "cloudflare", "dns":
+		rep, err = cert.IssueCloudflareACME(r.Context(), s.CertRunner, cfg)
+	case "http", "http-01":
+		rep, err = cert.IssueHTTPACME(r.Context(), s.CertRunner, cfg)
+	default:
+		writeJSONError(w, http.StatusBadRequest, "mode must be 'cf' or 'http'")
+		return
+	}
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	_, _ = s.Store.Update(st.Role, func(cur *state.State) error {
+		cur.Cert.Mode = "acme"
+		cur.Cert.Domain = dom
+		cur.Cert.CertFile = ""
+		cur.Cert.KeyFile = ""
+		cur.Cert.AutoRenew = autoRenew
+		if mode == "http" || mode == "http-01" {
+			// HTTP-01 does not touch CF token
+		} else if autoRenew {
+			cur.Cert.CFToken = tok
+			cur.Cert.CFEmail = email
+		} else {
+			cur.Cert.CFToken = ""
+			cur.Cert.CFEmail = ""
+		}
+		return nil
+	})
+	if s.ReloadCertFn != nil {
+		s.ReloadCertFn(r.Context())
+	}
+	s.Hub.Log("INFO", "cert", fmt.Sprintf("issued %s ACME cert for %s", mode, dom))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cert": rep})
+	s.scheduleDaemonRestart("TLS certificate issued")
+}
+
+func (s *Server) handleCertImport(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
+	var req struct {
+		CertPath        string `json:"cert_path"`
+		KeyPath         string `json:"key_path"`
+		CertPEM         string `json:"cert_pem"`
+		KeyPEM          string `json:"key_pem"`
+		AllowSelfSigned bool   `json:"allow_self_signed"`
+	}
+	if err := decodeJSONBody(r, &req, 1<<20); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	st, err := s.Store.Load()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	srcCert := strings.TrimSpace(req.CertPath)
+	srcKey := strings.TrimSpace(req.KeyPath)
+	if strings.TrimSpace(req.CertPEM) != "" || strings.TrimSpace(req.KeyPEM) != "" {
+		if strings.TrimSpace(req.CertPEM) == "" || strings.TrimSpace(req.KeyPEM) == "" {
+			writeJSONError(w, http.StatusBadRequest, "both cert_pem and key_pem are required")
+			return
+		}
+		tmpDir, merr := os.MkdirTemp("", "dex-cert-imp-*")
+		if merr != nil {
+			writeJSONError(w, http.StatusInternalServerError, merr.Error())
+			return
+		}
+		defer os.RemoveAll(tmpDir)
+		srcCert = filepath.Join(tmpDir, "cert.pem")
+		srcKey = filepath.Join(tmpDir, "key.pem")
+		if werr := os.WriteFile(srcCert, []byte(req.CertPEM), 0o644); werr != nil {
+			writeJSONError(w, http.StatusInternalServerError, werr.Error())
+			return
+		}
+		if werr := os.WriteFile(srcKey, []byte(req.KeyPEM), 0o600); werr != nil {
+			writeJSONError(w, http.StatusInternalServerError, werr.Error())
+			return
+		}
+	}
+	if srcCert == "" || srcKey == "" {
+		writeJSONError(w, http.StatusBadRequest, "cert_path/key_path or cert_pem/key_pem are required")
+		return
+	}
+	var checkDomains []string
+	if d := firstNonEmptyStr(st.Cert.Domain, st.Server.Domain); d != "" {
+		checkDomains = append(checkDomains, d)
+	}
+	rep, changed, err := cert.ImportPair(srcCert, srcKey, s.Store.DefaultCert(), s.Store.DefaultKey(), req.AllowSelfSigned, checkDomains)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_, _ = s.Store.Update(st.Role, func(cur *state.State) error {
+		cur.Cert.Mode = "imported"
+		cur.Cert.CertFile = s.Store.DefaultCert()
+		cur.Cert.KeyFile = s.Store.DefaultKey()
+		return nil
+	})
+	if changed && s.ReloadCertFn != nil {
+		s.ReloadCertFn(r.Context())
+	}
+	s.Hub.Log("INFO", "cert", fmt.Sprintf("imported certificate CN=%s changed=%v", rep.CommonName, changed))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "changed": changed, "cert": rep})
+	if changed {
+		s.scheduleDaemonRestart("TLS certificate imported")
+	}
+}
+
+func (s *Server) handleCertSelfSign(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
+	var req struct {
+		CN    string `json:"cn"`
+		Force *bool  `json:"force"`
+	}
+	_ = decodeJSONBody(r, &req, 4096)
+	st, err := s.Store.Load()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	cn := firstNonEmptyStr(req.CN, st.Cert.Domain, st.Server.Domain, "localhost")
+	force := true
+	if req.Force != nil {
+		force = *req.Force
+	}
+	if force {
+		err = cert.ForceSelfSigned(s.Store.DefaultCert(), s.Store.DefaultKey(), cn)
+	} else {
+		err = cert.EnsureSelfSigned(s.Store.DefaultCert(), s.Store.DefaultKey(), cn)
+	}
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_, _ = s.Store.Update(st.Role, func(cur *state.State) error {
+		cur.Cert.Mode = "self-signed"
+		cur.Cert.CertFile = ""
+		cur.Cert.KeyFile = ""
+		return nil
+	})
+	if s.ReloadCertFn != nil {
+		s.ReloadCertFn(r.Context())
+	}
+	cb, _ := os.ReadFile(s.Store.DefaultCert())
+	kb, _ := os.ReadFile(s.Store.DefaultKey())
+	rep, _ := cert.InspectPair(cb, kb)
+	s.Hub.Log("INFO", "cert", fmt.Sprintf("generated self-signed cert CN=%s", cn))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cert": rep})
+	s.scheduleDaemonRestart("self-signed TLS certificate regenerated")
+}
+
+func (s *Server) handleBackup(w http.ResponseWriter, _ *http.Request, _ *sessionRecord) {
+	st, err := s.Store.Load()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	b, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="dex-backup-%s.json"`, time.Now().UTC().Format("20060102-150405")))
+	_, _ = w.Write(b)
+}
+
+func (s *Server) handleSystemReboot(w http.ResponseWriter, _ *http.Request, _ *sessionRecord) {
+	s.Hub.Log("INFO", "system", "system reboot requested via Web UI")
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		_, _ = s.Exec.RunCommand(context.Background(), nil, "reboot")
+	}()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "reboot scheduled"})
 }
 
 func (s *Server) handleLogsStream(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {

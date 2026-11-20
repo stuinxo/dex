@@ -2,10 +2,40 @@ package render
 
 import (
 	"fmt"
+	"net/netip"
 	"path/filepath"
+	"strings"
 
 	"github.com/stuinxo/de_GWD/v3/internal/state"
 )
+
+func clientHasDomainTargets(s *state.State) bool {
+	if s.Role != state.RoleClient {
+		return false
+	}
+	isDomain := func(addr string) bool {
+		addr = strings.Trim(strings.TrimSpace(addr), "[]")
+		if addr == "" {
+			return false
+		}
+		_, err := netip.ParseAddr(addr)
+		return err != nil
+	}
+	for _, n := range s.Client.Nodes {
+		if isDomain(n.Address) {
+			return true
+		}
+	}
+	if s.Client.RproxyC.Enabled && isDomain(s.Client.RproxyC.TunnelAddress) {
+		return true
+	}
+	for _, rawDoH := range s.Client.DNS.DoHServers {
+		if host := ExtractDoHHost(rawDoH); isDomain(host) {
+			return true
+		}
+	}
+	return false
+}
 
 // RenderAll deterministically compiles State into the full set of target config files and service flags.
 func RenderAll(s *state.State, opts RenderOptions) (*RenderBundle, error) {
@@ -80,6 +110,14 @@ func RenderAll(s *state.State, opts RenderOptions) (*RenderBundle, error) {
 	}
 	bundle.DaemonNeeded = s.Role == state.RoleClient || s.Role == state.RoleServer
 	bundle.RulesTimerNeeded = s.Role == state.RoleClient && s.System.AutoUpdateRules
+	if bundle.NFTRelayNeeded {
+		bundle.RefreshTimerNeeded = true
+		bundle.RefreshInterval = "5min"
+	} else if clientHasDomainTargets(s) {
+		bundle.RefreshTimerNeeded = true
+		bundle.RefreshInterval = "4h"
+	}
+	bundle.CoreUpdateTimerNeeded = s.System.AutoUpdateCore
 
 	if wgFiles, needed, err := RenderWireGuard(s, opts); err != nil {
 		return nil, fmt.Errorf("render wireguard: %w", err)

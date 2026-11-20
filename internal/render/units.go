@@ -307,24 +307,30 @@ WantedBy=multi-user.target
 		})
 	}
 
-	if b.NFTRelayNeeded {
+	if b.RefreshTimerNeeded {
+		interval := b.RefreshInterval
+		if interval == "" {
+			interval = "5min"
+		}
+		desc := "DEX Dynamic DNS Refresh"
+		timerDesc := fmt.Sprintf("Refresh DEX DNS every %s", interval)
 		svc := fmt.Sprintf(`[Unit]
-Description=DEX Relay Dynamic DNS Refresh
+Description=%s
 
 [Service]
 Type=oneshot
 ExecStart=%s --state-dir %s refresh
-`, opts.DexBin, opts.StateDir)
-		timer := `[Unit]
-Description=Refresh DEX Relay DNS every 5 minutes
+`, desc, opts.DexBin, opts.StateDir)
+		timer := fmt.Sprintf(`[Unit]
+Description=%s
 
 [Timer]
-OnActiveSec=5min
-OnUnitActiveSec=5min
+OnActiveSec=%s
+OnUnitActiveSec=%s
 
 [Install]
 WantedBy=timers.target
-`
+`, timerDesc, interval, interval)
 		out = append(out,
 			RenderedFile{
 				RelName:    "systemd/dex-refresh.service",
@@ -335,6 +341,43 @@ WantedBy=timers.target
 			RenderedFile{
 				RelName:    "systemd/dex-refresh.timer",
 				TargetPath: "/etc/systemd/system/dex-refresh.timer",
+				Content:    []byte(timer),
+				Mode:       0o644,
+			},
+		)
+	}
+
+	if b.CoreUpdateTimerNeeded {
+		svc := fmt.Sprintf(`[Unit]
+Description=DEX Weekly Core Components Update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%s --state-dir %s update --component all
+`, opts.DexBin, opts.StateDir)
+		timer := `[Unit]
+Description=Weekly DEX Core Update Timer
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target
+`
+		out = append(out,
+			RenderedFile{
+				RelName:    "systemd/dex-core-update.service",
+				TargetPath: "/etc/systemd/system/dex-core-update.service",
+				Content:    []byte(svc),
+				Mode:       0o644,
+			},
+			RenderedFile{
+				RelName:    "systemd/dex-core-update.timer",
+				TargetPath: "/etc/systemd/system/dex-core-update.timer",
 				Content:    []byte(timer),
 				Mode:       0o644,
 			},

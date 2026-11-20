@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	osexec "os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -82,6 +83,8 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return cmdApply(store, exec, rest, stdout, stderr)
 	case "status":
 		return cmdStatus(store, exec, stdout, stderr)
+	case "server":
+		return cmdServer(store, exec, rest, stdout, stderr)
 	case "node":
 		return cmdNode(store, exec, rest, stdout, stderr)
 	case "cert":
@@ -126,14 +129,15 @@ Commands:
   init                  Initialize a new client / server / landing / relay state
   apply                 Validate, render, pre-flight check, and reconcile configs
   status                Show role, active node, certificate, and service health
-  node <subcmd>         Manage client outbound nodes (list|add|del|select|show)
+  server <subcmd>       Inspect or update server/landing configuration (show|set)
+  node <subcmd>         Manage client outbound nodes (list|add|edit|move|del|select|probe|show)
   cert <subcmd>         Manage TLS certificates (self-sign|import|issue|inspect|reload)
-  wg <subcmd>           Manage WireGuard VPN (enable|disable|peer-add|peer-del|show)
+  wg <subcmd>           Manage WireGuard VPN (enable|disable|keygen-server|peer-add|peer-regen|peer-del|show)
   ddns <subcmd>         Manage Cloudflare DDNS (set|sync|disable)
   socks5 <subcmd>       Manage server Option 35 SOCKS5 exits (list|add|del|toggle|test)
   relay <subcmd>        Manage Option 44 port forwards (list|add|del)
   rproxy <subcmd>       Manage RproxyS/RproxyC reverse proxy (show|set|map-add|map-del|disable|client-*)
-  extra <subcmd>        Manage Option 55 extra inbounds (list|add-reality|add-socks5|del)
+  extra <subcmd>        Manage Option 55 extra inbounds (list|add-reality|add-xhttp|add-vless-ws|add-vmess-ws|add-dokodemo|add-socks5|del|disable-all)
   rules <subcmd>        Inspect or hot-update GeoIP/Domain rule files (status|update)
   update                Upgrade dex, xray, mosdns, and/or rule datasets cleanly
   migrate               Import v2 0conf, v2 server, des, or dexs state (--cleanup-v2 --apply)
@@ -309,6 +313,68 @@ func cmdApply(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 	return 0
 }
 
+func serviceNamesForState(st *state.State, initSys string) []string {
+	var svcs []string
+	if st == nil {
+		return svcs
+	}
+	if st.Role == state.RoleClient {
+		svcs = append(svcs, "dex-xray", "dex-mosdns", "dex-nft")
+		if st.Client.WireGuard.Enabled {
+			if initSys == "openrc" {
+				svcs = append(svcs, "wg-quick.wg0")
+			} else {
+				svcs = append(svcs, "wg-quick@wg0")
+			}
+		}
+	} else {
+		svcs = append(svcs, "dex-xray")
+		if len(st.Relay.Forwards) > 0 {
+			svcs = append(svcs, "dex-nft")
+		}
+		needsNginx := (st.Role == state.RoleServer && st.Server.TLSMode == "nginx")
+		for _, ex := range st.ExtraInbounds {
+			if ex.ViaNginx {
+				needsNginx = true
+				break
+			}
+		}
+		if needsNginx {
+			svcs = append(svcs, "nginx")
+		}
+		if st.Role == state.RoleServer && st.Server.TLSMode == "nginx" && st.Server.EnableDoH {
+			svcs = append(svcs, "dex-doh")
+		}
+	}
+	svcs = append(svcs, "dex-daemon")
+	return svcs
+}
+
+func serviceStatusSummary(exec reconcile.SystemExecutor, st *state.State) string {
+	if exec == nil || st == nil {
+		return ""
+	}
+	initSys := exec.DetectInitSystem()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var parts []string
+	for _, svc := range serviceNamesForState(st, initSys) {
+		stateLabel := "inactive"
+		if exec.ServiceIsActive(ctx, initSys, svc) {
+			stateLabel = "active"
+		}
+		parts = append(parts, fmt.Sprintf("%s=%s", svc, stateLabel))
+	}
+	return strings.Join(parts, " ")
+}
+
+func resolveActiveCertPaths(store *state.Store, st *state.State) (string, string) {
+	if st != nil && st.Cert.Mode == "imported" && st.Cert.CertFile != "" && st.Cert.KeyFile != "" {
+		return st.Cert.CertFile, st.Cert.KeyFile
+	}
+	return store.DefaultCert(), store.DefaultKey()
+}
+
 func cmdStatus(store *state.Store, exec reconcile.SystemExecutor, stdout, stderr io.Writer) int {
 	st, err := store.Load()
 	if err != nil {
@@ -328,12 +394,191 @@ func cmdStatus(store *state.Store, exec reconcile.SystemExecutor, stdout, stderr
 		fmt.Fprintf(stdout, "Failover: %v | WireGuard: %v (%d peers) | DDNS: %v\n",
 			st.Client.FailoverEnabled, st.Client.WireGuard.Enabled, len(st.Client.WireGuard.Peers), st.Client.DDNS.Enabled)
 	} else if st.Role == state.RoleServer || st.Role == state.RoleLanding {
-		fmt.Fprintf(stdout, "Domain: %s | Mode: %s | Port: %d (pub %d)\n",
-			st.Server.Domain, st.Server.TLSMode, st.Server.ListenPort, st.Server.EffectivePublicPort())
+		fmt.Fprintf(stdout, "Domain: %s | Mode: %s | Protocol: %s | Port: %d (pub %d)\n",
+			st.Server.Domain, st.Server.TLSMode, st.Server.EffectiveProtocol(), st.Server.ListenPort, st.Server.EffectivePublicPort())
 	}
 	fmt.Fprintf(stdout, "Relay Forwards: %d | RproxyS: %v | Extra Inbounds: %d\n",
 		len(st.Relay.Forwards), st.RproxyS.Enabled, len(st.ExtraInbounds))
+	if sum := serviceStatusSummary(exec, st); sum != "" {
+		fmt.Fprintf(stdout, "Services: %s\n", sum)
+	}
+	certFile, keyFile := resolveActiveCertPaths(store, st)
+	if cb, err1 := os.ReadFile(certFile); err1 == nil {
+		if kb, err2 := os.ReadFile(keyFile); err2 == nil {
+			if rep, ierr := cert.InspectPair(cb, kb); ierr == nil {
+				fmt.Fprintf(stdout, "Certificate: CN=%s Expires=%s SelfSigned=%v ChainValid=%v ExpiringSoon=%v\n",
+					rep.CommonName, rep.NotAfter.Format("2006-01-02"), rep.SelfSigned, rep.ChainValid, rep.ExpiringSoon)
+			} else {
+				fmt.Fprintf(stdout, "Certificate: invalid (%v)\n", ierr)
+			}
+		} else {
+			fmt.Fprintf(stdout, "Certificate: key unreadable (%v)\n", err2)
+		}
+	} else {
+		fmt.Fprintf(stdout, "Certificate: missing (%s)\n", certFile)
+	}
 	return 0
+}
+
+func cmdServer(store *state.Store, exec reconcile.SystemExecutor, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] == "show" {
+		st, err := store.Load()
+		if err != nil {
+			fmt.Fprintf(stderr, "load state: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Role:             %s\n", st.Role)
+		fmt.Fprintf(stdout, "Domain:           %s\n", st.Server.Domain)
+		fmt.Fprintf(stdout, "ConnectHost:      %s\n", st.Server.EffectiveConnectHost())
+		fmt.Fprintf(stdout, "TLSMode:          %s\n", st.Server.TLSMode)
+		fmt.Fprintf(stdout, "Protocol:         %s\n", st.Server.EffectiveProtocol())
+		fmt.Fprintf(stdout, "ListenPort:       %d\n", st.Server.ListenPort)
+		fmt.Fprintf(stdout, "PublicPort:       %d\n", st.Server.EffectivePublicPort())
+		fmt.Fprintf(stdout, "Path:             %s\n", render.NormalizePath(st.Server.Path, firstOrEmpty(st.Server.UUIDs)))
+		fmt.Fprintf(stdout, "UUIDs:            %s\n", strings.Join(st.Server.UUIDs, ", "))
+		fmt.Fprintf(stdout, "EnableDoH:        %v\n", st.Server.EnableDoH)
+		if st.Server.CamouflageDir != "" {
+			fmt.Fprintf(stdout, "CamouflageDir:    %s\n", st.Server.CamouflageDir)
+		}
+		if uri := render.BuildServerMainURI(st); uri != "" {
+			fmt.Fprintf(stdout, "MainURI:          %s\n", uri)
+		}
+		return 0
+	}
+
+	sub := args[0]
+	rest := args[1:]
+	if sub != "set" {
+		fmt.Fprintf(stderr, "unknown server subcommand %q (expected show|set)\n", sub)
+		return 2
+	}
+
+	fs := flag.NewFlagSet("server set", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	domain := fs.String("domain", "", "server domain")
+	connectHost := fs.String("connect-host", "", "external host/IP for clients")
+	tlsMode := fs.String("tls-mode", "", "tls mode: nginx|direct")
+	proto := fs.String("protocol", "", "main inbound protocol: vless-xhttp|vmess-ws|vless-ws")
+	port := fs.Int("port", 0, "listen port")
+	pubPort := fs.Int("public-port", 0, "NAT public port")
+	path := fs.String("path", "", "WS/XHTTP path")
+	uuidVal := fs.String("uuid", "", "replace UUID list (comma-separated)")
+	addUUID := fs.String("add-uuid", "", "append UUID")
+	delUUID := fs.String("del-uuid", "", "remove UUID")
+	enableDoH := fs.Bool("enable-doh", false, "enable server RFC 8484 DoH endpoint")
+	camoDir := fs.String("camouflage-dir", "", "nginx camouflage root directory")
+	doApply := fs.Bool("apply", false, "apply immediately")
+	if err := fs.Parse(rest); err != nil {
+		return 2
+	}
+
+	setFlags := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		setFlags[f.Name] = true
+	})
+
+	defRole := existingRoleOr(store, state.RoleServer)
+	mut := func(cur *state.State) error {
+		if setFlags["domain"] {
+			cur.Server.Domain = strings.TrimSpace(*domain)
+		}
+		if setFlags["connect-host"] {
+			cur.Server.ConnectHost = strings.TrimSpace(*connectHost)
+		}
+		if setFlags["tls-mode"] {
+			cur.Server.TLSMode = strings.TrimSpace(*tlsMode)
+		}
+		if setFlags["protocol"] {
+			cur.Server.Protocol = strings.TrimSpace(*proto)
+		}
+		if setFlags["port"] {
+			cur.Server.ListenPort = *port
+		}
+		if setFlags["public-port"] {
+			cur.Server.PublicPort = *pubPort
+		}
+		if setFlags["path"] {
+			cur.Server.Path = strings.TrimSpace(*path)
+		}
+		if setFlags["uuid"] {
+			var next []string
+			for _, u := range strings.Split(*uuidVal, ",") {
+				if u = strings.TrimSpace(u); u != "" {
+					next = append(next, u)
+				}
+			}
+			cur.Server.UUIDs = next
+		}
+		if setFlags["add-uuid"] {
+			u := strings.TrimSpace(*addUUID)
+			if u == "" {
+				var err error
+				u, err = cryptoext.GenerateUUID()
+				if err != nil {
+					return err
+				}
+			}
+			exists := false
+			for _, ex := range cur.Server.UUIDs {
+				if ex == u {
+					exists = true
+					break
+				}
+			}
+			if !exists {
+				cur.Server.UUIDs = append(cur.Server.UUIDs, u)
+			}
+		}
+		if setFlags["del-uuid"] {
+			target := strings.TrimSpace(*delUUID)
+			var next []string
+			for _, ex := range cur.Server.UUIDs {
+				if ex != target {
+					next = append(next, ex)
+				}
+			}
+			cur.Server.UUIDs = next
+		}
+		if setFlags["enable-doh"] {
+			cur.Server.EnableDoH = *enableDoH
+		}
+		if setFlags["camouflage-dir"] {
+			cur.Server.CamouflageDir = strings.TrimSpace(*camoDir)
+		}
+		return nil
+	}
+	if err := applyOrSave(store, exec, defRole, *doApply, mut); err != nil {
+		fmt.Fprintf(stderr, "server set failed: %v\n", err)
+		return 1
+	}
+	fmt.Fprintln(stdout, "Server configuration updated.")
+	return 0
+}
+
+func maybePrintQR(stdout io.Writer, uri string, force bool) {
+	if uri == "" {
+		return
+	}
+	if !force {
+		f, ok := stdout.(*os.File)
+		if !ok {
+			return
+		}
+		fi, err := f.Stat()
+		if err != nil || (fi.Mode()&os.ModeCharDevice) == 0 {
+			return
+		}
+	}
+	bin, err := osexec.LookPath("qrencode")
+	if err != nil {
+		return
+	}
+	cmd := osexec.Command(bin, "-t", "ANSIUTF8", uri)
+	out, err := cmd.Output()
+	if err == nil && len(out) > 0 {
+		fmt.Fprintln(stdout)
+		_, _ = stdout.Write(out)
+	}
 }
 
 func cmdNode(store *state.Store, exec reconcile.SystemExecutor, args []string, stdout, stderr io.Writer) int {
@@ -361,22 +606,49 @@ func cmdNode(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 	rest := args[1:]
 	switch sub {
 	case "show":
+		fs := flag.NewFlagSet("node show", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		qrFlag := fs.Bool("qr", false, "render terminal QR code via qrencode if available")
+		if err := fs.Parse(rest); err != nil {
+			return 2
+		}
 		st, err := store.Load()
 		if err != nil {
 			fmt.Fprintf(stderr, "load state: %v\n", err)
 			return 1
 		}
 		if st.Role == state.RoleServer || st.Role == state.RoleLanding {
-			fmt.Fprintf(stdout, "Domain:   %s\nAddress:  %s:%d\nUUIDs:    %s\nPath:     %s\nURI:      %s\n",
+			mainURI := render.BuildServerMainURI(st)
+			fmt.Fprintf(stdout, "Domain:   %s\nAddress:  %s:%d\nMode:     %s (%s)\nUUIDs:    %s\nPath:     %s\nURI:      %s\n",
 				st.Server.Domain, st.Server.EffectiveConnectHost(), st.Server.EffectivePublicPort(),
+				st.Server.TLSMode, st.Server.EffectiveProtocol(),
 				strings.Join(st.Server.UUIDs, ", "),
 				render.NormalizePath(st.Server.Path, firstOrEmpty(st.Server.UUIDs)),
-				render.BuildServerMainURI(st))
+				mainURI)
+			if st.Role == state.RoleServer && st.Server.TLSMode == "nginx" && st.Server.EnableDoH {
+				dohHost := firstNonEmpty(st.Server.Domain, st.Server.EffectiveConnectHost(), "localhost")
+				if st.Server.EffectivePublicPort() == 443 {
+					fmt.Fprintf(stdout, "DoH URL:  https://%s/dq\n", dohHost)
+				} else {
+					fmt.Fprintf(stdout, "DoH URL:  https://%s:%d/dq\n", dohHost, st.Server.EffectivePublicPort())
+				}
+			}
+			for _, ex := range st.ExtraInbounds {
+				if uri := buildExtraShareURI(st, ex); uri != "" {
+					fmt.Fprintf(stdout, "Extra [%s] (%s:%d): %s\n", ex.Tag, ex.Protocol, ex.ListenPort, uri)
+				} else if ex.Protocol == "dokodemo" {
+					fmt.Fprintf(stdout, "Extra [%s] (dokodemo :%d -> %s:%d)\n", ex.Tag, ex.ListenPort, ex.TargetAddr, ex.TargetPort)
+				}
+			}
+			for _, rf := range st.Relay.Forwards {
+				fmt.Fprintf(stdout, "Relay [%s] :%d -> %s:%d (%s/%s)\n", rf.ID, rf.ListenPort, rf.TargetHost, rf.TargetPort, rf.Proto, rf.Engine)
+			}
+			maybePrintQR(stdout, mainURI, *qrFlag)
 			return 0
 		}
 		var target *state.OutboundNode
-		if len(rest) > 0 {
-			target = st.Client.FindNode(rest[0])
+		if fs.NArg() > 0 {
+			target = st.Client.FindNode(fs.Arg(0))
 		} else {
 			target = st.Client.ActiveNode()
 		}
@@ -384,9 +656,23 @@ func cmdNode(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 			fmt.Fprintln(stderr, "no matching node found")
 			return 1
 		}
+		uri := render.BuildNodeURI(*target)
 		fmt.Fprintf(stdout, "ID:       %s\nName:     %s\nProtocol: %s\nAddress:  %s:%d\nSNI:      %s\nURI:      %s\n",
 			target.ID, target.Name, target.Protocol, target.Address, target.Port,
-			target.EffectiveSNI(), render.BuildNodeURI(*target))
+			target.EffectiveSNI(), uri)
+		if len(st.Client.DNS.DoHServers) > 0 {
+			fmt.Fprintf(stdout, "DoH:      %s\n", strings.Join(st.Client.DNS.DoHServers, ", "))
+		}
+		if u0 := render.BuildFWDURI(st, "fwd0", ""); u0 != "" {
+			fmt.Fprintf(stdout, "FWD0 URI: %s\n", u0)
+		}
+		if u1 := render.BuildFWDURI(st, "fwd1", ""); u1 != "" {
+			fmt.Fprintf(stdout, "FWD1 URI: %s\n", u1)
+		}
+		for _, rf := range st.Relay.Forwards {
+			fmt.Fprintf(stdout, "Relay [%s] :%d -> %s:%d (%s/%s)\n", rf.ID, rf.ListenPort, rf.TargetHost, rf.TargetPort, rf.Proto, rf.Engine)
+		}
+		maybePrintQR(stdout, uri, *qrFlag)
 		return 0
 
 	case "add":
@@ -402,38 +688,84 @@ func cmdNode(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 		path := fs.String("path", "", "WS/XHTTP path")
 		pbk := fs.String("pbk", "", "Reality public key")
 		sid := fs.String("sid", "", "Reality shortId")
+		user := fs.String("username", "", "SOCKS5 username")
+		pass := fs.String("password", "", "SOCKS5 password")
+		fromURI := fs.String("from-uri", "", "parse node settings from vless://, vmess://, or socks5:// URI")
 		doApply := fs.Bool("apply", false, "apply immediately")
 		if err := fs.Parse(rest); err != nil {
 			return 2
 		}
-		if *addr == "" {
-			fmt.Fprintln(stderr, "--address is required")
+		setFlags := make(map[string]bool)
+		fs.Visit(func(f *flag.Flag) {
+			setFlags[f.Name] = true
+		})
+
+		node := state.OutboundNode{
+			Protocol: *proto,
+			Port:     *port,
+		}
+		if strings.TrimSpace(*fromURI) != "" {
+			parsed, err := render.ParseNodeURI(*fromURI)
+			if err != nil {
+				fmt.Fprintf(stderr, "parse --from-uri: %v\n", err)
+				return 2
+			}
+			node = parsed
+		}
+		if setFlags["id"] {
+			node.ID = *id
+		}
+		if setFlags["name"] {
+			node.Name = *name
+		}
+		if setFlags["proto"] {
+			node.Protocol = *proto
+		}
+		if setFlags["address"] {
+			node.Address = *addr
+		}
+		if setFlags["port"] {
+			node.Port = *port
+		}
+		if setFlags["uuid"] {
+			node.UUID = *uuid
+		}
+		if setFlags["sni"] {
+			node.TLSSNI = *sni
+		}
+		if setFlags["path"] {
+			node.Path = *path
+		}
+		if setFlags["pbk"] {
+			node.RealityPubKey = *pbk
+		}
+		if setFlags["sid"] {
+			node.RealityShortID = *sid
+		}
+		if setFlags["username"] {
+			node.Username = *user
+		}
+		if setFlags["password"] {
+			node.Password = *pass
+		}
+
+		if node.Address == "" {
+			fmt.Fprintln(stderr, "--address (or --from-uri) is required")
 			return 2
 		}
-		if *uuid == "" {
-			*uuid, _ = cryptoext.GenerateUUID()
+		if node.UUID == "" && node.Protocol != "socks5" {
+			node.UUID, _ = cryptoext.GenerateUUID()
 		}
-		if *id == "" {
-			*id = fmt.Sprintf("node-%d", time.Now().UnixNano()%1000000)
+		if node.ID == "" {
+			node.ID = fmt.Sprintf("node-%d", time.Now().UnixNano()%1000000)
 		}
-		if *name == "" {
-			*name = *addr
+		if node.Name == "" {
+			node.Name = node.Address
 		}
 		mut := func(cur *state.State) error {
-			cur.Client.Nodes = append(cur.Client.Nodes, state.OutboundNode{
-				ID:             *id,
-				Name:           *name,
-				Protocol:       *proto,
-				Address:        *addr,
-				Port:           *port,
-				UUID:           *uuid,
-				TLSSNI:         *sni,
-				Path:           *path,
-				RealityPubKey:  *pbk,
-				RealityShortID: *sid,
-			})
+			cur.Client.Nodes = append(cur.Client.Nodes, node)
 			if cur.Client.ActiveNodeID == "" {
-				cur.Client.ActiveNodeID = *id
+				cur.Client.ActiveNodeID = node.ID
 			}
 			return nil
 		}
@@ -441,7 +773,147 @@ func cmdNode(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 			fmt.Fprintf(stderr, "node add failed: %v\n", err)
 			return 1
 		}
-		fmt.Fprintf(stdout, "Added node %s (%s)\n", *id, *addr)
+		fmt.Fprintf(stdout, "Added node %s (%s)\n", node.ID, node.Address)
+		return 0
+
+	case "edit":
+		if len(rest) == 0 {
+			fmt.Fprintln(stderr, "usage: dex node edit <id> [flags] [--apply]")
+			return 2
+		}
+		id := rest[0]
+		fs := flag.NewFlagSet("node edit", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		name := fs.String("name", "", "node name")
+		proto := fs.String("proto", "", "protocol")
+		addr := fs.String("address", "", "server host/ip")
+		port := fs.Int("port", 0, "server port")
+		uuid := fs.String("uuid", "", "UUID")
+		sni := fs.String("sni", "", "TLS SNI")
+		path := fs.String("path", "", "WS/XHTTP path")
+		pbk := fs.String("pbk", "", "Reality public key")
+		sid := fs.String("sid", "", "Reality shortId")
+		user := fs.String("username", "", "SOCKS5 username")
+		pass := fs.String("password", "", "SOCKS5 password")
+		doApply := fs.Bool("apply", false, "apply immediately")
+		if err := fs.Parse(rest[1:]); err != nil {
+			return 2
+		}
+		setFlags := make(map[string]bool)
+		fs.Visit(func(f *flag.Flag) {
+			setFlags[f.Name] = true
+		})
+		mut := func(cur *state.State) error {
+			target := cur.Client.FindNode(id)
+			if target == nil {
+				return fmt.Errorf("node %q not found", id)
+			}
+			if setFlags["name"] {
+				target.Name = *name
+			}
+			if setFlags["proto"] {
+				target.Protocol = *proto
+			}
+			if setFlags["address"] {
+				target.Address = *addr
+			}
+			if setFlags["port"] {
+				target.Port = *port
+			}
+			if setFlags["uuid"] {
+				target.UUID = *uuid
+			}
+			if setFlags["sni"] {
+				target.TLSSNI = *sni
+			}
+			if setFlags["path"] {
+				target.Path = *path
+			}
+			if setFlags["pbk"] {
+				target.RealityPubKey = *pbk
+			}
+			if setFlags["sid"] {
+				target.RealityShortID = *sid
+			}
+			if setFlags["username"] {
+				target.Username = *user
+			}
+			if setFlags["password"] {
+				target.Password = *pass
+			}
+			return nil
+		}
+		if err := applyOrSave(store, exec, state.RoleClient, *doApply, mut); err != nil {
+			fmt.Fprintf(stderr, "node edit failed: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Updated node %s\n", id)
+		return 0
+
+	case "move":
+		if len(rest) < 2 {
+			fmt.Fprintln(stderr, "usage: dex node move <id> <up|down> [--apply]")
+			return 2
+		}
+		id := rest[0]
+		dir := strings.ToLower(strings.TrimSpace(rest[1]))
+		if dir != "up" && dir != "down" {
+			fmt.Fprintln(stderr, "direction must be 'up' or 'down'")
+			return 2
+		}
+		doApply := len(rest) > 2 && rest[2] == "--apply"
+		mut := func(cur *state.State) error {
+			idx := -1
+			for i, n := range cur.Client.Nodes {
+				if n.ID == id {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				return fmt.Errorf("node %q not found", id)
+			}
+			if dir == "up" && idx > 0 {
+				cur.Client.Nodes[idx-1], cur.Client.Nodes[idx] = cur.Client.Nodes[idx], cur.Client.Nodes[idx-1]
+			} else if dir == "down" && idx+1 < len(cur.Client.Nodes) {
+				cur.Client.Nodes[idx+1], cur.Client.Nodes[idx] = cur.Client.Nodes[idx], cur.Client.Nodes[idx+1]
+			}
+			return nil
+		}
+		if err := applyOrSave(store, exec, state.RoleClient, doApply, mut); err != nil {
+			fmt.Fprintf(stderr, "node move failed: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Moved node %s %s\n", id, dir)
+		return 0
+
+	case "probe":
+		st, err := store.Load()
+		if err != nil {
+			fmt.Fprintf(stderr, "load state: %v\n", err)
+			return 1
+		}
+		var targets []state.OutboundNode
+		if len(rest) > 0 {
+			n := st.Client.FindNode(rest[0])
+			if n == nil {
+				fmt.Fprintf(stderr, "node %q not found\n", rest[0])
+				return 1
+			}
+			targets = []state.OutboundNode{*n}
+		} else {
+			targets = st.Client.Nodes
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		for _, n := range targets {
+			res := daemon.ProbeNodeHealth(ctx, n, 5*time.Second, false)
+			if res.Healthy {
+				fmt.Fprintf(stdout, "[OK]   %-14s %-16s %4d ms (code=%d)\n", n.ID, n.Name, res.LatencyMS, res.StatusCode)
+			} else {
+				fmt.Fprintf(stdout, "[FAIL] %-14s %-16s %4d ms (%s)\n", n.ID, n.Name, res.LatencyMS, res.Error)
+			}
+		}
 		return 0
 
 	case "del":
@@ -533,18 +1005,37 @@ func cmdCert(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 	rest := args[1:]
 	switch sub {
 	case "self-sign":
+		fs := flag.NewFlagSet("cert self-sign", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		force := fs.Bool("force", false, "overwrite existing valid certificate")
 		cn := "localhost"
-		if len(rest) > 0 {
+		parseArgs := rest
+		if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
 			cn = rest[0]
+			parseArgs = rest[1:]
 		}
-		prevCert, _ := os.ReadFile(store.DefaultCert())
-		if err := cert.EnsureSelfSigned(store.DefaultCert(), store.DefaultKey(), cn); err != nil {
-			fmt.Fprintf(stderr, "self-sign failed: %v\n", err)
-			return 1
+		if err := fs.Parse(parseArgs); err != nil {
+			return 2
 		}
-		afterCert, _ := os.ReadFile(store.DefaultCert())
-		if !bytes.Equal(prevCert, afterCert) {
+		if fs.NArg() > 0 && cn == "localhost" {
+			cn = fs.Arg(0)
+		}
+		if *force {
+			if err := cert.ForceSelfSigned(store.DefaultCert(), store.DefaultKey(), cn); err != nil {
+				fmt.Fprintf(stderr, "self-sign failed: %v\n", err)
+				return 1
+			}
 			reloadCertConsumers(context.Background(), exec, stdout)
+		} else {
+			prevCert, _ := os.ReadFile(store.DefaultCert())
+			if err := cert.EnsureSelfSigned(store.DefaultCert(), store.DefaultKey(), cn); err != nil {
+				fmt.Fprintf(stderr, "self-sign failed: %v\n", err)
+				return 1
+			}
+			afterCert, _ := os.ReadFile(store.DefaultCert())
+			if !bytes.Equal(prevCert, afterCert) {
+				reloadCertConsumers(context.Background(), exec, stdout)
+			}
 		}
 		fmt.Fprintf(stdout, "Self-signed certificate ready at %s\n", store.DefaultCert())
 		return 0
@@ -572,10 +1063,12 @@ func cmdCert(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 	case "issue":
 		fs := flag.NewFlagSet("cert issue", flag.ContinueOnError)
 		fs.SetOutput(stderr)
+		mode := fs.String("mode", "cf", "ACME validation mode: cf|http")
 		dom := fs.String("domain", "", "domain")
 		tok := fs.String("cf-token", "", "Cloudflare API Token (or Global API Key with --cf-email)")
 		email := fs.String("cf-email", "", "Cloudflare account email (for Global API Key)")
-		renew := fs.Bool("renew", false, "keep CF token for automatic renewal")
+		webroot := fs.String("webroot", "", "HTTP-01 webroot directory (uses --standalone if empty)")
+		renew := fs.Bool("renew", true, "keep CF token for automatic renewal")
 		if err := fs.Parse(rest); err != nil {
 			return 2
 		}
@@ -592,15 +1085,30 @@ func cmdCert(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 		if *email == "" && st != nil {
 			*email = st.Cert.CFEmail
 		}
-		rep, err := cert.IssueCloudflareACME(context.Background(), nil, cert.ACMEConfig{
+		acmeMode := strings.ToLower(strings.TrimSpace(*mode))
+		var (
+			rep *cert.CertReport
+			err error
+		)
+		cfg := cert.ACMEConfig{
 			Domain:    *dom,
 			CFToken:   *tok,
 			CFEmail:   *email,
+			Webroot:   *webroot,
 			AutoRenew: *renew,
 			CertPath:  store.DefaultCert(),
 			KeyPath:   store.DefaultKey(),
 			ReloadCmd: buildCertReloadCmd(store.Dir),
-		})
+		}
+		switch acmeMode {
+		case "", "cf", "cloudflare", "dns":
+			rep, err = cert.IssueCloudflareACME(context.Background(), nil, cfg)
+		case "http", "http-01":
+			rep, err = cert.IssueHTTPACME(context.Background(), nil, cfg)
+		default:
+			fmt.Fprintf(stderr, "unsupported --mode %q (expected cf or http)\n", *mode)
+			return 2
+		}
 		if err != nil {
 			fmt.Fprintf(stderr, "acme issue failed: %v\n", err)
 			return 1
@@ -610,7 +1118,9 @@ func cmdCert(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 				cur.Cert.Mode = "acme"
 				cur.Cert.Domain = *dom
 				cur.Cert.AutoRenew = *renew
-				if *renew {
+				if acmeMode == "http" || acmeMode == "http-01" {
+					// HTTP-01 does not rely on CF API tokens
+				} else if *renew {
 					cur.Cert.CFToken = *tok
 					cur.Cert.CFEmail = *email
 				} else {
@@ -644,7 +1154,7 @@ func buildCertReloadCmd(stateDir string) string {
 	return fmt.Sprintf("%s --state-dir %s cert reload", shellSingleQuote(exe), shellSingleQuote(stateDir))
 }
 
-func reloadCertConsumers(ctx context.Context, exec reconcile.SystemExecutor, stdout io.Writer) {
+func reloadNonDaemonCertConsumers(ctx context.Context, exec reconcile.SystemExecutor, stdout io.Writer) {
 	if exec == nil {
 		return
 	}
@@ -656,14 +1166,26 @@ func reloadCertConsumers(ctx context.Context, exec reconcile.SystemExecutor, std
 		}
 		reloaded = append(reloaded, "nginx")
 	}
-	for _, svc := range []string{"dex-xray", "dex-daemon"} {
-		if exec.ServiceIsActive(ctx, initSys, svc) {
-			_ = exec.ServiceRestart(ctx, initSys, svc)
-			reloaded = append(reloaded, svc)
-		}
+	if exec.ServiceIsActive(ctx, initSys, "dex-xray") {
+		_ = exec.ServiceRestart(ctx, initSys, "dex-xray")
+		reloaded = append(reloaded, "dex-xray")
 	}
 	if stdout != nil && len(reloaded) > 0 {
 		fmt.Fprintf(stdout, "Reloaded TLS consumers: %s\n", strings.Join(reloaded, ", "))
+	}
+}
+
+func reloadCertConsumers(ctx context.Context, exec reconcile.SystemExecutor, stdout io.Writer) {
+	if exec == nil {
+		return
+	}
+	reloadNonDaemonCertConsumers(ctx, exec, stdout)
+	initSys := exec.DetectInitSystem()
+	if exec.ServiceIsActive(ctx, initSys, "dex-daemon") {
+		_ = exec.ServiceRestart(ctx, initSys, "dex-daemon")
+		if stdout != nil {
+			fmt.Fprintln(stdout, "Reloaded TLS consumers: dex-daemon")
+		}
 	}
 }
 
@@ -788,7 +1310,10 @@ func cmdWG(store *state.Store, exec reconcile.SystemExecutor, args []string, std
 				}
 			}
 			wg.Enabled = true
-			ip := fmt.Sprintf("172.16.66.%d", 11+len(wg.Peers))
+			ip, ipErr := render.NextAvailableWGIP(wg.SubnetCIDR, wg.Peers)
+			if ipErr != nil {
+				return ipErr
+			}
 			peer := state.WGPeer{Name: name, IP: ip, PrivateKey: priv, PublicKey: pub}
 			wg.Peers = append(wg.Peers, peer)
 			cfgText = render.BuildWGPeerConfig(*wg, peer)
@@ -799,6 +1324,55 @@ func cmdWG(store *state.Store, exec reconcile.SystemExecutor, args []string, std
 			return 1
 		}
 		fmt.Fprintf(stdout, "Added peer %s:\n%s", name, cfgText)
+		return 0
+
+	case "keygen-server":
+		doApply := len(rest) > 0 && rest[0] == "--apply"
+		priv, pub, err := cryptoext.GenerateWireGuardKeypair()
+		if err != nil {
+			fmt.Fprintf(stderr, "generate server keypair: %v\n", err)
+			return 1
+		}
+		if err := applyOrSave(store, exec, state.RoleClient, doApply, func(cur *state.State) error {
+			cur.Client.WireGuard.ServerPrivateKey = priv
+			cur.Client.WireGuard.ServerPublicKey = pub
+			return nil
+		}); err != nil {
+			fmt.Fprintf(stderr, "wg keygen-server failed: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Regenerated WireGuard server keypair (pubkey=%s)\n", pub)
+		return 0
+
+	case "peer-regen":
+		if len(rest) == 0 {
+			fmt.Fprintln(stderr, "usage: dex wg peer-regen <name> [--apply]")
+			return 2
+		}
+		name := rest[0]
+		doApply := len(rest) > 1 && rest[1] == "--apply"
+		priv, pub, err := cryptoext.GenerateWireGuardKeypair()
+		if err != nil {
+			fmt.Fprintf(stderr, "generate keypair: %v\n", err)
+			return 1
+		}
+		var cfgText string
+		if err := applyOrSave(store, exec, state.RoleClient, doApply, func(cur *state.State) error {
+			wg := &cur.Client.WireGuard
+			for i := range wg.Peers {
+				if wg.Peers[i].Name == name {
+					wg.Peers[i].PrivateKey = priv
+					wg.Peers[i].PublicKey = pub
+					cfgText = render.BuildWGPeerConfig(*wg, wg.Peers[i])
+					return nil
+				}
+			}
+			return fmt.Errorf("peer %q not found", name)
+		}); err != nil {
+			fmt.Fprintf(stderr, "wg peer-regen failed: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Regenerated peer %s:\n%s", name, cfgText)
 		return 0
 
 	case "peer-del":
@@ -1390,6 +1964,10 @@ func buildExtraShareURI(st *state.State, ex state.ExtraInbound) string {
 	if host == "" {
 		host = "node.example.com"
 	}
+	path := ex.Path
+	if ex.Protocol == "vless-xhttp" || ex.Protocol == "vless-ws" || ex.Protocol == "vmess-ws" {
+		path = render.NormalizePath(ex.Path, ex.UUID)
+	}
 	return render.BuildNodeURI(state.OutboundNode{
 		Name:           ex.Tag,
 		Protocol:       ex.Protocol,
@@ -1397,7 +1975,7 @@ func buildExtraShareURI(st *state.State, ex state.ExtraInbound) string {
 		Port:           ex.ListenPort,
 		UUID:           ex.UUID,
 		TLSSNI:         firstNonEmpty(ex.RealitySNI, ex.Domain, host),
-		Path:           ex.Path,
+		Path:           path,
 		RealityPubKey:  ex.RealityPubKey,
 		RealityShortID: ex.RealityShortID,
 		Username:       ex.SocksUser,
@@ -1424,6 +2002,53 @@ func upsertExtraInbound(list []state.ExtraInbound, ex state.ExtraInbound) []stat
 	return append(list, ex)
 }
 
+func addTLSExtraInbound(store *state.Store, exec reconcile.SystemExecutor, defRole, proto, cmdName string, rest []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet(cmdName, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	port := fs.Int("port", 0, "listen port")
+	domain := fs.String("domain", "", "TLS domain/SNI (optional when sharing server domain)")
+	path := fs.String("path", "", "WS/XHTTP path (auto-derived if empty)")
+	uuid := fs.String("uuid", "", "UUID (auto-generated if empty)")
+	viaNginx := fs.Bool("via-nginx", false, "terminate TLS via Nginx SNI/path proxy")
+	tag := fs.String("tag", "", "inbound tag")
+	doApply := fs.Bool("apply", false, "apply immediately")
+	if err := fs.Parse(rest); err != nil {
+		return 2
+	}
+	if *port <= 0 || *port > 65535 {
+		fmt.Fprintln(stderr, "--port must be 1..65535")
+		return 2
+	}
+	u := strings.TrimSpace(*uuid)
+	if u == "" {
+		u, _ = cryptoext.GenerateUUID()
+	}
+	t := strings.TrimSpace(*tag)
+	if t == "" {
+		t = fmt.Sprintf("inbound-%s-%d", strings.ReplaceAll(proto, "vless-", ""), *port)
+	}
+	ex := state.ExtraInbound{
+		Tag:        t,
+		Protocol:   proto,
+		ListenPort: *port,
+		Domain:     strings.TrimSpace(*domain),
+		Path:       strings.TrimSpace(*path),
+		UUID:       u,
+		ViaNginx:   *viaNginx,
+	}
+	if err := applyOrSave(store, exec, defRole, *doApply, func(cur *state.State) error {
+		cur.ExtraInbounds = upsertExtraInbound(cur.ExtraInbounds, ex)
+		return nil
+	}); err != nil {
+		fmt.Fprintf(stderr, "%s failed: %v\n", cmdName, err)
+		return 1
+	}
+	st, _ := store.Load()
+	fmt.Fprintf(stdout, "Added %s (%s :%d via_nginx=%v)\nUUID: %s\nPath: %s\nURI:  %s\n",
+		ex.Tag, ex.Protocol, ex.ListenPort, ex.ViaNginx, ex.UUID, render.NormalizePath(ex.Path, ex.UUID), buildExtraShareURI(st, ex))
+	return 0
+}
+
 func cmdExtra(store *state.Store, exec reconcile.SystemExecutor, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "list" {
 		st, err := store.Load()
@@ -1433,8 +2058,17 @@ func cmdExtra(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 		}
 		for _, ex := range st.ExtraInbounds {
 			fmt.Fprintf(stdout, "[%s] %-14s :%d via_nginx=%v", ex.Tag, ex.Protocol, ex.ListenPort, ex.ViaNginx)
-			if ex.Protocol == "vless-reality" {
+			switch ex.Protocol {
+			case "vless-reality":
 				fmt.Fprintf(stdout, " sni=%s pbk=%s sid=%s uuid=%s", ex.RealitySNI, ex.RealityPubKey, ex.RealityShortID, ex.UUID)
+			case "dokodemo":
+				netLabel := ex.Network
+				if netLabel == "" {
+					netLabel = "tcp,udp"
+				}
+				fmt.Fprintf(stdout, " -> %s:%d (%s)", ex.TargetAddr, ex.TargetPort, netLabel)
+			case "vless-xhttp", "vless-ws", "vmess-ws":
+				fmt.Fprintf(stdout, " domain=%s path=%s", ex.Domain, render.NormalizePath(ex.Path, ex.UUID))
 			}
 			fmt.Fprintln(stdout)
 			if uri := buildExtraShareURI(st, ex); uri != "" {
@@ -1448,6 +2082,90 @@ func cmdExtra(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 	sub := args[0]
 	rest := args[1:]
 	switch sub {
+	case "add-xhttp":
+		return addTLSExtraInbound(store, exec, defRole, "vless-xhttp", "extra add-xhttp", rest, stdout, stderr)
+	case "add-vless-ws":
+		return addTLSExtraInbound(store, exec, defRole, "vless-ws", "extra add-vless-ws", rest, stdout, stderr)
+	case "add-vmess-ws":
+		return addTLSExtraInbound(store, exec, defRole, "vmess-ws", "extra add-vmess-ws", rest, stdout, stderr)
+	case "add-dokodemo":
+		fs := flag.NewFlagSet("extra add-dokodemo", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		port := fs.Int("port", 0, "listen port")
+		target := fs.String("target", "", "target host:port")
+		targetAddr := fs.String("target-addr", "", "target host/IP")
+		targetPort := fs.Int("target-port", 0, "target port")
+		network := fs.String("network", "tcp,udp", "network: tcp|udp|tcp,udp")
+		tag := fs.String("tag", "", "inbound tag")
+		doApply := fs.Bool("apply", false, "apply immediately")
+		if err := fs.Parse(rest); err != nil {
+			return 2
+		}
+		if *port <= 0 || *port > 65535 {
+			fmt.Fprintln(stderr, "--port must be 1..65535")
+			return 2
+		}
+		tAddr := strings.TrimSpace(*targetAddr)
+		tPort := *targetPort
+		if strings.TrimSpace(*target) != "" {
+			h, pStr, err := net.SplitHostPort(strings.TrimSpace(*target))
+			if err != nil {
+				fmt.Fprintf(stderr, "invalid --target %q: %v\n", *target, err)
+				return 2
+			}
+			pVal, err := strconv.Atoi(pStr)
+			if err != nil || pVal < 1 || pVal > 65535 {
+				fmt.Fprintf(stderr, "invalid --target port %q\n", pStr)
+				return 2
+			}
+			if tAddr == "" {
+				tAddr = h
+			}
+			if tPort == 0 {
+				tPort = pVal
+			}
+		}
+		if tAddr == "" || tPort <= 0 || tPort > 65535 {
+			fmt.Fprintln(stderr, "--target (or --target-addr and --target-port) is required")
+			return 2
+		}
+		t := strings.TrimSpace(*tag)
+		if t == "" {
+			t = fmt.Sprintf("inbound-dokodemo-%d", *port)
+		}
+		ex := state.ExtraInbound{
+			Tag:        t,
+			Protocol:   "dokodemo",
+			ListenPort: *port,
+			TargetAddr: tAddr,
+			TargetPort: tPort,
+			Network:    strings.TrimSpace(*network),
+		}
+		if err := applyOrSave(store, exec, defRole, *doApply, func(cur *state.State) error {
+			cur.ExtraInbounds = upsertExtraInbound(cur.ExtraInbounds, ex)
+			return nil
+		}); err != nil {
+			fmt.Fprintf(stderr, "extra add-dokodemo failed: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Added %s (dokodemo :%d -> %s:%d %s)\n", ex.Tag, ex.ListenPort, ex.TargetAddr, ex.TargetPort, ex.Network)
+		return 0
+	case "disable-all":
+		fs := flag.NewFlagSet("extra disable-all", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		doApply := fs.Bool("apply", false, "apply immediately")
+		if err := fs.Parse(rest); err != nil {
+			return 2
+		}
+		if err := applyOrSave(store, exec, defRole, *doApply, func(cur *state.State) error {
+			cur.ExtraInbounds = nil
+			return nil
+		}); err != nil {
+			fmt.Fprintf(stderr, "extra disable-all failed: %v\n", err)
+			return 1
+		}
+		fmt.Fprintln(stdout, "Disabled all extra inbounds.")
+		return 0
 	case "add-reality":
 		fs := flag.NewFlagSet("extra add-reality", flag.ContinueOnError)
 		fs.SetOutput(stderr)
@@ -1542,7 +2260,8 @@ func cmdExtra(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 			fmt.Fprintf(stderr, "extra add-socks5 failed: %v\n", err)
 			return 1
 		}
-		fmt.Fprintf(stdout, "Added %s (socks5 :%d)\n", ex.Tag, ex.ListenPort)
+		st, _ := store.Load()
+		fmt.Fprintf(stdout, "Added %s (socks5 :%d)\nURI: %s\n", ex.Tag, ex.ListenPort, buildExtraShareURI(st, ex))
 		return 0
 
 	case "del":
@@ -1697,6 +2416,16 @@ func cmdDaemon(store *state.Store, exec reconcile.SystemExecutor, args []string,
 	hub := daemon.NewTaskHub(300)
 	runner := daemon.NewRunner(store, exec, hub)
 	webSrv := web.NewServer(store, exec, hub, runner.DDNS, reconcile.ApplyOptions{})
+	webSrv.CertReloadCmd = buildCertReloadCmd(store.Dir)
+	webSrv.UpdateRulesFn = func(ctx context.Context, includeAds bool, w io.Writer) error {
+		return UpdateRules(ctx, store, exec, OpsConfig{}, includeAds, false, w)
+	}
+	webSrv.UpdateComponentsFn = func(ctx context.Context, component, ver string, w io.Writer) error {
+		return UpdateComponents(ctx, store, exec, OpsConfig{SkipDaemonRestart: true}, component, ver, w)
+	}
+	webSrv.ReloadCertFn = func(ctx context.Context) {
+		reloadNonDaemonCertConsumers(ctx, exec, nil)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

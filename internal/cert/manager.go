@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,11 +20,12 @@ import (
 	"time"
 )
 
-// ACMEConfig configures Cloudflare DNS-01 certificate issuance via acme.sh.
+// ACMEConfig configures ACME certificate issuance via acme.sh (DNS-01 or HTTP-01).
 type ACMEConfig struct {
 	Domain    string
 	CFToken   string
 	CFEmail   string
+	Webroot   string
 	AutoRenew bool
 	AcmeBin   string
 	AcmeHome  string
@@ -95,7 +97,15 @@ func EnsureSelfSigned(certPath, keyPath, cn string) error {
 			}
 		}
 	}
+	return generateAndWriteSelfSigned(certPath, keyPath, cn)
+}
 
+// ForceSelfSigned unconditionally generates and writes a new 10-year ECDSA P-256 self-signed cert/key pair.
+func ForceSelfSigned(certPath, keyPath, cn string) error {
+	return generateAndWriteSelfSigned(certPath, keyPath, cn)
+}
+
+func generateAndWriteSelfSigned(certPath, keyPath, cn string) error {
 	if cn == "" {
 		cn = "localhost"
 	}
@@ -186,64 +196,37 @@ func ImportPair(srcCert, srcKey, dstCert, dstKey string, allowSelfSigned bool, c
 	return report, true, nil
 }
 
-// IssueCloudflareACME issues an EC-256 wildcard certificate via acme.sh DNS-01, stages and validates it,
-// preserves previous certificates on failure, and scrubs CF credentials if AutoRenew is false.
-func IssueCloudflareACME(ctx context.Context, runner ACMERunner, cfg ACMEConfig) (*CertReport, error) {
-	if runner == nil {
-		runner = osACMERunner{}
-	}
+func normalizeACMEConfig(cfg *ACMEConfig) ACMERunner {
 	if cfg.AcmeBin == "" {
 		cfg.AcmeBin = "/root/.acme.sh/acme.sh"
 	}
 	if cfg.AcmeHome == "" {
 		cfg.AcmeHome = filepath.Dir(cfg.AcmeBin)
 	}
-	if strings.TrimSpace(cfg.CFToken) == "" {
-		return nil, errors.New("Cloudflare API Token is required")
-	}
-	mainDomain, sans, err := BuildWildcardSANs(cfg.Domain)
-	if err != nil {
-		return nil, err
-	}
+	return osACMERunner{}
+}
 
-	if _, isOS := runner.(osACMERunner); isOS {
-		if _, statErr := os.Stat(cfg.AcmeBin); os.IsNotExist(statErr) {
-			out, ierr := runner.Run(ctx, nil, "sh", "-c",
-				`curl -fsSL https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh | sh -s -- --install-online --force --home "$1" --email "$2"`,
-				"sh", cfg.AcmeHome, "admin@"+mainDomain,
-			)
-			if ierr != nil {
-				return nil, fmt.Errorf("auto-install acme.sh failed: %w (%s)", ierr, strings.TrimSpace(string(out)))
-			}
-			if _, postErr := os.Stat(cfg.AcmeBin); postErr != nil {
-				return nil, fmt.Errorf("acme.sh binary missing after install at %s: %w (%s)", cfg.AcmeBin, postErr, strings.TrimSpace(string(out)))
-			}
-		}
+func ensureACMESh(ctx context.Context, runner ACMERunner, acmeBin, acmeHome, email string) error {
+	if _, isOS := runner.(osACMERunner); !isOS {
+		return nil
 	}
+	if _, statErr := os.Stat(acmeBin); !os.IsNotExist(statErr) {
+		return nil
+	}
+	out, ierr := runner.Run(ctx, nil, "sh", "-c",
+		`curl -fsSL https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh | sh -s -- --install-online --force --home "$1" --email "$2"`,
+		"sh", acmeHome, email,
+	)
+	if ierr != nil {
+		return fmt.Errorf("auto-install acme.sh failed: %w (%s)", ierr, strings.TrimSpace(string(out)))
+	}
+	if _, postErr := os.Stat(acmeBin); postErr != nil {
+		return fmt.Errorf("acme.sh binary missing after install at %s: %w (%s)", acmeBin, postErr, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
 
-	accountConf := filepath.Join(cfg.AcmeHome, "account.conf")
-	scrubLegacyKeys(accountConf)
-
-	env := []string{"CF_Token=" + strings.TrimSpace(cfg.CFToken)}
-	if strings.TrimSpace(cfg.CFEmail) != "" {
-		env = []string{
-			"CF_Key=" + strings.TrimSpace(cfg.CFToken),
-			"CF_Email=" + strings.TrimSpace(cfg.CFEmail),
-		}
-	}
-	if _, err := runner.Run(ctx, env, cfg.AcmeBin, "--home", cfg.AcmeHome, "--set-default-ca", "--server", "letsencrypt"); err != nil {
-		return nil, fmt.Errorf("acme set-default-ca: %w", err)
-	}
-
-	args := []string{"--home", cfg.AcmeHome, "--force", "--issue", "--dns", "dns_cf", "--dnssleep", "45"}
-	for _, s := range sans {
-		args = append(args, "-d", s)
-	}
-	args = append(args, "-k", "ec-256")
-	if out, err := runner.Run(ctx, env, cfg.AcmeBin, args...); err != nil {
-		return nil, fmt.Errorf("acme issue failed: %w (%s)", err, strings.TrimSpace(string(out)))
-	}
-
+func stageAndInstallACMECert(ctx context.Context, runner ACMERunner, env []string, cfg ACMEConfig, mainDomain string) (*CertReport, error) {
 	acmeSrc := filepath.Join(cfg.AcmeHome, mainDomain+"_ecc")
 	stagedCert := filepath.Join(acmeSrc, "fullchain.cer")
 	stagedKey := filepath.Join(acmeSrc, mainDomain+".key")
@@ -277,11 +260,100 @@ func IssueCloudflareACME(ctx context.Context, runner ACMERunner, cfg ACMEConfig)
 		installArgs = append(installArgs, "--reloadcmd", cfg.ReloadCmd)
 	}
 	_, _ = runner.Run(ctx, env, cfg.AcmeBin, installArgs...)
+	return report, nil
+}
 
+// IssueCloudflareACME issues an EC-256 wildcard certificate via acme.sh DNS-01, stages and validates it,
+// preserves previous certificates on failure, and scrubs CF credentials if AutoRenew is false.
+func IssueCloudflareACME(ctx context.Context, runner ACMERunner, cfg ACMEConfig) (*CertReport, error) {
+	defaultRunner := normalizeACMEConfig(&cfg)
+	if runner == nil {
+		runner = defaultRunner
+	}
+	if strings.TrimSpace(cfg.CFToken) == "" {
+		return nil, errors.New("Cloudflare API Token is required")
+	}
+	mainDomain, sans, err := BuildWildcardSANs(cfg.Domain)
+	if err != nil {
+		return nil, err
+	}
+	if err := ensureACMESh(ctx, runner, cfg.AcmeBin, cfg.AcmeHome, "admin@"+mainDomain); err != nil {
+		return nil, err
+	}
+
+	accountConf := filepath.Join(cfg.AcmeHome, "account.conf")
+	scrubLegacyKeys(accountConf)
+
+	env := []string{"CF_Token=" + strings.TrimSpace(cfg.CFToken)}
+	if strings.TrimSpace(cfg.CFEmail) != "" {
+		env = []string{
+			"CF_Key=" + strings.TrimSpace(cfg.CFToken),
+			"CF_Email=" + strings.TrimSpace(cfg.CFEmail),
+		}
+	}
+	if _, err := runner.Run(ctx, env, cfg.AcmeBin, "--home", cfg.AcmeHome, "--set-default-ca", "--server", "letsencrypt"); err != nil {
+		return nil, fmt.Errorf("acme set-default-ca: %w", err)
+	}
+
+	args := []string{"--home", cfg.AcmeHome, "--force", "--issue", "--dns", "dns_cf", "--dnssleep", "45"}
+	for _, s := range sans {
+		args = append(args, "-d", s)
+	}
+	args = append(args, "-k", "ec-256")
+	if out, err := runner.Run(ctx, env, cfg.AcmeBin, args...); err != nil {
+		return nil, fmt.Errorf("acme issue failed: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+
+	report, err := stageAndInstallACMECert(ctx, runner, env, cfg, mainDomain)
+	if err != nil {
+		return nil, err
+	}
 	if !cfg.AutoRenew {
 		scrubTokenFromAccountConf(accountConf)
 	}
 	return report, nil
+}
+
+// IssueHTTPACME issues a single-domain EC-256 certificate via acme.sh HTTP-01 (--webroot or --standalone).
+func IssueHTTPACME(ctx context.Context, runner ACMERunner, cfg ACMEConfig) (*CertReport, error) {
+	defaultRunner := normalizeACMEConfig(&cfg)
+	if runner == nil {
+		runner = defaultRunner
+	}
+	d := strings.ToLower(strings.TrimSpace(strings.TrimSuffix(cfg.Domain, ".")))
+	if _, ipErr := netip.ParseAddr(d); ipErr == nil {
+		return nil, fmt.Errorf("ACME HTTP-01 certificates require a domain name, got IP %q", cfg.Domain)
+	}
+	if !domainSyntaxRe.MatchString(d) {
+		return nil, fmt.Errorf("invalid domain %q", cfg.Domain)
+	}
+	if err := ensureACMESh(ctx, runner, cfg.AcmeBin, cfg.AcmeHome, "admin@"+d); err != nil {
+		return nil, err
+	}
+	if _, err := runner.Run(ctx, nil, cfg.AcmeBin, "--home", cfg.AcmeHome, "--set-default-ca", "--server", "letsencrypt"); err != nil {
+		return nil, fmt.Errorf("acme set-default-ca: %w", err)
+	}
+
+	args := []string{"--home", cfg.AcmeHome, "--force", "--issue", "-d", d}
+	if wr := strings.TrimSpace(cfg.Webroot); wr != "" {
+		if strings.HasPrefix(wr, "-") || !filepath.IsAbs(wr) {
+			return nil, fmt.Errorf("invalid webroot %q: must be an absolute path", cfg.Webroot)
+		}
+		for _, r := range wr {
+			if r < 0x20 || r == 0x7f {
+				return nil, fmt.Errorf("invalid webroot %q: control character not allowed", cfg.Webroot)
+			}
+		}
+		args = append(args, "--webroot", wr)
+	} else {
+		args = append(args, "--standalone")
+	}
+	args = append(args, "-k", "ec-256")
+	if out, err := runner.Run(ctx, nil, cfg.AcmeBin, args...); err != nil {
+		return nil, fmt.Errorf("acme http issue failed: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+
+	return stageAndInstallACMECert(ctx, runner, nil, cfg, d)
 }
 
 func scrubLegacyKeys(path string) {

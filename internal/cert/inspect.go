@@ -18,15 +18,15 @@ import (
 
 // CertReport summarizes the inspection of a certificate + private key PEM pair.
 type CertReport struct {
-	CommonName       string    `json:"common_name"`
-	SANs             []string  `json:"sans"`
-	NotBefore        time.Time `json:"not_before"`
-	NotAfter         time.Time `json:"not_after"`
-	SelfSigned       bool      `json:"self_signed"`
-	ChainValid       bool      `json:"chain_valid"`
-	ExpiringSoon     bool      `json:"expiring_soon"`
-	Warnings         []string  `json:"warnings,omitempty"`
-	IntermediateCount int      `json:"intermediate_count"`
+	CommonName        string    `json:"common_name"`
+	SANs              []string  `json:"sans"`
+	NotBefore         time.Time `json:"not_before"`
+	NotAfter          time.Time `json:"not_after"`
+	SelfSigned        bool      `json:"self_signed"`
+	ChainValid        bool      `json:"chain_valid"`
+	ExpiringSoon      bool      `json:"expiring_soon"`
+	Warnings          []string  `json:"warnings,omitempty"`
+	IntermediateCount int       `json:"intermediate_count"`
 }
 
 var (

@@ -585,3 +585,116 @@ func TestRenderWave1ProtocolsAndDataPlane(t *testing.T) {
 		t.Fatalf("expected vmess:// BuildServerMainURI for vmess-ws, got %q", mainURI)
 	}
 }
+
+func TestWave2ParseNodeURIWGIPAndTimers(t *testing.T) {
+	// 1. ParseNodeURI round-trips across all 6 protocols
+	cases := []state.OutboundNode{
+		{
+			Name:     "xhttp1",
+			Protocol: "vless-xhttp",
+			Address:  "x.example.com",
+			Port:     443,
+			UUID:     "11111111-1111-4111-8111-111111111111",
+			TLSSNI:   "sni.example.com",
+			Path:     "/xhttp-path",
+		},
+		{
+			Name:           "real1",
+			Protocol:       "vless-reality",
+			Address:        "198.51.100.10",
+			Port:           2443,
+			UUID:           "22222222-2222-4222-8222-222222222222",
+			TLSSNI:         "www.apple.com",
+			RealityPubKey:  "pubkey123",
+			RealityShortID: "abcd",
+		},
+		{
+			Name:     "vlessws1",
+			Protocol: "vless-ws",
+			Address:  "ws.example.com",
+			Port:     8443,
+			UUID:     "33333333-3333-4333-8333-333333333333",
+			TLSSNI:   "ws.example.com",
+			Path:     "/vws",
+		},
+		{
+			Name:     "vmessws1",
+			Protocol: "vmess-ws",
+			Address:  "vm.example.com",
+			Port:     443,
+			UUID:     "44444444-4444-4444-8444-444444444444",
+			TLSSNI:   "vm.example.com",
+			Path:     "/vmws",
+		},
+		{
+			Name:     "vmesstcp1",
+			Protocol: "vmess-tcp",
+			Address:  "198.51.100.20",
+			Port:     9800,
+			UUID:     "55555555-5555-4555-8555-555555555555",
+		},
+		{
+			Name:     "socks1",
+			Protocol: "socks5",
+			Address:  "127.0.0.1",
+			Port:     1080,
+			Username: "u1",
+			Password: "p1",
+		},
+	}
+	for _, tc := range cases {
+		uri := BuildNodeURI(tc)
+		got, err := ParseNodeURI(uri)
+		if err != nil {
+			t.Fatalf("ParseNodeURI(%s): %v (uri=%q)", tc.Protocol, err, uri)
+		}
+		if got.Protocol != tc.Protocol || got.Address != tc.Address || got.Port != tc.Port || got.UUID != tc.UUID {
+			t.Fatalf("round-trip mismatch for %s: got=%+v want=%+v", tc.Protocol, got, tc)
+		}
+	}
+
+	// 2. NextAvailableWGIP fills gaps cleanly
+	ip, err := NextAvailableWGIP("172.16.66.1/24", []state.WGPeer{
+		{Name: "p1", IP: "172.16.66.11"},
+		{Name: "p3", IP: "172.16.66.13"},
+	})
+	if err != nil || ip != "172.16.66.12" {
+		t.Fatalf("expected gap IP 172.16.66.12, got %q err=%v", ip, err)
+	}
+
+	// 3. Refresh timer (4h vs 5min) and AutoUpdateCore timer
+	c := state.NewDefaultState(state.RoleClient)
+	c.System.AutoUpdateCore = true
+	c.Client.Nodes = []state.OutboundNode{{
+		ID: "n1", Protocol: "vless-xhttp", Address: "node.example.com", Port: 443,
+		UUID: "11111111-1111-4111-8111-111111111111",
+	}}
+	bDom, err := RenderAll(c, RenderOptions{})
+	if err != nil {
+		t.Fatalf("RenderAll domain client: %v", err)
+	}
+	if !bDom.RefreshTimerNeeded || bDom.RefreshInterval != "4h" || !bDom.CoreUpdateTimerNeeded {
+		t.Fatalf("expected RefreshTimerNeeded(4h) & CoreUpdateTimerNeeded, got %+v", bDom)
+	}
+	if refT, ok := findFile(bDom, "systemd/dex-refresh.timer"); !ok || !strings.Contains(string(refT.Content), "OnUnitActiveSec=4h") {
+		t.Fatalf("expected 4h refresh timer unit")
+	}
+	if updT, ok := findFile(bDom, "systemd/dex-core-update.timer"); !ok || !strings.Contains(string(updT.Content), "OnCalendar=weekly") {
+		t.Fatalf("expected dex-core-update.timer unit")
+	}
+
+	c.Relay.Forwards = []state.ForwardRule{{
+		ID: "r1", ListenPort: 10001, TargetHost: "relay.example.com", TargetPort: 443, Proto: "tcp", Engine: "nft",
+	}}
+	bRelay, err := RenderAll(c, RenderOptions{
+		ResolvedHostIPs: map[string][]netip.Addr{
+			"relay.example.com": {netip.MustParseAddr("198.51.100.99")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("RenderAll relay client: %v", err)
+	}
+	if !bRelay.RefreshTimerNeeded || bRelay.RefreshInterval != "5min" {
+		t.Fatalf("expected 5min refresh interval when NFTRelayNeeded, got %+v", bRelay)
+	}
+}

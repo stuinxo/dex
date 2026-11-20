@@ -36,13 +36,17 @@ func runInteractiveMenu(store *state.Store, exec reconcile.SystemExecutor, stdin
 	for {
 		st, err := store.Load()
 		roleStr := "uninitialized"
+		svcLine := ""
 		if err == nil {
 			roleStr = st.Role
+			if sum := serviceStatusSummary(exec, st); sum != "" {
+				svcLine = "Services: " + sum + "\n"
+			}
 		}
 		fmt.Fprintf(stdout, `
 ================ DEX %s (%s) ================
- 1. 初始化向导 (Client / Server / Landing / Relay)
- 3. 域名与证书管理 (导入 / ACME 签发 / 自检)
+%s 1. 初始化向导 (Client / Server / Landing / Relay)
+ 3. 域名与证书管理 (导入 / ACME 签发 / 自检 / 服务端端口域名)
  4. 修改主节点 UUID / Path
  8. 修改 Web 面板监听端口
  9. 修改 Web 登录密码
@@ -50,7 +54,7 @@ func runInteractiveMenu(store *state.Store, exec reconcile.SystemExecutor, stdin
 22. Rproxy 反向代理设置
 35. SOCKS5 多出口分流管理 (Server)
 44. TCP/UDP 端口转发管理 (nft / haproxy / xray)
-55. 附加协议管理 (Reality / WS / SOCKS5 / Dokodemo)
+55. 附加协议管理 (Reality / XHTTP / WS / SOCKS5 / Dokodemo)
 66. WireGuard 回家管理
 77. Cloudflare DDNS 设置与同步
 88. 从 v2 (0conf/server) / des / dexs 导入迁移
@@ -59,7 +63,7 @@ func runInteractiveMenu(store *state.Store, exec reconcile.SystemExecutor, stdin
  0. 应用配置 (Apply) 并查看状态
  q. 退出
 ====================================================
-`, version.Summary(), roleStr)
+`, version.Summary(), roleStr, svcLine)
 
 		choice := ask("Select", "q")
 		switch choice {
@@ -78,16 +82,49 @@ func runInteractiveMenu(store *state.Store, exec reconcile.SystemExecutor, stdin
 			}
 			cmdInit(store, exec, args, stdout, stderr)
 		case "3":
-			sub := ask("Action (inspect/import/issue/self-sign)", "inspect")
-			if sub == "import" {
+			sub := ask("Action (inspect/import/issue/self-sign/server)", "inspect")
+			switch sub {
+			case "import":
 				c := ask("Cert file", "/root/de_GWD.cer")
 				k := ask("Key file", "/root/de_GWD.key")
 				cmdCert(store, exec, []string{"import", c, k}, stdout, stderr)
-			} else if sub == "issue" {
+			case "issue":
+				m := ask("Mode (cf/http)", "cf")
 				d := ask("Domain", "")
-				t := ask("Cloudflare Token", "")
-				cmdCert(store, exec, []string{"issue", "--domain", d, "--cf-token", t}, stdout, stderr)
-			} else {
+				args := []string{"issue", "--mode", m, "--domain", d}
+				if strings.EqualFold(m, "http") {
+					wr := ask("Webroot (empty for standalone)", "")
+					if wr != "" {
+						args = append(args, "--webroot", wr)
+					}
+				} else {
+					t := ask("Cloudflare Token", "")
+					args = append(args, "--cf-token", t)
+				}
+				cmdCert(store, exec, args, stdout, stderr)
+			case "server":
+				d := ask("Server Domain", "")
+				p := ask("Listen Port (empty to keep)", "")
+				pp := ask("Public Port (empty to keep)", "")
+				proto := ask("Protocol (vless-xhttp/vmess-ws/vless-ws, empty to keep)", "")
+				args := []string{"set"}
+				if d != "" {
+					args = append(args, "--domain", d)
+				}
+				if p != "" {
+					args = append(args, "--port", p)
+				}
+				if pp != "" {
+					args = append(args, "--public-port", pp)
+				}
+				if proto != "" {
+					args = append(args, "--protocol", proto)
+				}
+				if strings.EqualFold(ask("Apply now? (y/N)", "n"), "y") {
+					args = append(args, "--apply")
+				}
+				cmdServer(store, exec, args, stdout, stderr)
+			default:
 				cmdCert(store, exec, []string{sub}, stdout, stderr)
 			}
 		case "4":
@@ -111,7 +148,10 @@ func runInteractiveMenu(store *state.Store, exec reconcile.SystemExecutor, stdin
 			if err != nil {
 				fmt.Fprintf(stderr, "update failed: %v\n", err)
 			} else {
-				fmt.Fprintln(stdout, "Updated UUID & Path. Run option 0 to apply.")
+				fmt.Fprintln(stdout, "Updated UUID & Path.")
+				if strings.EqualFold(ask("Apply now? (y/N)", "n"), "y") {
+					cmdApply(store, exec, nil, stdout, stderr)
+				}
 			}
 		case "8":
 			if st == nil {
@@ -159,12 +199,24 @@ func runInteractiveMenu(store *state.Store, exec reconcile.SystemExecutor, stdin
 		case "11":
 			cmdNode(store, exec, []string{"show"}, stdout, stderr)
 		case "22":
-			sub := ask("Action (show/set/disable)", "show")
-			if sub == "set" {
+			sub := ask("Action (show/set/map-add/map-del/disable)", "show")
+			switch sub {
+			case "set":
 				d := ask("RproxyS domain", "")
 				p := ask("Tunnel port", "20000")
 				cmdRproxy(store, exec, []string{"set", "--domain", d, "--port", p}, stdout, stderr)
-			} else {
+			case "map-add":
+				p := ask("Public port", "")
+				pr := ask("Protocol (tcp/udp/tcp,udp)", "tcp")
+				args := []string{"map-add", "--port", p, "--proto", pr}
+				if strings.EqualFold(ask("Apply now? (y/N)", "n"), "y") {
+					args = append(args, "--apply")
+				}
+				cmdRproxy(store, exec, args, stdout, stderr)
+			case "map-del":
+				p := ask("Mapped port", "")
+				cmdRproxy(store, exec, []string{"map-del", p}, stdout, stderr)
+			default:
 				cmdRproxy(store, exec, []string{sub}, stdout, stderr)
 			}
 		case "35":
@@ -174,7 +226,15 @@ func runInteractiveMenu(store *state.Store, exec reconcile.SystemExecutor, stdin
 				ep := ask("Endpoint (socks5://... or host:port)", "")
 				dom := ask("Domain rules (@ai,@stream,@tg or empty)", "")
 				ip := ask("IP rules (@tg,CIDR or empty)", "")
-				cmdSocks5(store, exec, []string{"add", "--name", n, "--endpoint", ep, "--domains", dom, "--ips", ip}, stdout, stderr)
+				pb := ask("Private bypass? (Y/n)", "y")
+				args := []string{"add", "--name", n, "--endpoint", ep, "--domains", dom, "--ips", ip}
+				if strings.EqualFold(pb, "n") || strings.EqualFold(pb, "false") {
+					args = append(args, "--private-bypass=false")
+				}
+				if strings.EqualFold(ask("Apply now? (y/N)", "n"), "y") {
+					args = append(args, "--apply")
+				}
+				cmdSocks5(store, exec, args, stdout, stderr)
 			} else if sub == "del" || sub == "toggle" {
 				n := ask("Profile name", "default")
 				cmdSocks5(store, exec, []string{sub, n}, stdout, stderr)
@@ -197,37 +257,73 @@ func runInteractiveMenu(store *state.Store, exec reconcile.SystemExecutor, stdin
 				cmdRelay(store, exec, []string{"list"}, stdout, stderr)
 			}
 		case "55":
-			if st == nil {
-				fmt.Fprintln(stderr, "Initialize state first.")
-				continue
-			}
-			priv, pub, _ := cryptoext.GenerateRealityKeypair()
-			sid, _ := cryptoext.GenerateHexToken(4)
-			u, _ := cryptoext.GenerateUUID()
-			pStr := ask("Extra Reality listen port", "2443")
-			sni := ask("Reality SNI", "www.apple.com")
-			if p, perr := strconv.Atoi(pStr); perr == nil {
-				_, _ = store.Update(st.Role, func(cur *state.State) error {
-					cur.ExtraInbounds = append(cur.ExtraInbounds, state.ExtraInbound{
-						Tag:            fmt.Sprintf("inbound-reality-%d", p),
-						Protocol:       "vless-reality",
-						ListenPort:     p,
-						UUID:           u,
-						RealitySNI:     sni,
-						RealityDest:    sni + ":443",
-						RealityPrivKey: priv,
-						RealityPubKey:  pub,
-						RealityShortID: sid,
-					})
-					return nil
-				})
-				fmt.Fprintf(stdout, "Added Reality inbound on :%d (pbk=%s sid=%s)\n", p, pub, sid)
+			sub := ask("Action (list/add-reality/add-xhttp/add-vless-ws/add-vmess-ws/add-dokodemo/add-socks5/del/disable-all)", "list")
+			switch sub {
+			case "add-reality":
+				pStr := ask("Listen port", "2443")
+				sni := ask("Reality SNI", "www.apple.com")
+				args := []string{"add-reality", "--port", pStr, "--sni", sni}
+				if strings.EqualFold(ask("Apply now? (y/N)", "n"), "y") {
+					args = append(args, "--apply")
+				}
+				cmdExtra(store, exec, args, stdout, stderr)
+			case "add-xhttp", "add-vless-ws", "add-vmess-ws":
+				pStr := ask("Listen port", "")
+				dom := ask("TLS domain (empty to share server domain)", "")
+				path := ask("Path (empty for auto)", "")
+				viaNginx := ask("Via Nginx? (y/N)", "n")
+				args := []string{sub, "--port", pStr}
+				if dom != "" {
+					args = append(args, "--domain", dom)
+				}
+				if path != "" {
+					args = append(args, "--path", path)
+				}
+				if strings.EqualFold(viaNginx, "y") {
+					args = append(args, "--via-nginx")
+				}
+				if strings.EqualFold(ask("Apply now? (y/N)", "n"), "y") {
+					args = append(args, "--apply")
+				}
+				cmdExtra(store, exec, args, stdout, stderr)
+			case "add-dokodemo":
+				pStr := ask("Listen port", "")
+				tgt := ask("Target (host:port)", "")
+				netProto := ask("Network (tcp/udp/tcp,udp)", "tcp,udp")
+				args := []string{"add-dokodemo", "--port", pStr, "--target", tgt, "--network", netProto}
+				if strings.EqualFold(ask("Apply now? (y/N)", "n"), "y") {
+					args = append(args, "--apply")
+				}
+				cmdExtra(store, exec, args, stdout, stderr)
+			case "add-socks5":
+				pStr := ask("Listen port", "1080")
+				u := ask("Username (optional)", "")
+				pw := ask("Password (optional)", "")
+				args := []string{"add-socks5", "--port", pStr, "--user", u, "--pass", pw}
+				if strings.EqualFold(ask("Apply now? (y/N)", "n"), "y") {
+					args = append(args, "--apply")
+				}
+				cmdExtra(store, exec, args, stdout, stderr)
+			case "del":
+				k := ask("Tag or port", "")
+				cmdExtra(store, exec, []string{"del", k}, stdout, stderr)
+			case "disable-all":
+				args := []string{"disable-all"}
+				if strings.EqualFold(ask("Apply now? (y/N)", "n"), "y") {
+					args = append(args, "--apply")
+				}
+				cmdExtra(store, exec, args, stdout, stderr)
+			default:
+				cmdExtra(store, exec, []string{"list"}, stdout, stderr)
 			}
 		case "66":
-			sub := ask("Action (show/enable/disable/peer-add/peer-del)", "show")
+			sub := ask("Action (show/enable/disable/keygen-server/peer-add/peer-regen/peer-del)", "show")
 			if sub == "peer-add" {
 				n := ask("Peer name", "laptop")
 				cmdWG(store, exec, []string{"peer-add", n}, stdout, stderr)
+			} else if sub == "peer-regen" {
+				n := ask("Peer name", "")
+				cmdWG(store, exec, []string{"peer-regen", n}, stdout, stderr)
 			} else if sub == "peer-del" {
 				n := ask("Peer name", "")
 				cmdWG(store, exec, []string{"peer-del", n}, stdout, stderr)

@@ -110,6 +110,8 @@ func servicesForFile(relName, targetPath, wgUnit string) ([]string, bool) {
 		return []string{"dex-refresh.timer"}, true
 	case relName == "systemd/dex-rules-update.timer" || relName == "systemd/dex-rules-update.service":
 		return []string{"dex-rules-update.timer"}, true
+	case relName == "systemd/dex-core-update.timer" || relName == "systemd/dex-core-update.service":
+		return []string{"dex-core-update.timer"}, true
 	case relName == "sysctl-99-dex.conf":
 		return nil, true
 	}
@@ -140,6 +142,8 @@ func servicesForFile(relName, targetPath, wgUnit string) ([]string, bool) {
 		return []string{"dex-refresh.timer"}, true
 	case base == "dex-rules-update.timer" || base == "dex-rules-update.service":
 		return []string{"dex-rules-update.timer"}, true
+	case base == "dex-core-update.timer" || base == "dex-core-update.service":
+		return []string{"dex-core-update.timer"}, true
 	case targetPath == "/etc/sysctl.d/99-dex.conf":
 		return nil, true
 	default:
@@ -765,8 +769,9 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		}
 		if ropts.InitSystem == "systemd" {
 			specs = append(specs,
-				svcSpec{name: "dex-refresh.timer", active: bundle.NFTRelayNeeded, probe: false},
+				svcSpec{name: "dex-refresh.timer", active: bundle.RefreshTimerNeeded, probe: false},
 				svcSpec{name: "dex-rules-update.timer", active: bundle.RulesTimerNeeded, probe: false},
+				svcSpec{name: "dex-core-update.timer", active: bundle.CoreUpdateTimerNeeded, probe: false},
 			)
 		}
 

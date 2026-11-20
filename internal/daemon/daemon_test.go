@@ -12,12 +12,14 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/stuinxo/de_GWD/v3/internal/reconcile"
 	"github.com/stuinxo/de_GWD/v3/internal/state"
 )
 
@@ -240,5 +242,53 @@ func TestCloudflareDDNSGlobalAPIKeyHeaders(t *testing.T) {
 	gotIP, err := fetchPublicIP(context.Background(), newDirectHTTPClient(), []string{ipSrv.URL}, false)
 	if err != nil || gotIP != "203.0.113.55" {
 		t.Fatalf("direct client fetchPublicIP failed: got=%q err=%v", gotIP, err)
+	}
+}
+
+type stubDaemonExec struct {
+	reconcile.OSExecutor
+	active map[string]bool
+}
+
+func (s *stubDaemonExec) DetectInitSystem() string { return "systemd" }
+func (s *stubDaemonExec) ServiceIsActive(_ context.Context, _ string, unit string) bool {
+	return s.active[unit]
+}
+func (s *stubDaemonExec) ResolveHostIPs(context.Context, string) ([]netip.Addr, error) {
+	return nil, nil
+}
+
+func TestWave2FailoverSkipsWhenProxyPaused(t *testing.T) {
+	store := state.NewStore(t.TempDir())
+	st := state.NewDefaultState(state.RoleClient)
+	st.Client.FailoverEnabled = true
+	st.Client.Nodes = []state.OutboundNode{
+		{ID: "n1", Protocol: "vless-xhttp", Address: "1.1.1.1", Port: 443, UUID: "11111111-1111-4111-8111-111111111111"},
+		{ID: "n2", Protocol: "vless-xhttp", Address: "2.2.2.2", Port: 443, UUID: "22222222-2222-4222-8222-222222222222"},
+	}
+	st.Client.ActiveNodeID = "n1"
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := &stubDaemonExec{active: map[string]bool{"dex-xray": false}}
+	runner := NewRunner(store, exec, NewTaskHub(10))
+	probed := 0
+	runner.Failover.ProbeEgress = func(context.Context) bool {
+		probed++
+		return false
+	}
+
+	// While dex-xray is inactive (proxy paused), failover tick must skip probing.
+	runner.runFailoverTick(context.Background())
+	if probed != 0 {
+		t.Fatalf("expected failover skipped while dex-xray inactive, got probed=%d", probed)
+	}
+
+	// Once dex-xray is active, failover tick runs normally.
+	exec.active["dex-xray"] = true
+	runner.runFailoverTick(context.Background())
+	if probed != 1 {
+		t.Fatalf("expected failover to probe when dex-xray active, got probed=%d", probed)
 	}
 }

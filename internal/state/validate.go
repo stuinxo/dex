@@ -424,6 +424,13 @@ func (s *State) Validate() error {
 
 	// Extra Inbounds (Option 55)
 	extraTags := make(map[string]struct{}, len(s.ExtraInbounds))
+	seenViaNginx := make(map[string]string) // "port|lowerDomain" -> tag
+	mainNginxPort := 0
+	mainNginxDomain := ""
+	if (s.Role == RoleServer || s.Role == RoleLanding) && s.Server.TLSMode == "nginx" {
+		mainNginxPort = s.Server.ListenPort
+		mainNginxDomain = strings.ToLower(strings.TrimSpace(s.Server.Domain))
+	}
 	for i, ex := range s.ExtraInbounds {
 		if ex.Tag == "" {
 			return fmt.Errorf("extra_inbounds[%d]: empty tag", i)
@@ -434,14 +441,40 @@ func (s *State) Validate() error {
 		extraTags[ex.Tag] = struct{}{}
 		protoNet := "tcp"
 		if ex.Protocol == "dokodemo" {
-			protoNet = "tcp,udp"
+			if ex.Network != "" && !isValidNetProto(ex.Network) {
+				return fmt.Errorf("extra %q: invalid network %q", ex.Tag, ex.Network)
+			}
+			protoNet = ex.Network
+			if protoNet == "" {
+				protoNet = "tcp,udp"
+			}
 		}
 		if !ex.ViaNginx {
 			if err := claimPort(protoNet, ex.ListenPort, "extra:"+ex.Tag); err != nil {
 				return err
 			}
-		} else if ex.ListenPort < 1 || ex.ListenPort > 65535 {
-			return fmt.Errorf("extra_inbounds[%d]: invalid internal port %d", i, ex.ListenPort)
+		} else {
+			if ex.ListenPort < 1 || ex.ListenPort > 65535 {
+				return fmt.Errorf("extra_inbounds[%d]: invalid internal port %d", i, ex.ListenPort)
+			}
+			dom := strings.ToLower(strings.TrimSpace(ex.Domain))
+			if dom == "" {
+				dom = strings.ToLower(strings.TrimSpace(s.Server.Domain))
+			}
+			keyTCP := fmt.Sprintf("tcp:%d", ex.ListenPort)
+			if owner, used := portOwner[keyTCP]; used {
+				if owner != "server-main" || ex.ListenPort != mainNginxPort {
+					return fmt.Errorf("port conflict on tcp:%d: used by both %s and extra:%s (via_nginx)", ex.ListenPort, owner, ex.Tag)
+				}
+			}
+			if mainNginxPort > 0 && ex.ListenPort == mainNginxPort && dom == mainNginxDomain {
+				return fmt.Errorf("extra %q: via_nginx port %d domain %q conflicts with main nginx server", ex.Tag, ex.ListenPort, dom)
+			}
+			vnKey := fmt.Sprintf("%d|%s", ex.ListenPort, dom)
+			if prevTag, dup := seenViaNginx[vnKey]; dup {
+				return fmt.Errorf("extra %q: via_nginx port %d domain %q conflicts with %s", ex.Tag, ex.ListenPort, dom, prevTag)
+			}
+			seenViaNginx[vnKey] = ex.Tag
 		}
 		switch ex.Protocol {
 		case "vless-reality":

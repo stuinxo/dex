@@ -48,11 +48,11 @@ func buildTestDNSResponse(req []byte, ttl uint32, truncated bool) []byte {
 	b.Write(req[12:]) // question verbatim
 	// Answer: pointer to offset 12 (0xC00C)
 	b.Write([]byte{0xC0, 0x0C})
-	_ = binary.Write(&b, binary.BigEndian, uint16(1))   // A
-	_ = binary.Write(&b, binary.BigEndian, uint16(1))   // IN
-	_ = binary.Write(&b, binary.BigEndian, ttl)         // TTL
-	_ = binary.Write(&b, binary.BigEndian, uint16(4))   // RDLENGTH
-	b.Write([]byte{203, 0, 113, 42})                    // 203.0.113.42
+	_ = binary.Write(&b, binary.BigEndian, uint16(1)) // A
+	_ = binary.Write(&b, binary.BigEndian, uint16(1)) // IN
+	_ = binary.Write(&b, binary.BigEndian, ttl)       // TTL
+	_ = binary.Write(&b, binary.BigEndian, uint16(4)) // RDLENGTH
+	b.Write([]byte{203, 0, 113, 42})                  // 203.0.113.42
 	return b.Bytes()
 }
 

@@ -247,3 +247,77 @@ func TestIssueCloudflareACMEAndTokenScrub(t *testing.T) {
 		t.Fatalf("expected CF_Token/CF_Key/CF_Email scrubbed when AutoRenew=false, got %q", string(accData2))
 	}
 }
+
+func TestWave2ForceSelfSignedAndIssueHTTPACME(t *testing.T) {
+	dir := t.TempDir()
+	certP := filepath.Join(dir, "dex.cer")
+	keyP := filepath.Join(dir, "dex.key")
+
+	if err := EnsureSelfSigned(certP, keyP, "first.example.com"); err != nil {
+		t.Fatalf("EnsureSelfSigned: %v", err)
+	}
+	if err := ForceSelfSigned(certP, keyP, "second.example.com"); err != nil {
+		t.Fatalf("ForceSelfSigned: %v", err)
+	}
+	cb, _ := os.ReadFile(certP)
+	kb, _ := os.ReadFile(keyP)
+	rep, err := InspectPair(cb, kb)
+	if err != nil || rep.CommonName != "second.example.com" {
+		t.Fatalf("expected overwritten CN second.example.com, got rep=%+v err=%v", rep, err)
+	}
+
+	now := time.Now()
+	cPEM, kPEM, _, _ := genTestCert(t, "http.example.com", []string{"http.example.com"}, now.Add(-time.Hour), now.Add(90*24*time.Hour), nil, nil)
+	acmeHome := filepath.Join(dir, "acme")
+	_ = os.MkdirAll(acmeHome, 0o755)
+	runner := &fakeACMERunner{
+		t:         t,
+		mainDom:   "http.example.com",
+		certBytes: cPEM,
+		keyBytes:  kPEM,
+	}
+	hRep, err := IssueHTTPACME(context.Background(), runner, ACMEConfig{
+		Domain:   "http.example.com",
+		Webroot:  "/var/www/html",
+		AcmeBin:  filepath.Join(acmeHome, "acme.sh"),
+		AcmeHome: acmeHome,
+		CertPath: filepath.Join(dir, "http.cer"),
+		KeyPath:  filepath.Join(dir, "http.key"),
+	})
+	if err != nil || !CoversDomain(hRep, "http.example.com") {
+		t.Fatalf("IssueHTTPACME webroot failed: rep=%+v err=%v", hRep, err)
+	}
+	joined := strings.Join(runner.calls[1], " ")
+	if !strings.Contains(joined, "--webroot /var/www/html") {
+		t.Fatalf("expected --webroot in acme args, got %q", joined)
+	}
+
+	// Empty webroot uses --standalone
+	runner2 := &fakeACMERunner{t: t, mainDom: "http.example.com", certBytes: cPEM, keyBytes: kPEM}
+	if _, err := IssueHTTPACME(context.Background(), runner2, ACMEConfig{
+		Domain:   "http.example.com",
+		AcmeBin:  filepath.Join(acmeHome, "acme.sh"),
+		AcmeHome: acmeHome,
+		CertPath: filepath.Join(dir, "http2.cer"),
+		KeyPath:  filepath.Join(dir, "http2.key"),
+	}); err != nil {
+		t.Fatalf("IssueHTTPACME standalone failed: %v", err)
+	}
+	if !strings.Contains(strings.Join(runner2.calls[1], " "), "--standalone") {
+		t.Fatalf("expected --standalone when webroot empty, got %v", runner2.calls[1])
+	}
+
+	// Reject relative or flag-like webroot to avoid argument injection
+	for _, badWR := range []string{"relative/path", "-webroot", "/tmp/bad\nline"} {
+		if _, err := IssueHTTPACME(context.Background(), runner2, ACMEConfig{
+			Domain:   "http.example.com",
+			Webroot:  badWR,
+			AcmeBin:  filepath.Join(acmeHome, "acme.sh"),
+			AcmeHome: acmeHome,
+			CertPath: filepath.Join(dir, "http3.cer"),
+			KeyPath:  filepath.Join(dir, "http3.key"),
+		}); err == nil {
+			t.Fatalf("expected unsafe webroot %q rejected", badWR)
+		}
+	}
+}

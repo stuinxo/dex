@@ -537,6 +537,10 @@ func buildExtraInbound(ex state.ExtraInbound, certFile, keyFile string) map[stri
 			"settings": settings,
 		}
 	case "dokodemo":
+		netProto := strings.TrimSpace(ex.Network)
+		if netProto == "" {
+			netProto = "tcp,udp"
+		}
 		return map[string]any{
 			"tag":      ex.Tag,
 			"listen":   "0.0.0.0",
@@ -545,7 +549,7 @@ func buildExtraInbound(ex state.ExtraInbound, certFile, keyFile string) map[stri
 			"settings": map[string]any{
 				"address": ex.TargetAddr,
 				"port":    ex.TargetPort,
-				"network": "tcp,udp",
+				"network": netProto,
 			},
 		}
 	default:

@@ -294,3 +294,60 @@ func TestWave1StateValidationAdditions(t *testing.T) {
 		t.Fatalf("expected unsupported server.protocol rejected")
 	}
 }
+
+func TestWave2ViaNginxConflictsAndDokodemoNetwork(t *testing.T) {
+	srv := NewDefaultState(RoleServer)
+	srv.Server.TLSMode = "nginx"
+	srv.Server.Domain = "srv.example.com"
+	srv.Server.ListenPort = 443
+	srv.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+
+	// Same port+domain as main nginx server must fail
+	srv.ExtraInbounds = []ExtraInbound{{
+		Tag:        "extra-dup",
+		Protocol:   "vless-xhttp",
+		ListenPort: 443,
+		Domain:     "srv.example.com",
+		UUID:       "22222222-2222-4222-8222-222222222222",
+		ViaNginx:   true,
+	}}
+	if err := srv.Validate(); err == nil {
+		t.Fatalf("expected via_nginx conflict with main nginx server rejected")
+	}
+
+	// Same port with different domain succeeds
+	srv.ExtraInbounds[0].Domain = "alt.example.com"
+	if err := srv.Validate(); err != nil {
+		t.Fatalf("expected via_nginx on different domain accepted, got %v", err)
+	}
+
+	// Two extra via_nginx on same port+domain fail
+	srv.ExtraInbounds = append(srv.ExtraInbounds, ExtraInbound{
+		Tag:        "extra-dup2",
+		Protocol:   "vless-ws",
+		ListenPort: 443,
+		Domain:     "ALT.example.com",
+		UUID:       "33333333-3333-4333-8333-333333333333",
+		ViaNginx:   true,
+	})
+	if err := srv.Validate(); err == nil {
+		t.Fatalf("expected duplicate via_nginx port+domain rejected")
+	}
+
+	// Dokodemo network validation
+	srv.ExtraInbounds = []ExtraInbound{{
+		Tag:        "doko",
+		Protocol:   "dokodemo",
+		ListenPort: 10053,
+		TargetAddr: "1.1.1.1",
+		TargetPort: 53,
+		Network:    "udp",
+	}}
+	if err := srv.Validate(); err != nil {
+		t.Fatalf("expected valid dokodemo network=udp, got %v", err)
+	}
+	srv.ExtraInbounds[0].Network = "sctp"
+	if err := srv.Validate(); err == nil {
+		t.Fatalf("expected invalid dokodemo network=sctp rejected")
+	}
+}

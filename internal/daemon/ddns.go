@@ -61,6 +61,49 @@ func newDirectHTTPClient() *http.Client {
 	}
 }
 
+// ConnectivityCheck reports HTTP reachability and latency for a target probe path.
+type ConnectivityCheck struct {
+	OK         bool   `json:"ok"`
+	StatusCode int    `json:"status_code,omitempty"`
+	LatencyMS  int64  `json:"latency_ms"`
+	Error      string `json:"error,omitempty"`
+}
+
+func probeHTTPTargets(ctx context.Context, client *http.Client, urls []string) ConnectivityCheck {
+	var last ConnectivityCheck
+	for _, u := range urls {
+		start := time.Now()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			last = ConnectivityCheck{Error: err.Error(), LatencyMS: time.Since(start).Milliseconds()}
+			continue
+		}
+		resp, err := client.Do(req)
+		lat := time.Since(start).Milliseconds()
+		if err != nil {
+			last = ConnectivityCheck{Error: err.Error(), LatencyMS: lat}
+			continue
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 200 && resp.StatusCode < 500 {
+			return ConnectivityCheck{OK: true, StatusCode: resp.StatusCode, LatencyMS: lat}
+		}
+		last = ConnectivityCheck{StatusCode: resp.StatusCode, LatencyMS: lat, Error: fmt.Sprintf("HTTP %d", resp.StatusCode)}
+	}
+	return last
+}
+
+// ProbeConnectivity tests domestic direct (SO_MARK=0xff) and global outbound proxy connectivity.
+func ProbeConnectivity(ctx context.Context) (cn ConnectivityCheck, global ConnectivityCheck) {
+	cDirect := newDirectHTTPClient()
+	cDirect.Timeout = 6 * time.Second
+	cGlobal := &http.Client{Timeout: 6 * time.Second}
+	cn = probeHTTPTargets(ctx, cDirect, []string{"https://www.baidu.com", "http://connect.rom.miui.com/generate_204"})
+	global = probeHTTPTargets(ctx, cGlobal, []string{"https://www.google.com/generate_204", "https://cp.cloudflare.com/generate_204"})
+	return cn, global
+}
+
 // FetchCNPublicIP probes the host's direct domestic WAN IPv4 using SO_MARK=0xff to bypass local TPROXY.
 func FetchCNPublicIP(ctx context.Context) (string, error) {
 	return fetchPublicIP(ctx, newDirectHTTPClient(), cnPublicIPv4URLs, false)

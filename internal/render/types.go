@@ -3,11 +3,13 @@ package render
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/stuinxo/de_GWD/v3/internal/cryptoext"
@@ -106,17 +108,20 @@ type RenderedFile struct {
 
 // RenderBundle holds all rendered files and active subsystem flags for reconciliation.
 type RenderBundle struct {
-	Files            []RenderedFile
-	XrayNeeded       bool
-	NFTClientNeeded  bool
-	NFTRelayNeeded   bool
-	MosDNSNeeded     bool
-	HAProxyNeeded    bool
-	NginxNeeded      bool
-	DoHNeeded        bool
-	WireGuardNeeded  bool
-	DaemonNeeded     bool
-	RulesTimerNeeded bool
+	Files                 []RenderedFile
+	XrayNeeded            bool
+	NFTClientNeeded       bool
+	NFTRelayNeeded        bool
+	MosDNSNeeded          bool
+	HAProxyNeeded         bool
+	NginxNeeded           bool
+	DoHNeeded             bool
+	WireGuardNeeded       bool
+	DaemonNeeded          bool
+	RulesTimerNeeded      bool
+	RefreshTimerNeeded    bool
+	RefreshInterval       string // "5min" | "4h"
+	CoreUpdateTimerNeeded bool
 }
 
 // ExtractDoHHost extracts a hostname or IP from a DoH endpoint (with or without scheme).
@@ -343,4 +348,201 @@ func BuildFWDURI(s *state.State, fwdKind, uuid string) string {
 		TLSSNI:   host,
 		Path:     path,
 	})
+}
+
+// ParseNodeURI parses a standard vless://, vmess://, or socks5:// share link into an OutboundNode.
+func ParseNodeURI(raw string) (state.OutboundNode, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return state.OutboundNode{}, errors.New("empty node URI")
+	}
+	idHex, _ := cryptoext.GenerateHexToken(4)
+	genID := "node-" + idHex
+
+	if strings.HasPrefix(strings.ToLower(raw), "vmess://") {
+		payloadB64 := strings.TrimSpace(raw[len("vmess://"):])
+		var decoded []byte
+		var decErr error
+		for _, enc := range []*base64.Encoding{
+			base64.StdEncoding,
+			base64.RawStdEncoding,
+			base64.URLEncoding,
+			base64.RawURLEncoding,
+		} {
+			if b, err := enc.DecodeString(payloadB64); err == nil {
+				decoded = b
+				decErr = nil
+				break
+			} else {
+				decErr = err
+			}
+		}
+		if decErr != nil {
+			return state.OutboundNode{}, fmt.Errorf("invalid vmess base64: %w", decErr)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(decoded, &m); err != nil {
+			return state.OutboundNode{}, fmt.Errorf("invalid vmess JSON: %w", err)
+		}
+		strField := func(k string) string {
+			v, _ := m[k].(string)
+			return strings.TrimSpace(v)
+		}
+		addr := strField("add")
+		uuid := strField("id")
+		if addr == "" || uuid == "" {
+			return state.OutboundNode{}, errors.New("vmess URI missing add or id")
+		}
+		port := 443
+		switch pv := m["port"].(type) {
+		case float64:
+			if int(pv) > 0 {
+				port = int(pv)
+			}
+		case string:
+			if p, err := strconv.Atoi(strings.TrimSpace(pv)); err == nil && p > 0 {
+				port = p
+			}
+		}
+		netType := strings.ToLower(strField("net"))
+		proto := "vmess-tcp"
+		if netType == "ws" {
+			proto = "vmess-ws"
+		} else if netType != "" && netType != "tcp" {
+			return state.OutboundNode{}, fmt.Errorf("unsupported vmess net %q", netType)
+		}
+		name := strField("ps")
+		if name == "" {
+			name = fmt.Sprintf("%s:%d", addr, port)
+		}
+		sni := strField("sni")
+		if sni == "" {
+			sni = strField("host")
+		}
+		path := strField("path")
+		if path != "" && !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
+		return state.OutboundNode{
+			ID:       genID,
+			Name:     name,
+			Protocol: proto,
+			Address:  addr,
+			Port:     port,
+			UUID:     uuid,
+			TLSSNI:   sni,
+			Path:     path,
+		}, nil
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil {
+		return state.OutboundNode{}, fmt.Errorf("invalid URI: %w", err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.TrimSpace(u.Hostname())
+	if host == "" {
+		return state.OutboundNode{}, errors.New("missing host in URI")
+	}
+	label := strings.TrimSpace(u.Fragment)
+
+	switch scheme {
+	case "vless":
+		port := 443
+		if ps := u.Port(); ps != "" {
+			p, perr := strconv.Atoi(ps)
+			if perr != nil || p < 1 || p > 65535 {
+				return state.OutboundNode{}, fmt.Errorf("invalid port %q", ps)
+			}
+			port = p
+		}
+		if label == "" {
+			label = fmt.Sprintf("%s:%d", host, port)
+		}
+		uuid := ""
+		if u.User != nil {
+			uuid = strings.TrimSpace(u.User.Username())
+		}
+		if uuid == "" {
+			return state.OutboundNode{}, errors.New("vless URI missing UUID")
+		}
+		q := u.Query()
+		sec := strings.ToLower(strings.TrimSpace(q.Get("security")))
+		netType := strings.ToLower(strings.TrimSpace(q.Get("type")))
+		sni := strings.TrimSpace(q.Get("sni"))
+		if sni == "" {
+			sni = strings.TrimSpace(q.Get("host"))
+		}
+		path := strings.TrimSpace(q.Get("path"))
+		if path != "" && !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
+
+		var proto string
+		switch {
+		case sec == "reality":
+			proto = "vless-reality"
+			pbk := strings.TrimSpace(q.Get("pbk"))
+			if pbk == "" {
+				return state.OutboundNode{}, errors.New("vless reality URI missing pbk")
+			}
+			return state.OutboundNode{
+				ID:             genID,
+				Name:           label,
+				Protocol:       proto,
+				Address:        host,
+				Port:           port,
+				UUID:           uuid,
+				TLSSNI:         sni,
+				RealityPubKey:  pbk,
+				RealityShortID: strings.TrimSpace(q.Get("sid")),
+			}, nil
+		case netType == "ws":
+			proto = "vless-ws"
+		case netType == "xhttp", netType == "splithttp", netType == "":
+			proto = "vless-xhttp"
+		default:
+			return state.OutboundNode{}, fmt.Errorf("unsupported vless transport %q", netType)
+		}
+		return state.OutboundNode{
+			ID:       genID,
+			Name:     label,
+			Protocol: proto,
+			Address:  host,
+			Port:     port,
+			UUID:     uuid,
+			TLSSNI:   sni,
+			Path:     path,
+		}, nil
+
+	case "socks5", "socks5h", "socks":
+		port := 1080
+		if ps := u.Port(); ps != "" {
+			p, perr := strconv.Atoi(ps)
+			if perr != nil || p < 1 || p > 65535 {
+				return state.OutboundNode{}, fmt.Errorf("invalid port %q", ps)
+			}
+			port = p
+		}
+		if label == "" {
+			label = fmt.Sprintf("%s:%d", host, port)
+		}
+		var user, pass string
+		if u.User != nil {
+			user = u.User.Username()
+			pass, _ = u.User.Password()
+		}
+		return state.OutboundNode{
+			ID:       genID,
+			Name:     label,
+			Protocol: "socks5",
+			Address:  host,
+			Port:     port,
+			Username: user,
+			Password: pass,
+		}, nil
+
+	default:
+		return state.OutboundNode{}, fmt.Errorf("unsupported URI scheme %q", scheme)
+	}
 }

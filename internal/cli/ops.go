@@ -24,27 +24,28 @@ import (
 
 // OpsConfig configures remote sources and install targets for dex rules/update (overridable in tests).
 type OpsConfig struct {
-	Client          *http.Client
-	GeoIPURL        string
-	GeoSiteURL      string
-	ChnRouteURL     string
-	DomainsChnURL   string
-	DomainsAdsURL   string
-	DomainsAppleURL string
-	DomainsGamesURL string
-	DexRepo         string
-	DexReleaseBase  string // optional override base URL instead of GitHub repo releases
-	XrayReleaseBase string
-	MosDNSBase      string
-	DexBinPath      string
-	XrayBinPath     string
-	MosDNSBinPath   string
-	GOARCH          string
-	MinChnRouteCIDR int
-	MinChnDomains   int
-	MinAdsDomains   int
-	MinAppleDomains int
-	MinGamesDomains int
+	Client            *http.Client
+	GeoIPURL          string
+	GeoSiteURL        string
+	ChnRouteURL       string
+	DomainsChnURL     string
+	DomainsAdsURL     string
+	DomainsAppleURL   string
+	DomainsGamesURL   string
+	DexRepo           string
+	DexReleaseBase    string // optional override base URL instead of GitHub repo releases
+	XrayReleaseBase   string
+	MosDNSBase        string
+	DexBinPath        string
+	XrayBinPath       string
+	MosDNSBinPath     string
+	GOARCH            string
+	MinChnRouteCIDR   int
+	MinChnDomains     int
+	MinAdsDomains     int
+	MinAppleDomains   int
+	MinGamesDomains   int
+	SkipDaemonRestart bool
 }
 
 func (c OpsConfig) withDefaults(versionTag string) OpsConfig {
@@ -660,7 +661,7 @@ func updateDexBinary(ctx context.Context, exec reconcile.SystemExecutor, cfg Ops
 			if stdout != nil {
 				fmt.Fprintf(stdout, "[+] Updated dex from local DEX_BIN=%s\n", local)
 			}
-			restartIfActive(ctx, exec, "dex-doh", "dex-daemon")
+			restartDexConsumers(ctx, exec, cfg)
 			return nil
 		}
 	}
@@ -699,8 +700,16 @@ func updateDexBinary(ctx context.Context, exec reconcile.SystemExecutor, cfg Ops
 	if stdout != nil {
 		fmt.Fprintf(stdout, "[+] Updated %s cleanly.\n", cfg.DexBinPath)
 	}
-	restartIfActive(ctx, exec, "dex-doh", "dex-daemon")
+	restartDexConsumers(ctx, exec, cfg)
 	return nil
+}
+
+func restartDexConsumers(ctx context.Context, exec reconcile.SystemExecutor, cfg OpsConfig) {
+	if cfg.SkipDaemonRestart {
+		restartIfActive(ctx, exec, "dex-doh")
+		return
+	}
+	restartIfActive(ctx, exec, "dex-doh", "dex-daemon")
 }
 
 func updateXrayBinary(ctx context.Context, exec reconcile.SystemExecutor, cfg OpsConfig, xrayArch string, stdout io.Writer) error {

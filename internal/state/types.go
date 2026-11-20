@@ -37,6 +37,7 @@ type SystemConfig struct {
 	EnableFlowtable bool   `json:"enable_flowtable"`
 	AutoTuneSysctl  bool   `json:"auto_tune_sysctl"`
 	AutoUpdateRules bool   `json:"auto_update_rules"`
+	AutoUpdateCore  bool   `json:"auto_update_core"`
 }
 
 type AuthConfig struct {
@@ -276,6 +277,7 @@ type ExtraInbound struct {
 	SocksPass      string `json:"socks_pass,omitempty"`
 	TargetAddr     string `json:"target_addr,omitempty"`
 	TargetPort     int    `json:"target_port,omitempty"`
+	Network        string `json:"network,omitempty"` // tcp | udp | tcp,udp (dokodemo)
 	ViaNginx       bool   `json:"via_nginx,omitempty"`
 }
 
