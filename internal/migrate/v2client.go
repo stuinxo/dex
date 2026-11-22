@@ -103,13 +103,13 @@ func isEmptyJSONVal(v any) bool {
 	}
 }
 
-func isVtruiVlessXHTTP(extraDir string) bool {
+func detectVtruiVlessProto(extraDir string) string {
 	if extraDir == "" {
-		return false
+		return ""
 	}
 	b, err := os.ReadFile(filepath.Join(extraDir, "vtrui", "config.json"))
 	if err != nil {
-		return false
+		return ""
 	}
 	var cfg struct {
 		Outbounds []struct {
@@ -120,18 +120,30 @@ func isVtruiVlessXHTTP(extraDir string) bool {
 		} `json:"outbounds"`
 	}
 	if err := json.Unmarshal(b, &cfg); err != nil || len(cfg.Outbounds) == 0 {
-		return false
+		return ""
 	}
-	return strings.EqualFold(cfg.Outbounds[0].Protocol, "vless") &&
-		strings.EqualFold(cfg.Outbounds[0].StreamSettings.Network, "xhttp")
+	if !strings.EqualFold(cfg.Outbounds[0].Protocol, "vless") {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.Outbounds[0].StreamSettings.Network)) {
+	case "xhttp":
+		return "vless-xhttp"
+	case "ws":
+		return "vless-ws"
+	default:
+		return ""
+	}
 }
 
-func inferV2NodeProtoAndPath(rawPath string, vtruiVlessXHTTP bool) (string, string) {
+func inferV2NodeProtoAndPath(rawProto, rawPath, vtruiVlessProto string) (string, string) {
 	p := strings.TrimSpace(rawPath)
 	if p != "" && !strings.HasPrefix(p, "/") {
 		p = "/" + p
 	}
-	if vtruiVlessXHTTP {
+	if vtruiVlessProto != "" {
+		return vtruiVlessProto, p
+	}
+	if strings.EqualFold(strings.TrimSpace(rawProto), "vless") {
 		return "vless-xhttp", p
 	}
 	if p == "" {
@@ -183,7 +195,7 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 		}
 	}
 
-	vtruiVlessXHTTP := isVtruiVlessXHTTP(extraDir)
+	vtruiVlessProto := detectVtruiVlessProto(extraDir)
 
 	// Nodes: .v2node[]
 	domainToNodeID := make(map[string]string)
@@ -204,7 +216,7 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 			if name == "" {
 				name = domRaw
 			}
-			proto, normPath := inferV2NodeProtoAndPath(strVal(m["path"]), vtruiVlessXHTTP)
+			proto, normPath := inferV2NodeProtoAndPath(strVal(m["protocol"]), strVal(m["path"]), vtruiVlessProto)
 			node := state.OutboundNode{
 				ID:       id,
 				Name:     name,
@@ -248,7 +260,7 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 				if id := resolveNodeID(cand); id != "" {
 					st.Client.ActiveNodeID = id
 				} else if uuid := strVal(vn["uuid"]); uuid != "" {
-					proto, normPath := inferV2NodeProtoAndPath(strVal(vn["path"]), vtruiVlessXHTTP)
+					proto, normPath := inferV2NodeProtoAndPath(strVal(vn["protocol"]), strVal(vn["path"]), vtruiVlessProto)
 					st.Client.Nodes = append([]state.OutboundNode{{
 						ID:       "v2node-active",
 						Name:     cand,
@@ -379,6 +391,8 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 			st.Cert.Domain = dom
 		}
 		if email := strVal(fwd["email"]); email != "" {
+			st.Cert.CFEmail = email
+		} else if email := strVal(fwd["Email"]); email != "" {
 			st.Cert.CFEmail = email
 		}
 		if tok := strVal(fwd["token"]); tok != "" {
@@ -632,6 +646,31 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 		extraInbs, exNotes := importExtraInboundsDir(extraDir)
 		st.ExtraInbounds = append(st.ExtraInbounds, extraInbs...)
 		notes = append(notes, exNotes...)
+	}
+
+	// Optional Option 44 HAProxy forwards from sibling /etc/haproxy/haproxy.cfg
+	hapCandidates := []string{
+		filepath.Clean(filepath.Join(filepath.Dir(confPath), "..", "..", "etc", "haproxy", "haproxy.cfg")),
+	}
+	if extraDir != "" {
+		hapCandidates = append(hapCandidates, filepath.Join(extraDir, "haproxy.cfg"))
+	}
+	seenHapPorts := make(map[int]bool)
+	for _, r := range st.Relay.Forwards {
+		seenHapPorts[r.ListenPort] = true
+	}
+	for _, hp := range hapCandidates {
+		hb, herr := os.ReadFile(hp)
+		if herr != nil || !strings.Contains(string(hb), "de_GWD rule begin") {
+			continue
+		}
+		for _, r := range parseHAProxyRules(string(hb)) {
+			if !seenHapPorts[r.ListenPort] {
+				seenHapPorts[r.ListenPort] = true
+				st.Relay.Forwards = append(st.Relay.Forwards, r)
+			}
+		}
+		break
 	}
 
 	return st, notes, nil

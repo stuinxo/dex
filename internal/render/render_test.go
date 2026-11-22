@@ -1213,3 +1213,77 @@ func TestHardeningWGPeerCollisionRelayTagsIPv6RproxyAndNginxDualStack(t *testing
 		t.Fatalf("expected legacy IPv6 http2 directive:\n%s", string(ngLegacyDual))
 	}
 }
+
+func TestRenderClientRproxySRuleOrderAndMosDNSNon443DialAddr(t *testing.T) {
+	c := state.NewDefaultState(state.RoleClient)
+	c.Client.Nodes = []state.OutboundNode{{
+		ID: "n1", Protocol: "vless-ws", Address: "hnn.example.com", Port: 32087,
+		UUID: "11111111-1111-4111-8111-111111111111", TLSSNI: "hnn.example.com", Path: "/ws",
+	}}
+	c.Client.ActiveNodeID = "n1"
+	c.Client.DNS.DoHServers = []string{
+		"https://hnn.example.com:32087/dq",
+		"https://default-port.example.com/dq",
+	}
+	c.RproxyS = state.RproxySConfig{
+		Enabled:    true,
+		Domain:     "gw.example.com",
+		ListenPort: 20000,
+		UUIDs:      []string{"22222222-2222-4222-8222-222222222222"},
+		InUUIDs:    []string{"33333333-3333-4333-8333-333333333333"},
+		Mappings:   []state.RproxyServerMapping{{Port: 20443, Proto: "tcp"}},
+	}
+
+	ropts := RenderOptions{
+		ResolvedHostIPs: map[string][]netip.Addr{
+			"hnn.example.com":          {netip.MustParseAddr("198.51.100.10")},
+			"default-port.example.com": {netip.MustParseAddr("198.51.100.11")},
+		},
+	}
+
+	xb, xNeeded, err := RenderXray(c, ropts)
+	if err != nil || !xNeeded {
+		t.Fatalf("RenderXray client+RproxyS: err=%v needed=%v", err, xNeeded)
+	}
+	var xcfg map[string]any
+	if err := json.Unmarshal(xb, &xcfg); err != nil {
+		t.Fatalf("unmarshal xray: %v", err)
+	}
+	rules := xcfg["routing"].(map[string]any)["rules"].([]any)
+	rpsMapIdx, rpsTunIdx, privIdx := -1, -1, -1
+	for i, raw := range rules {
+		r := raw.(map[string]any)
+		if r["outboundTag"] == "portal" {
+			if inbs, ok := r["inboundTag"].([]any); ok && len(inbs) > 0 {
+				if inbs[0] == "rps-map-20443" {
+					rpsMapIdx = i
+				} else if inbs[0] == "rps-tunnel" {
+					rpsTunIdx = i
+				}
+			}
+		}
+		if ips, ok := r["ip"].([]any); ok && len(ips) > 0 && ips[0] == "geoip:private" && r["outboundTag"] == "direct" {
+			privIdx = i
+		}
+	}
+	if rpsMapIdx < 0 || rpsTunIdx < 0 || privIdx < 0 || rpsMapIdx > privIdx || rpsTunIdx > privIdx {
+		t.Fatalf("expected RproxyS portal rules before geoip:private direct rule, got rpsMap=%d rpsTun=%d priv=%d", rpsMapIdx, rpsTunIdx, privIdx)
+	}
+
+	mFiles, mNeeded, err := RenderMosDNS(c, ropts)
+	if err != nil || !mNeeded {
+		t.Fatalf("RenderMosDNS: err=%v needed=%v", err, mNeeded)
+	}
+	var myStr string
+	for _, rf := range mFiles {
+		if rf.RelName == "mosdns/mosdns.yaml" {
+			myStr = string(rf.Content)
+		}
+	}
+	if !strings.Contains(myStr, `dial_addr: "198.51.100.10:32087"`) {
+		t.Fatalf("expected non-443 DoH dial_addr with :32087, got:\n%s", myStr)
+	}
+	if !strings.Contains(myStr, `dial_addr: "198.51.100.11"`) {
+		t.Fatalf("expected default-port DoH dial_addr without port, got:\n%s", myStr)
+	}
+}

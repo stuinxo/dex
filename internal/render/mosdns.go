@@ -152,7 +152,11 @@ func RenderMosDNS(s *state.State, opts RenderOptions) ([]RenderedFile, bool, err
 			if ips := opts.ResolvedHostIPs[parsed.Hostname()]; len(ips) > 0 {
 				for _, ip := range ips {
 					if ip.Is4() {
-						fmt.Fprintf(&yaml, "          dial_addr: %q\n", ip.String())
+						dialAddr := ip.String()
+						if port := parsed.Port(); port != "" {
+							dialAddr = net.JoinHostPort(dialAddr, port)
+						}
+						fmt.Fprintf(&yaml, "          dial_addr: %q\n", dialAddr)
 						break
 					}
 				}

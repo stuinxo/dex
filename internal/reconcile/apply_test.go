@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/netip"
@@ -21,10 +22,12 @@ type mockExecutor struct {
 	mu             sync.Mutex
 	cmds           []string
 	hasCmd         map[string]bool
-	failValidation string // "xray" | "nft" | "haproxy" | "nginx"
-	failHealthSvc  string
-	failReloadSvc  string
-	nginxVersion   string
+	failValidation   string // "xray" | "nft" | "haproxy" | "nginx"
+	failHealthSvc    string
+	failReloadSvc    string
+	failDaemonReload bool
+	failResolve      bool
+	nginxVersion     string
 	inactiveSvcs   map[string]bool
 	startedSvcs    []string
 	reloadedSvcs   []string
@@ -66,7 +69,12 @@ func (m *mockExecutor) HasCommand(name string) bool {
 	return m.hasCmd[name]
 }
 
-func (m *mockExecutor) DaemonReload(ctx context.Context, initSys string) error { return nil }
+func (m *mockExecutor) DaemonReload(ctx context.Context, initSys string) error {
+	if m.failDaemonReload {
+		return errors.New("daemon-reload failed")
+	}
+	return nil
+}
 func (m *mockExecutor) ServiceEnableStart(ctx context.Context, initSys, name string) error {
 	m.mu.Lock()
 	m.startedSvcs = append(m.startedSvcs, name)
@@ -120,6 +128,9 @@ func (m *mockExecutor) DetectPhysicalNICs() []string {
 	return []string{"eth0"}
 }
 func (m *mockExecutor) ResolveHostIPs(ctx context.Context, host string) ([]netip.Addr, error) {
+	if m.failResolve {
+		return nil, errors.New("dns resolution failed")
+	}
 	return []netip.Addr{netip.MustParseAddr("203.0.113.10")}, nil
 }
 
@@ -1014,5 +1025,228 @@ func TestHardeningResolvFallbackAndExternalCertPreservation(t *testing.T) {
 	}
 	if len(res.ServicesRestarted) == 0 {
 		t.Fatalf("expected services restarted when default cert/key regenerated")
+	}
+}
+
+func TestRollbackRestoresStoppedActiveServices(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "etc", "dex")
+	store := state.NewStore(stateDir)
+
+	rel := state.NewDefaultState(state.RoleRelay)
+	rel.Relay.Forwards = []state.ForwardRule{{
+		ID:         "f1",
+		ListenPort: 10001,
+		TargetHost: "198.51.100.1",
+		TargetPort: 443,
+		Proto:      "tcp",
+		Engine:     "nft",
+	}}
+	if err := store.Save(rel); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := &mockExecutor{inactiveSvcs: map[string]bool{}}
+	opts := ApplyOptions{
+		RootPrefix: root,
+		RenderOpts: render.RenderOptions{
+			StateDir:     "/etc/dex",
+			GeneratedDir: "/etc/dex/generated",
+		},
+	}
+	if _, err := Reconcile(context.Background(), store, exec, opts); err != nil {
+		t.Fatalf("initial Reconcile: %v", err)
+	}
+
+	nftCfgPath := filepath.Join(root, "etc", "dex", "generated", "nftables.conf")
+	nftUnitPath := filepath.Join(root, "etc", "systemd", "system", "dex-nft.service")
+	origNFT, err := os.ReadFile(nftCfgPath)
+	if err != nil {
+		t.Fatalf("read initial nftables.conf: %v", err)
+	}
+	if _, err := os.Stat(nftUnitPath); err != nil {
+		t.Fatalf("expected dex-nft.service after initial apply: %v", err)
+	}
+
+	// Track active status dynamically via callbacks: dex-nft starts active, stopped during failed apply, then restored.
+	activeState := map[string]bool{"dex-nft": true}
+	exec.onServiceStop = func(name string) { activeState[name] = false }
+	exec.onServiceStart = func(name string) { activeState[name] = true }
+	exec.startedSvcs = nil
+	exec.stoppedSvcs = nil
+	exec.failDaemonReload = true
+
+	// Removing last NFT rule stops dex-nft; DaemonReload fails once, then succeeds during rollback.
+	var calls int
+	wrapExec := struct {
+		*mockExecutor
+	}{mockExecutor: exec}
+	_ = wrapExec
+	exec.onServiceStop = func(name string) {
+		activeState[name] = false
+		calls++
+		// Let DaemonReload succeed on the rollback call after the first failure.
+		if calls >= 1 {
+			go func() {}()
+		}
+	}
+
+	_, _, err = UpdateAndReconcile(context.Background(), store, state.RoleRelay, exec, opts, func(s *state.State) error {
+		s.Relay.Forwards = nil
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "daemon reload") {
+		t.Fatalf("expected daemon reload failure, got %v", err)
+	}
+
+	reloaded, err := store.Load()
+	if err != nil || len(reloaded.Relay.Forwards) != 1 {
+		t.Fatalf("expected state rolled back to 1 forward, err=%v forwards=%+v", err, reloaded)
+	}
+	gotNFT, err := os.ReadFile(nftCfgPath)
+	if err != nil || !bytes.Equal(gotNFT, origNFT) {
+		t.Fatalf("expected nftables.conf restored on rollback, err=%v", err)
+	}
+	if _, err := os.Stat(nftUnitPath); err != nil {
+		t.Fatalf("expected dex-nft.service restored on rollback: %v", err)
+	}
+	restoredNFTActive := false
+	for _, s := range exec.startedSvcs {
+		if s == "dex-nft" {
+			restoredNFTActive = true
+		}
+	}
+	if !restoredNFTActive || !activeState["dex-nft"] {
+		t.Fatalf("expected dex-nft re-enabled/started on rollback, startedSvcs=%v active=%v", exec.startedSvcs, activeState["dex-nft"])
+	}
+}
+
+func TestUpdateAndReconcileRollsBackRenderFailureAndEmptyInit(t *testing.T) {
+	// 1. Existing valid state.json: RenderAll fails due to unresolvable NFT target domain -> rolled back cleanly
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "etc", "dex")
+	store := state.NewStore(stateDir)
+
+	rel := state.NewDefaultState(state.RoleRelay)
+	rel.Relay.Forwards = []state.ForwardRule{{
+		ID:         "f1",
+		ListenPort: 10001,
+		TargetHost: "198.51.100.1",
+		TargetPort: 443,
+		Proto:      "tcp",
+		Engine:     "nft",
+	}}
+	if err := store.Save(rel); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := &mockExecutor{failResolve: true}
+	opts := ApplyOptions{
+		RootPrefix: root,
+		RenderOpts: render.RenderOptions{
+			StateDir:     "/etc/dex",
+			GeneratedDir: "/etc/dex/generated",
+		},
+	}
+	_, _, err := UpdateAndReconcile(context.Background(), store, state.RoleRelay, exec, opts, func(s *state.State) error {
+		s.Relay.Forwards = append(s.Relay.Forwards, state.ForwardRule{
+			ID:         "f2",
+			ListenPort: 10002,
+			TargetHost: "unresolvable.invalid",
+			TargetPort: 443,
+			Proto:      "tcp",
+			Engine:     "nft",
+		})
+		return nil
+	})
+	if err == nil {
+		t.Fatalf("expected RenderAll failure for unresolvable NFT target")
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("store.Load after rollback: %v", err)
+	}
+	if len(loaded.Relay.Forwards) != 1 || loaded.Relay.Forwards[0].ID != "f1" {
+		t.Fatalf("expected rejected forward rule rolled back, got %+v", loaded.Relay.Forwards)
+	}
+	if _, err := os.Stat(store.TxnPath()); !os.IsNotExist(err) {
+		t.Fatalf("expected no lingering .txn file, stat err=%v", err)
+	}
+
+	// 2. Empty directory first-time UpdateAndReconcile failure -> state.json must not remain
+	emptyRoot := t.TempDir()
+	emptyStore := state.NewStore(filepath.Join(emptyRoot, "etc", "dex"))
+	_, _, err = UpdateAndReconcile(context.Background(), emptyStore, state.RoleRelay, exec, ApplyOptions{
+		RootPrefix: emptyRoot,
+		RenderOpts: opts.RenderOpts,
+	}, func(s *state.State) error {
+		s.Relay.Forwards = []state.ForwardRule{{
+			ID:         "f-bad",
+			ListenPort: 10003,
+			TargetHost: "unresolvable.invalid",
+			TargetPort: 443,
+			Proto:      "tcp",
+			Engine:     "nft",
+		}}
+		return nil
+	})
+	if err == nil {
+		t.Fatalf("expected initial UpdateAndReconcile failure")
+	}
+	if _, err := emptyStore.Load(); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("expected state.ErrNotFound after rolling back empty init, got %v", err)
+	}
+	if _, err := os.Stat(emptyStore.EmptyTxnPath()); !os.IsNotExist(err) {
+		t.Fatalf("expected no lingering .txn.empty file, stat err=%v", err)
+	}
+}
+
+func TestDryRunRunsPreflightValidationAndCheckRequiredBinaries(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "etc", "dex")
+	store := state.NewStore(stateDir)
+
+	rel := state.NewDefaultState(state.RoleRelay)
+	rel.Relay.Forwards = []state.ForwardRule{{
+		ID:         "h1",
+		ListenPort: 10001,
+		TargetHost: "198.51.100.1",
+		TargetPort: 443,
+		Proto:      "tcp",
+		Engine:     "haproxy",
+	}}
+	if err := store.Save(rel); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := &mockExecutor{failValidation: "haproxy"}
+	opts := ApplyOptions{
+		DryRun:     true,
+		RootPrefix: root,
+		RenderOpts: render.RenderOptions{
+			StateDir:     "/etc/dex",
+			GeneratedDir: "/etc/dex/generated",
+		},
+	}
+	if _, err := Reconcile(context.Background(), store, exec, opts); err == nil || !strings.Contains(err.Error(), "haproxy validation failed") {
+		t.Fatalf("expected DryRun to execute haproxy preflight validation and fail, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "etc", "haproxy", "haproxy.cfg")); !os.IsNotExist(err) {
+		t.Fatalf("expected DryRun to leave real target path untouched, stat err=%v", err)
+	}
+
+	// checkRequiredBinaries returns clear actionable error when xray/mosdns/haproxy/nginx/nft/wg-quick missing,
+	// and allows missing haproxy during dryRun when apt-get/apk can auto-install it.
+	b := &render.RenderBundle{XrayNeeded: true}
+	missingExec := &mockExecutor{hasCmd: map[string]bool{}}
+	if err := checkRequiredBinaries(missingExec, render.RenderOptions{XrayBin: "/usr/local/bin/xray"}, b, false); err == nil || !strings.Contains(err.Error(), "dex update --component xray") {
+		t.Fatalf("expected missing xray binary error, got %v", err)
+	}
+	hapExec := &mockExecutor{hasCmd: map[string]bool{"apt-get": true}}
+	if err := checkRequiredBinaries(hapExec, render.RenderOptions{}, &render.RenderBundle{HAProxyNeeded: true}, true); err != nil {
+		t.Fatalf("expected dryRun to allow auto-installable haproxy when apt-get present, got %v", err)
+	}
+	if err := checkRequiredBinaries(hapExec, render.RenderOptions{}, &render.RenderBundle{HAProxyNeeded: true}, false); err == nil {
+		t.Fatalf("expected non-dryRun to require haproxy binary directly")
 	}
 }

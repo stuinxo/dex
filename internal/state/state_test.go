@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -116,6 +117,29 @@ func TestStoreTransactionRollback(t *testing.T) {
 	}
 	if restored.Relay.Forwards[0].ListenPort != 10001 {
 		t.Fatalf("expected rollback to port 10001, got %d", restored.Relay.Forwards[0].ListenPort)
+	}
+
+	// Empty state BeginTxn + Update + RollbackTxn removes newly created state.json
+	emptyDir := t.TempDir()
+	emptyStore := NewStore(emptyDir)
+	if err := emptyStore.BeginTxn(); err != nil {
+		t.Fatalf("empty BeginTxn: %v", err)
+	}
+	if _, err := emptyStore.Update(RoleClient, func(cur *State) error {
+		cur.System.Hostname = "temp-host"
+		return nil
+	}); err != nil {
+		t.Fatalf("empty Update: %v", err)
+	}
+	if restoredEmpty, err := emptyStore.RollbackTxn(); err != nil || restoredEmpty != nil {
+		t.Fatalf("empty RollbackTxn: restored=%v err=%v", restoredEmpty, err)
+	}
+	if _, err := emptyStore.Load(); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound after rolling back empty txn, got %v", err)
+	}
+	// Idempotent second RollbackTxn without sentinel returns nil, nil
+	if restoredAgain, err := emptyStore.RollbackTxn(); err != nil || restoredAgain != nil {
+		t.Fatalf("idempotent RollbackTxn: restored=%v err=%v", restoredAgain, err)
 	}
 }
 

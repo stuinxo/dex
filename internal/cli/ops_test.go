@@ -29,6 +29,8 @@ type fakeOpsExec struct {
 	restarted      []string
 	reloaded       []string
 	activeSvcs     map[string]bool
+	failRestartSvc string
+	failStartSvc   string
 	piholeRunning  bool
 	failValidation string
 	failResolve    bool
@@ -64,10 +66,16 @@ func (f *fakeOpsExec) ResolveHostIPs(ctx context.Context, host string) ([]netip.
 func (f *fakeOpsExec) DaemonReload(ctx context.Context, initSys string) error { return nil }
 func (f *fakeOpsExec) ServiceEnableStart(ctx context.Context, initSys, name string) error {
 	f.startedSvcs = append(f.startedSvcs, name)
+	if f.failStartSvc == name {
+		return fmt.Errorf("simulated start failure for %s", name)
+	}
 	return nil
 }
 func (f *fakeOpsExec) ServiceRestart(ctx context.Context, initSys, name string) error {
 	f.restarted = append(f.restarted, name)
+	if f.failRestartSvc == name {
+		return fmt.Errorf("simulated restart failure for %s", name)
+	}
 	return nil
 }
 func (f *fakeOpsExec) ServiceReload(ctx context.Context, initSys, name string) error {
@@ -425,8 +433,8 @@ func TestMigrateCleanupV2OrderSafetyAndRestore(t *testing.T) {
 		t.Fatalf("expected no v2 cleanup commands when --apply omitted, stopped=%v cmds=%v", execNoApply.stoppedSvcs, execNoApply.cmds)
 	}
 
-	// 2. --cleanup-v2 --apply when Reconcile fails after cleanup restores active v2 services, pihole, and v2 nft rules.
-	execFail := &fakeOpsExec{
+	// 2. --cleanup-v2 --apply catches nft preflight failure during dry-run BEFORE touching legacy v2.
+	execDryFail := &fakeOpsExec{
 		piholeRunning:  true,
 		failValidation: "nft",
 		activeSvcs: map[string]bool{
@@ -445,11 +453,32 @@ func TestMigrateCleanupV2OrderSafetyAndRestore(t *testing.T) {
 	}
 	out.Reset()
 	errBuf.Reset()
+	code = runMigrateWithExec(store, execDryFail, v2NFTDir, baseOpts, []string{
+		"--kind", "v2_client", "--from", zeroConf, "--cleanup-v2", "--apply",
+	}, &out, &errBuf)
+	if code == 0 || !strings.Contains(errBuf.String(), "legacy v2 untouched") {
+		t.Fatalf("expected dry-run nft validation failure leaving legacy v2 untouched, code=%d err=%q", code, errBuf.String())
+	}
+	if len(execDryFail.stoppedSvcs) != 0 {
+		t.Fatalf("expected no v2 services stopped when dry-run preflight fails, stopped=%v", execDryFail.stoppedSvcs)
+	}
+
+	// 3. --cleanup-v2 --apply when formal Reconcile fails after cleanup (e.g. dex-nft start fails) restores active v2 services, pihole, and v2 nft rules.
+	execFail := &fakeOpsExec{
+		piholeRunning: true,
+		failStartSvc:  "dex-nft",
+		activeSvcs: map[string]bool{
+			"vtrui":  true,
+			"mosdns": true,
+		},
+	}
+	out.Reset()
+	errBuf.Reset()
 	code = runMigrateWithExec(store, execFail, v2NFTDir, baseOpts, []string{
 		"--kind", "v2_client", "--from", zeroConf, "--cleanup-v2", "--apply",
 	}, &out, &errBuf)
 	if code == 0 {
-		t.Fatalf("expected migrate --cleanup-v2 --apply to fail on nft preflight failure")
+		t.Fatalf("expected migrate --cleanup-v2 --apply to fail on dex-nft start failure")
 	}
 
 	for _, svc := range execFail.stoppedSvcs {
@@ -466,6 +495,14 @@ func TestMigrateCleanupV2OrderSafetyAndRestore(t *testing.T) {
 		}
 		return -1
 	}
+	findLastCmdIdx := func(substr string) int {
+		for i := len(execFail.cmds) - 1; i >= 0; i-- {
+			if strings.Contains(execFail.cmds[i], substr) {
+				return i
+			}
+		}
+		return -1
+	}
 	for _, c := range execFail.cmds {
 		if strings.Contains(c, "docker rm") {
 			t.Fatalf("must never run docker rm, cmds=%v", execFail.cmds)
@@ -477,7 +514,7 @@ func TestMigrateCleanupV2OrderSafetyAndRestore(t *testing.T) {
 	delBypassIdx := findCmdIdx("nft delete table inet bypassflow")
 	delFilterIdx := findCmdIdx("nft delete table inet filter")
 	delRouterIdx := findCmdIdx("nft delete table inet router")
-	nftCheckIdx := findCmdIdx("nft -c -f")
+	nftCheckIdx := findLastCmdIdx("nft -c -f")
 	startPiholeIdx := findCmdIdx("docker start pihole")
 	reloadFlowIdx := findCmdIdx("flowtable_eth.sh")
 	reloadNFTIdx := findCmdIdx("nft -f " + filepath.Join(v2NFTDir, "nftables"))
@@ -759,5 +796,115 @@ func TestUpdateMosDNSVerifySHA256AndRejectTamper(t *testing.T) {
 	serveReleaseAPI = false
 	if err := UpdateComponents(context.Background(), store, &fakeOpsExec{}, cfg, "mosdns", "latest", &out); err == nil {
 		t.Fatalf("expected error when neither .sha256sum nor release API is available")
+	}
+}
+
+func TestUpdateComponentsRollsBackOnRestartFailure(t *testing.T) {
+	oldELF := append([]byte("\x7fELF"), []byte("old-binary-v1")...)
+	newELF := append([]byte("\x7fELF"), []byte("new-binary-v2")...)
+
+	oldXraySum := sha256.Sum256(makeTestZip(t, "xray", oldELF))
+	_ = oldXraySum
+
+	newXrayZip := makeTestZip(t, "xray", newELF)
+	newXrayHex := func() string {
+		s := sha256.Sum256(newXrayZip)
+		return hex.EncodeToString(s[:])
+	}()
+
+	newMosZip := makeTestZip(t, "mosdns", newELF)
+	newMosHex := func() string {
+		s := sha256.Sum256(newMosZip)
+		return hex.EncodeToString(s[:])
+	}()
+
+	newDexSum := sha256.Sum256(newELF)
+	newDexHex := hex.EncodeToString(newDexSum[:])
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/xray/Xray-linux-64.zip":
+			_, _ = w.Write(newXrayZip)
+		case "/xray/Xray-linux-64.zip.dgst":
+			fmt.Fprintf(w, "SHA2-256=%s\n", newXrayHex)
+		case "/mosdns/mosdns-linux-amd64.zip":
+			_, _ = w.Write(newMosZip)
+		case "/mosdns/mosdns-linux-amd64.zip.sha256sum":
+			fmt.Fprintf(w, "%s  mosdns-linux-amd64.zip\n", newMosHex)
+		case "/dex/dex-linux-amd64":
+			_, _ = w.Write(newELF)
+		case "/dex/SHA256SUMS":
+			fmt.Fprintf(w, "%s  dex-linux-amd64\n", newDexHex)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	store := state.NewStore(filepath.Join(dir, "state"))
+	_ = store.Save(state.NewDefaultState(state.RoleClient))
+
+	xrayBin := filepath.Join(dir, "xray")
+	mosBin := filepath.Join(dir, "mosdns")
+	dexBin := filepath.Join(dir, "dex")
+	_ = os.WriteFile(xrayBin, oldELF, 0o755)
+	_ = os.WriteFile(mosBin, oldELF, 0o755)
+	_ = os.WriteFile(dexBin, oldELF, 0o755)
+
+	cfg := OpsConfig{
+		Client:          srv.Client(),
+		XrayReleaseBase: srv.URL + "/xray",
+		MosDNSBase:      srv.URL + "/mosdns",
+		DexReleaseBase:  srv.URL + "/dex",
+		XrayBinPath:     xrayBin,
+		MosDNSBinPath:   mosBin,
+		DexBinPath:      dexBin,
+		GOARCH:          "amd64",
+	}
+
+	// 1. Xray restart fails -> error returned, old xray binary restored, no "Updated ... cleanly"
+	var out bytes.Buffer
+	execXrayFail := &fakeOpsExec{activeSvcs: map[string]bool{"dex-xray": true}, failRestartSvc: "dex-xray"}
+	if err := UpdateComponents(context.Background(), store, execXrayFail, cfg, "xray", "latest", &out); err == nil {
+		t.Fatalf("expected UpdateComponents(xray) to fail on restart error")
+	}
+	if strings.Contains(out.String(), "Updated") {
+		t.Fatalf("must not report Updated cleanly on failed restart, got %q", out.String())
+	}
+	if got, _ := os.ReadFile(xrayBin); !bytes.Equal(got, oldELF) {
+		t.Fatalf("expected xray binary rolled back to oldELF, got %q", got)
+	}
+
+	// 2. MosDNS restart fails -> error returned, old mosdns binary restored
+	out.Reset()
+	execMosFail := &fakeOpsExec{activeSvcs: map[string]bool{"dex-mosdns": true}, failRestartSvc: "dex-mosdns"}
+	if err := UpdateComponents(context.Background(), store, execMosFail, cfg, "mosdns", "latest", &out); err == nil {
+		t.Fatalf("expected UpdateComponents(mosdns) to fail on restart error")
+	}
+	if strings.Contains(out.String(), "Updated") {
+		t.Fatalf("must not report Updated cleanly on failed restart, got %q", out.String())
+	}
+	if got, _ := os.ReadFile(mosBin); !bytes.Equal(got, oldELF) {
+		t.Fatalf("expected mosdns binary rolled back to oldELF, got %q", got)
+	}
+
+	// 3. DEX consumer (dex-doh) restart fails -> error returned, old dex binary restored
+	out.Reset()
+	execDohFail := &fakeOpsExec{activeSvcs: map[string]bool{"dex-doh": true, "dex-daemon": true}, failRestartSvc: "dex-doh"}
+	if err := UpdateComponents(context.Background(), store, execDohFail, cfg, "dex", "latest", &out); err == nil {
+		t.Fatalf("expected UpdateComponents(dex) to fail on dex-doh restart error")
+	}
+	if strings.Contains(out.String(), "Updated") {
+		t.Fatalf("must not report Updated cleanly on failed restart, got %q", out.String())
+	}
+	if got, _ := os.ReadFile(dexBin); !bytes.Equal(got, oldELF) {
+		t.Fatalf("expected dex binary rolled back to oldELF, got %q", got)
+	}
+
+	// 4. Explicit invalid DEX_BIN fails instead of silently downloading
+	t.Setenv("DEX_BIN", filepath.Join(dir, "does-not-exist"))
+	if err := UpdateComponents(context.Background(), store, &fakeOpsExec{}, cfg, "dex", "latest", &out); err == nil || !strings.Contains(err.Error(), "DEX_BIN") {
+		t.Fatalf("expected explicit missing DEX_BIN error, got %v", err)
 	}
 }

@@ -432,3 +432,62 @@ func TestHardeningV2ServerInMemoryExtraAndDEXSEmptyNames(t *testing.T) {
 		t.Fatalf("unexpected fallback relay IDs: %+v", stDexs.Relay.Forwards)
 	}
 }
+
+func TestImportV2ClientVlessEmailAndHAProxy(t *testing.T) {
+	root := t.TempDir()
+	optDir := filepath.Join(root, "opt", "de_GWD")
+	hapDir := filepath.Join(root, "etc", "haproxy")
+	_ = os.MkdirAll(optDir, 0o755)
+	_ = os.MkdirAll(hapDir, 0o755)
+
+	confPath := filepath.Join(optDir, "0conf")
+	_ = os.WriteFile(confPath, []byte(`{
+  "address": {"alias": "pub-gw", "serverName": "gw.example.com", "webUIport": "8443"},
+  "v2node": [
+    {"domain": "n1.example.com:32087", "name": "n1", "uuid": "11111111-1111-4111-8111-111111111111", "path": "/ws", "tls": "n1.example.com", "protocol": "vless"}
+  ],
+  "FORWARD": {
+    "domain": "gw.example.com",
+    "Email": "upper@example.com",
+    "token": "tok-abc"
+  }
+}`), 0o600)
+
+	_ = os.WriteFile(filepath.Join(hapDir, "haproxy.cfg"), []byte(`
+# de_GWD rule begin 32087
+frontend de_gwd_32087
+  bind :32087
+  default_backend de_gwd_backend_32087
+backend de_gwd_backend_32087
+  server endpoint n1.example.com:32087 check resolvers local init-addr none
+# de_GWD rule end 32087
+`), 0o644)
+
+	// 1. Without vtrui/config.json: explicit protocol="vless" -> vless-xhttp, uppercase Email, sibling HAProxy imported
+	st, _, err := ImportV2Client(confPath, optDir)
+	if err != nil {
+		t.Fatalf("ImportV2Client: %v", err)
+	}
+	if st.Client.Nodes[0].Protocol != "vless-xhttp" {
+		t.Fatalf("expected vless-xhttp when 0conf protocol=vless without vtrui/config.json, got %q", st.Client.Nodes[0].Protocol)
+	}
+	if st.Cert.CFEmail != "upper@example.com" {
+		t.Fatalf("expected Email fallback imported, got %q", st.Cert.CFEmail)
+	}
+	if len(st.Relay.Forwards) != 1 || st.Relay.Forwards[0].ListenPort != 32087 || st.Relay.Forwards[0].Engine != "haproxy" {
+		t.Fatalf("expected sibling HAProxy rule imported, got %+v", st.Relay.Forwards)
+	}
+
+	// 2. With vtrui/config.json specifying network="ws": vless -> vless-ws
+	_ = os.MkdirAll(filepath.Join(optDir, "vtrui"), 0o755)
+	_ = os.WriteFile(filepath.Join(optDir, "vtrui", "config.json"), []byte(`{
+  "outbounds": [{"protocol": "vless", "streamSettings": {"network": "ws"}}]
+}`), 0o644)
+	stWS, _, err := ImportV2Client(confPath, optDir)
+	if err != nil {
+		t.Fatalf("ImportV2Client ws: %v", err)
+	}
+	if stWS.Client.Nodes[0].Protocol != "vless-ws" {
+		t.Fatalf("expected vless-ws when vtrui/config.json uses ws, got %q", stWS.Client.Nodes[0].Protocol)
+	}
+}

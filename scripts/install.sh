@@ -143,15 +143,9 @@ verify_sum_in_list() {
 
 install_dex_binary() {
   local_cand=""
-  if [ -n "$DEX_BIN" ] && [ -f "$DEX_BIN" ]; then
+  if [ -n "$DEX_BIN" ]; then
+    [ -f "$DEX_BIN" ] || die "Specified DEX_BIN does not exist: $DEX_BIN"
     local_cand="$DEX_BIN"
-  else
-    for p in "./dex-linux-${ARCH}" "./dex" "/root/dex-linux-${ARCH}" "/root/dex" "/tmp/dex-linux-${ARCH}" "/tmp/dex"; do
-      if [ -f "$p" ]; then
-        local_cand="$p"
-        break
-      fi
-    done
   fi
 
   tmp_bin=$(mktemp /tmp/dex-bin.XXXXXX)
@@ -273,15 +267,9 @@ install_xray_core() {
   [ -x "$XRAY_BIN" ] && return 0
   zip_name="Xray-linux-${XRAY_ARCH}.zip"
   local_zip=""
-  if [ -n "$XRAY_ZIP" ] && [ -f "$XRAY_ZIP" ]; then
+  if [ -n "$XRAY_ZIP" ]; then
+    [ -f "$XRAY_ZIP" ] || die "Specified XRAY_ZIP does not exist: $XRAY_ZIP"
     local_zip="$XRAY_ZIP"
-  else
-    for p in "./${zip_name}" "/root/${zip_name}" "/tmp/${zip_name}"; do
-      if [ -f "$p" ]; then
-        local_zip="$p"
-        break
-      fi
-    done
   fi
 
   work_dir=$(mktemp -d /tmp/dex-xray.XXXXXX)
@@ -317,15 +305,9 @@ install_mosdns_and_rules() {
   if [ ! -x "$MOSDNS_BIN" ]; then
     zip_name="mosdns-linux-${MOS_ARCH}.zip"
     local_zip=""
-    if [ -n "$MOSDNS_ZIP" ] && [ -f "$MOSDNS_ZIP" ]; then
+    if [ -n "$MOSDNS_ZIP" ]; then
+      [ -f "$MOSDNS_ZIP" ] || die "Specified MOSDNS_ZIP does not exist: $MOSDNS_ZIP"
       local_zip="$MOSDNS_ZIP"
-    else
-      for p in "./${zip_name}" "/root/${zip_name}" "/tmp/${zip_name}"; do
-        if [ -f "$p" ]; then
-          local_zip="$p"
-          break
-        fi
-      done
     fi
     work_dir=$(mktemp -d /tmp/dex-mos.XXXXXX)
     if [ -n "$local_zip" ]; then
@@ -458,6 +440,11 @@ main() {
           apt-get install -y -qq --no-install-recommends haproxy >/dev/null 2>&1 || true
           ;;
       esac
+      ensure_ntp
+      install_xray_core
+      mkdir -p "${STATE_DIR}/rules"
+      fetch_verified_rule_dat "geoip.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" "${STATE_DIR}/rules/geoip.dat"
+      fetch_verified_rule_dat "geosite.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" "${STATE_DIR}/rules/geosite.dat"
       say "[+] Ready. Run 'dex init --role relay --apply' or 'dex' for interactive menu."
       ;;
     "")

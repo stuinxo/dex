@@ -34,6 +34,14 @@ import (
 
 // Run is the main CLI entrypoint invoked by cmd/dex/main.go and tests.
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	return RunWithExecutor(args, reconcile.OSExecutor{}, stdin, stdout, stderr)
+}
+
+// RunWithExecutor executes the CLI with a caller-provided SystemExecutor (primarily for tests).
+func RunWithExecutor(args []string, exec reconcile.SystemExecutor, stdin io.Reader, stdout, stderr io.Writer) int {
+	if exec == nil {
+		exec = reconcile.OSExecutor{}
+	}
 	stateDir := strings.TrimSpace(os.Getenv("DEX_STATE_DIR"))
 	if stateDir == "" {
 		stateDir = "/etc/dex"
@@ -58,7 +66,6 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	store.OnApplyLockWait = func() {
 		fmt.Fprintln(stderr, "waiting for another dex apply...")
 	}
-	exec := reconcile.OSExecutor{}
 
 	if len(args) == 0 {
 		return runInteractiveMenu(store, exec, stdin, stdout, stderr)

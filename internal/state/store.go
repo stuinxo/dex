@@ -30,6 +30,7 @@ func NewStore(stateDir string) *Store {
 func (s *Store) StatePath() string     { return filepath.Join(s.Dir, "state.json") }
 func (s *Store) BackupPath() string    { return filepath.Join(s.Dir, "state.json.bak") }
 func (s *Store) TxnPath() string       { return filepath.Join(s.Dir, "state.json.txn") }
+func (s *Store) EmptyTxnPath() string  { return filepath.Join(s.Dir, "state.json.txn.empty") }
 func (s *Store) LockPath() string      { return filepath.Join(s.Dir, "state.lock") }
 func (s *Store) ApplyLockPath() string { return filepath.Join(s.Dir, "apply.lock") }
 
@@ -252,16 +253,19 @@ func (s *Store) Update(defaultRole string, mutator func(*State) error) (*State, 
 	return updated, err
 }
 
-// BeginTxn snapshots the current valid state.json to state.json.txn.
+// BeginTxn snapshots the current valid state.json to state.json.txn,
+// or creates state.json.txn.empty when no state.json exists yet.
 func (s *Store) BeginTxn() error {
 	return s.withLock(true, func() error {
 		cur, err := s.loadUnlocked()
 		if errors.Is(err, ErrNotFound) {
-			return nil
+			_ = os.Remove(s.TxnPath())
+			return os.WriteFile(s.EmptyTxnPath(), []byte("empty\n"), 0o600)
 		}
 		if err != nil {
 			return err
 		}
+		_ = os.Remove(s.EmptyTxnPath())
 		return writeJSONAtomic(s.TxnPath(), cur, 0o600)
 	})
 }
@@ -269,20 +273,35 @@ func (s *Store) BeginTxn() error {
 // CommitTxn removes the transaction snapshot after successful apply.
 func (s *Store) CommitTxn() error {
 	return s.withLock(true, func() error {
-		err := os.Remove(s.TxnPath())
-		if os.IsNotExist(err) {
-			return nil
+		for _, p := range []string{s.TxnPath(), s.EmptyTxnPath()} {
+			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+				return err
+			}
 		}
-		return err
+		return nil
 	})
 }
 
-// RollbackTxn restores state.json from state.json.txn if it exists.
+// RollbackTxn restores state.json from state.json.txn if it exists,
+// or removes state.json/state.json.bak if state.json.txn.empty was recorded.
 func (s *Store) RollbackTxn() (*State, error) {
 	var restored *State
 	err := s.withLock(true, func() error {
+		if _, statErr := os.Stat(s.EmptyTxnPath()); statErr == nil {
+			for _, p := range []string{s.StatePath(), s.BackupPath(), s.EmptyTxnPath(), s.TxnPath()} {
+				if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+					return err
+				}
+			}
+			return nil
+		} else if !os.IsNotExist(statErr) {
+			return statErr
+		}
 		txn, err := readValidStateFile(s.TxnPath())
 		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
 			return err
 		}
 		if err := writeJSONAtomic(s.StatePath(), txn, 0o600); err != nil {

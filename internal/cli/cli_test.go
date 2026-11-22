@@ -23,10 +23,11 @@ func TestCLISmokeEndToEnd(t *testing.T) {
 	dir := t.TempDir()
 	stateDir := filepath.Join(dir, "state")
 
+	exec := &fakeOpsExec{}
 	run := func(args ...string) (int, string, string) {
 		var out, errBuf bytes.Buffer
 		full := append([]string{"--state-dir", stateDir}, args...)
-		code := Run(full, strings.NewReader(""), &out, &errBuf)
+		code := RunWithExecutor(full, exec, strings.NewReader(""), &out, &errBuf)
 		return code, out.String(), errBuf.String()
 	}
 
@@ -201,10 +202,11 @@ func TestWave2ServerExtraNodeCertWGCommands(t *testing.T) {
 	dir := t.TempDir()
 	stateDir := filepath.Join(dir, "state")
 
+	exec := &fakeOpsExec{}
 	run := func(args ...string) (int, string, string) {
 		var out, errBuf bytes.Buffer
 		full := append([]string{"--state-dir", stateDir}, args...)
-		code := Run(full, strings.NewReader(""), &out, &errBuf)
+		code := RunWithExecutor(full, exec, strings.NewReader(""), &out, &errBuf)
 		return code, out.String(), errBuf.String()
 	}
 
@@ -463,10 +465,11 @@ func TestCmdCertSyncsStateAndReconcilesExternalPaths(t *testing.T) {
 func TestHardeningCLIInitForceDLModeNodeDelMenuPortRelayAndServices(t *testing.T) {
 	dir := t.TempDir()
 	stateDir := filepath.Join(dir, "state")
+	exec := &fakeOpsExec{}
 	run := func(args ...string) (int, string, string) {
 		var out, errBuf bytes.Buffer
 		full := append([]string{"--state-dir", stateDir}, args...)
-		code := Run(full, strings.NewReader(""), &out, &errBuf)
+		code := RunWithExecutor(full, exec, strings.NewReader(""), &out, &errBuf)
 		return code, out.String(), errBuf.String()
 	}
 

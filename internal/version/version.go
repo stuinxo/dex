@@ -2,7 +2,7 @@ package version
 
 // Build-time variables injectable via -ldflags.
 var (
-	Version   = "0.0.1"
+	Version   = "0.0.2"
 	Commit    = "dev"
 	BuildTime = "unknown"
 )

@@ -527,6 +527,30 @@
               </div>
             </div>
 
+            <div class="card mb-3">
+              <div class="card-header">
+                <span class="card-header-title">RproxyS — 内网穿透服务端 (公网 Client 可选)</span>
+                <button id="btn-c-rs-add-map" type="button" class="btn btn-sm btn-primary">+ 添加入口端口映射</button>
+              </div>
+              <div class="card-body">
+                <label class="check-row"><input type="checkbox" id="c-rs-enabled"> 启用 RproxyS</label>
+                <div class="grid-2 mt">
+                  <label class="field"><span>隧道域名 (domain)</span><input type="text" id="c-rs-domain" class="form-control"></label>
+                  <label class="field"><span>隧道端口 (listen_port)</span><input type="number" id="c-rs-port" class="form-control"></label>
+                  <label class="field"><span>安全模式 (security)</span><select id="c-rs-security" class="form-control"><option value="tls">tls</option><option value="none">none</option></select></label>
+                  <div></div>
+                  <label class="field"><span>隧道 UUIDs (逗号/换行)</span><textarea id="c-rs-uuids" class="form-control" rows="2"></textarea></label>
+                  <label class="field"><span>代理入口 InUUIDs (可选, 逗号/换行)</span><textarea id="c-rs-in-uuids" class="form-control" rows="2"></textarea></label>
+                </div>
+                <div class="table-responsive mt">
+                  <table class="table table-bordered table-hover">
+                    <thead><tr><th>公网端口</th><th>协议</th><th>操作</th></tr></thead>
+                    <tbody id="c-rs-map-tbody"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
             <div class="card">
               <div class="card-header">
                 <span class="card-header-title">RproxyC — 内网穿透客户端</span>

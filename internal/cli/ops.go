@@ -250,10 +250,18 @@ func UpdateRules(ctx context.Context, store *state.Store, exec reconcile.SystemE
 		// xray reads geoip.dat / geosite.dat via XRAY_LOCATION_ASSET;
 		// mosdns reads IPchnroute / Domains.chn.txt / Domains.apple.txt / Domains.games.txt / Domains.ads.txt.
 		if anyRuleFileChanged(backups, "geoip.dat", "geosite.dat") {
-			restartIfActive(ctx, exec, "dex-xray")
+			if err := restartIfActive(ctx, exec, "dex-xray"); err != nil {
+				restoreRulesFiles(backups)
+				bestEffortRestartActive(ctx, exec, "dex-xray")
+				return fmt.Errorf("restart dex-xray after rules update (rolled back): %w", err)
+			}
 		}
 		if anyRuleFileChanged(backups, "IPchnroute", "Domains.chn.txt", "Domains.apple.txt", "Domains.games.txt", "Domains.ads.txt") {
-			restartIfActive(ctx, exec, "dex-mosdns")
+			if err := restartIfActive(ctx, exec, "dex-mosdns"); err != nil {
+				restoreRulesFiles(backups)
+				bestEffortRestartActive(ctx, exec, "dex-xray", "dex-mosdns")
+				return fmt.Errorf("restart dex-mosdns after rules update (rolled back): %w", err)
+			}
 		}
 		if stdout != nil {
 			fmt.Fprintln(stdout, "[+] Applied updated rules.")
@@ -469,7 +477,7 @@ func cmdUpdate(store *state.Store, exec reconcile.SystemExecutor, args []string,
 	fs := flag.NewFlagSet("update", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	component := fs.String("component", "all", "all|dex|xray|mosdns|rules")
-	ver := fs.String("version", "latest", "target dex version tag (e.g. latest or v0.0.1)")
+	ver := fs.String("version", "latest", "target dex version tag (e.g. latest or v0.0.2)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -617,10 +625,10 @@ func installBinaryAtomic(srcPath, dstPath string) error {
 	return nil
 }
 
-func extractZipBinary(zipPath, entryBase, dstPath string) error {
+func extractZipBinaryToTemp(zipPath, entryBase, tmpDir string) (string, error) {
 	zr, err := zip.OpenReader(zipPath)
 	if err != nil {
-		return fmt.Errorf("open zip %s: %w", zipPath, err)
+		return "", fmt.Errorf("open zip %s: %w", zipPath, err)
 	}
 	defer zr.Close()
 
@@ -630,12 +638,12 @@ func extractZipBinary(zipPath, entryBase, dstPath string) error {
 		}
 		rc, err := f.Open()
 		if err != nil {
-			return err
+			return "", err
 		}
-		tmp, err := os.CreateTemp(filepath.Dir(dstPath), ".zipext.tmp.*")
+		tmp, err := os.CreateTemp(tmpDir, ".zipext.tmp.*")
 		if err != nil {
 			_ = rc.Close()
-			return err
+			return "", err
 		}
 		tmpName := tmp.Name()
 		_, copyErr := io.Copy(tmp, io.LimitReader(rc, 256<<20))
@@ -644,31 +652,125 @@ func extractZipBinary(zipPath, entryBase, dstPath string) error {
 		if copyErr != nil || closeErr != nil {
 			_ = os.Remove(tmpName)
 			if copyErr != nil {
-				return copyErr
+				return "", copyErr
 			}
-			return closeErr
+			return "", closeErr
 		}
-		err = installBinaryAtomic(tmpName, dstPath)
-		_ = os.Remove(tmpName)
+		return tmpName, nil
+	}
+	return "", fmt.Errorf("entry %q not found inside %s", entryBase, zipPath)
+}
+
+func backupExistingBinary(dstPath string) (bakPath string, existed bool, err error) {
+	info, statErr := os.Stat(dstPath)
+	if os.IsNotExist(statErr) {
+		return "", false, nil
+	}
+	if statErr != nil {
+		return "", false, statErr
+	}
+	if info.IsDir() {
+		return "", false, fmt.Errorf("destination %s is a directory", dstPath)
+	}
+	in, err := os.Open(dstPath)
+	if err != nil {
+		return "", false, err
+	}
+	defer in.Close()
+	bak, err := os.CreateTemp(filepath.Dir(dstPath), ".bak-upd.*")
+	if err != nil {
+		return "", false, err
+	}
+	bakName := bak.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			_ = os.Remove(bakName)
+		}
+	}()
+	if _, err := io.Copy(bak, in); err != nil {
+		_ = bak.Close()
+		return "", false, err
+	}
+	if err := bak.Chmod(info.Mode().Perm()); err != nil {
+		_ = bak.Close()
+		return "", false, err
+	}
+	if err := bak.Close(); err != nil {
+		return "", false, err
+	}
+	ok = true
+	return bakName, true, nil
+}
+
+func installBinaryWithRollback(newSrc, dstPath string, linkDeGWD bool, verifyRestart func() error, rollbackRestart func()) error {
+	ok, err := IsELFBinary(newSrc)
+	if err != nil {
 		return err
 	}
-	return fmt.Errorf("entry %q not found inside %s", entryBase, zipPath)
+	if !ok {
+		return fmt.Errorf("%s is not a valid Linux ELF binary", newSrc)
+	}
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+		return err
+	}
+	bakPath, hasBackup, err := backupExistingBinary(dstPath)
+	if err != nil {
+		return err
+	}
+	if hasBackup {
+		defer os.Remove(bakPath)
+	}
+	if err := installBinaryAtomic(newSrc, dstPath); err != nil {
+		return err
+	}
+	linkPath := filepath.Join(filepath.Dir(dstPath), "de_GWD")
+	if linkDeGWD {
+		_ = os.Remove(linkPath)
+		_ = os.Symlink(dstPath, linkPath)
+	}
+	if verifyRestart != nil {
+		if err := verifyRestart(); err != nil {
+			if hasBackup {
+				_ = os.Rename(bakPath, dstPath)
+				if linkDeGWD {
+					_ = os.Remove(linkPath)
+					_ = os.Symlink(dstPath, linkPath)
+				}
+			} else {
+				_ = os.Remove(dstPath)
+				if linkDeGWD {
+					_ = os.Remove(linkPath)
+				}
+			}
+			if rollbackRestart != nil {
+				rollbackRestart()
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 func updateDexBinary(ctx context.Context, exec reconcile.SystemExecutor, cfg OpsConfig, dexArch string, stdout io.Writer) error {
+	verifyRestart := func() error { return restartDexConsumers(ctx, exec, cfg) }
+	rollbackRestart := func() { bestEffortRestartDexConsumers(ctx, exec, cfg) }
+
 	if local := strings.TrimSpace(os.Getenv("DEX_BIN")); local != "" {
-		if info, err := os.Stat(local); err == nil && !info.IsDir() {
-			if err := installBinaryAtomic(local, cfg.DexBinPath); err != nil {
-				return err
-			}
-			_ = os.Remove(filepath.Join(filepath.Dir(cfg.DexBinPath), "de_GWD"))
-			_ = os.Symlink(cfg.DexBinPath, filepath.Join(filepath.Dir(cfg.DexBinPath), "de_GWD"))
-			if stdout != nil {
-				fmt.Fprintf(stdout, "[+] Updated dex from local DEX_BIN=%s\n", local)
-			}
-			restartDexConsumers(ctx, exec, cfg)
-			return nil
+		info, err := os.Stat(local)
+		if err != nil {
+			return fmt.Errorf("specified DEX_BIN %q is invalid: %w", local, err)
 		}
+		if info.IsDir() {
+			return fmt.Errorf("specified DEX_BIN %q is a directory", local)
+		}
+		if err := installBinaryWithRollback(local, cfg.DexBinPath, true, verifyRestart, rollbackRestart); err != nil {
+			return err
+		}
+		if stdout != nil {
+			fmt.Fprintf(stdout, "[+] Updated dex from local DEX_BIN=%s\n", local)
+		}
+		return nil
 	}
 
 	asset := "dex-linux-" + dexArch
@@ -697,24 +799,28 @@ func updateDexBinary(ctx context.Context, exec reconcile.SystemExecutor, cfg Ops
 	if err := VerifyFileSHA256(binStage, expectedHex); err != nil {
 		return err
 	}
-	if err := installBinaryAtomic(binStage, cfg.DexBinPath); err != nil {
+	if err := installBinaryWithRollback(binStage, cfg.DexBinPath, true, verifyRestart, rollbackRestart); err != nil {
 		return err
 	}
-	_ = os.Remove(filepath.Join(filepath.Dir(cfg.DexBinPath), "de_GWD"))
-	_ = os.Symlink(cfg.DexBinPath, filepath.Join(filepath.Dir(cfg.DexBinPath), "de_GWD"))
 	if stdout != nil {
 		fmt.Fprintf(stdout, "[+] Updated %s cleanly.\n", cfg.DexBinPath)
 	}
-	restartDexConsumers(ctx, exec, cfg)
 	return nil
 }
 
-func restartDexConsumers(ctx context.Context, exec reconcile.SystemExecutor, cfg OpsConfig) {
+func restartDexConsumers(ctx context.Context, exec reconcile.SystemExecutor, cfg OpsConfig) error {
 	if cfg.SkipDaemonRestart {
-		restartIfActive(ctx, exec, "dex-doh")
+		return restartIfActive(ctx, exec, "dex-doh")
+	}
+	return restartIfActive(ctx, exec, "dex-doh", "dex-daemon")
+}
+
+func bestEffortRestartDexConsumers(ctx context.Context, exec reconcile.SystemExecutor, cfg OpsConfig) {
+	if cfg.SkipDaemonRestart {
+		bestEffortRestartActive(ctx, exec, "dex-doh")
 		return
 	}
-	restartIfActive(ctx, exec, "dex-doh", "dex-daemon")
+	bestEffortRestartActive(ctx, exec, "dex-doh", "dex-daemon")
 }
 
 func updateXrayBinary(ctx context.Context, exec reconcile.SystemExecutor, cfg OpsConfig, xrayArch string, stdout io.Writer) error {
@@ -749,16 +855,22 @@ func updateXrayBinary(ctx context.Context, exec reconcile.SystemExecutor, cfg Op
 	if err := VerifyFileSHA256(zipPath, expected); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(cfg.XrayBinPath), 0o755); err != nil {
+	extracted, err := extractZipBinaryToTemp(zipPath, "xray", tmpDir)
+	if err != nil {
 		return err
 	}
-	if err := extractZipBinary(zipPath, "xray", cfg.XrayBinPath); err != nil {
+	if err := installBinaryWithRollback(
+		extracted,
+		cfg.XrayBinPath,
+		false,
+		func() error { return restartIfActive(ctx, exec, "dex-xray") },
+		func() { bestEffortRestartActive(ctx, exec, "dex-xray") },
+	); err != nil {
 		return err
 	}
 	if stdout != nil {
 		fmt.Fprintf(stdout, "[+] Updated %s cleanly.\n", cfg.XrayBinPath)
 	}
-	restartIfActive(ctx, exec, "dex-xray")
 	return nil
 }
 
@@ -840,20 +952,44 @@ func updateMosDNSBinary(ctx context.Context, exec reconcile.SystemExecutor, cfg 
 	if err := VerifyFileSHA256(zipPath, expected); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(cfg.MosDNSBinPath), 0o755); err != nil {
+	extracted, err := extractZipBinaryToTemp(zipPath, "mosdns", tmpDir)
+	if err != nil {
 		return err
 	}
-	if err := extractZipBinary(zipPath, "mosdns", cfg.MosDNSBinPath); err != nil {
+	if err := installBinaryWithRollback(
+		extracted,
+		cfg.MosDNSBinPath,
+		false,
+		func() error { return restartIfActive(ctx, exec, "dex-mosdns") },
+		func() { bestEffortRestartActive(ctx, exec, "dex-mosdns") },
+	); err != nil {
 		return err
 	}
 	if stdout != nil {
 		fmt.Fprintf(stdout, "[+] Updated %s cleanly.\n", cfg.MosDNSBinPath)
 	}
-	restartIfActive(ctx, exec, "dex-mosdns")
 	return nil
 }
 
-func restartIfActive(ctx context.Context, exec reconcile.SystemExecutor, units ...string) {
+func restartIfActive(ctx context.Context, exec reconcile.SystemExecutor, units ...string) error {
+	if exec == nil {
+		return nil
+	}
+	initSys := exec.DetectInitSystem()
+	for _, u := range units {
+		if exec.ServiceIsActive(ctx, initSys, u) {
+			if err := exec.ServiceRestart(ctx, initSys, u); err != nil {
+				return fmt.Errorf("restart %s: %w", u, err)
+			}
+			if !exec.ServiceIsActive(ctx, initSys, u) {
+				return fmt.Errorf("service %s failed health check after restart", u)
+			}
+		}
+	}
+	return nil
+}
+
+func bestEffortRestartActive(ctx context.Context, exec reconcile.SystemExecutor, units ...string) {
 	if exec == nil {
 		return
 	}

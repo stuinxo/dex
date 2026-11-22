@@ -55,6 +55,9 @@ func UpdateAndReconcile(
 		opts.PreserveTxn = true
 		var rerr error
 		res, rerr = reconcileUnlocked(ctx, store, exec, opts)
+		if rerr != nil || opts.DryRun {
+			_, _ = store.RollbackTxn()
+		}
 		return rerr
 	})
 	if err != nil {
@@ -463,6 +466,90 @@ func Reconcile(ctx context.Context, store *state.Store, exec SystemExecutor, opt
 	return res, nil
 }
 
+func isCustomExternalCertState(st *state.State, store *state.Store) bool {
+	return st.Cert.Mode == "imported" &&
+		((st.Cert.CertFile != "" && st.Cert.CertFile != store.DefaultCert()) ||
+			(st.Cert.KeyFile != "" && st.Cert.KeyFile != store.DefaultKey()))
+}
+
+func dryRunPreflight(ctx context.Context, exec SystemExecutor, store *state.Store, st *state.State, ropts render.RenderOptions, rootPrefix string, bundle *render.RenderBundle) error {
+	dryDir, err := os.MkdirTemp("", "dex-dryrun-*")
+	if err != nil {
+		return fmt.Errorf("create dry-run temp dir: %w", err)
+	}
+	defer os.RemoveAll(dryDir)
+
+	dryRopts := ropts
+	dryFiles := bundle.Files
+	if !isCustomExternalCertState(st, store) {
+		certDisk := mapTargetPath(rootPrefix, ropts.CertFile)
+		keyDisk := mapTargetPath(rootPrefix, ropts.KeyFile)
+		_, errC := os.Stat(certDisk)
+		_, errK := os.Stat(keyDisk)
+		if os.IsNotExist(errC) || os.IsNotExist(errK) {
+			dryCert := filepath.Join(dryDir, "dex.cer")
+			dryKey := filepath.Join(dryDir, "dex.key")
+			cn := st.Server.Domain
+			if cn == "" {
+				cn = st.Auth.ServerName
+			}
+			if cerr := cert.EnsureSelfSigned(dryCert, dryKey, cn); cerr != nil {
+				return fmt.Errorf("dry-run self-signed cert: %w", cerr)
+			}
+			dryRopts.CertFile = dryCert
+			dryRopts.KeyFile = dryKey
+			dryBundle, rerr := render.RenderAll(st, dryRopts)
+			if rerr != nil {
+				return rerr
+			}
+			dryFiles = dryBundle.Files
+		}
+	}
+
+	dryStagedPaths := make(map[string]string, len(dryFiles))
+	for i, f := range dryFiles {
+		name := fmt.Sprintf("%02d-%s", i, filepath.Base(f.TargetPath))
+		if strings.HasSuffix(f.TargetPath, ".json") && !strings.HasSuffix(name, ".json") {
+			name += ".json"
+		}
+		dst := filepath.Join(dryDir, name)
+		if err := writeBytesExact(dst, f.Content, f.Mode); err != nil {
+			return fmt.Errorf("stage dry-run %s: %w", f.TargetPath, err)
+		}
+		dryStagedPaths[f.TargetPath] = dst
+	}
+	if _, isOS := exec.(OSExecutor); isOS {
+		if err := checkRequiredBinaries(exec, ropts, bundle, true); err != nil {
+			return err
+		}
+	}
+	return preflightValidate(ctx, exec, dryRopts, dryStagedPaths, dryFiles)
+}
+
+func checkRequiredBinaries(exec SystemExecutor, ropts render.RenderOptions, bundle *render.RenderBundle, dryRun bool) error {
+	if bundle.XrayNeeded && !exec.HasCommand(ropts.XrayBin) {
+		return fmt.Errorf("missing required xray binary %q (run 'dex update --component xray')", ropts.XrayBin)
+	}
+	if bundle.MosDNSNeeded && !exec.HasCommand(ropts.MosDNSBin) {
+		return fmt.Errorf("missing required mosdns binary %q (run 'dex update --component mosdns')", ropts.MosDNSBin)
+	}
+	if (bundle.NFTClientNeeded || bundle.NFTRelayNeeded) && !exec.HasCommand("nft") {
+		return fmt.Errorf("missing required binary \"nft\"")
+	}
+	if bundle.HAProxyNeeded && !exec.HasCommand("haproxy") {
+		if !dryRun || (!exec.HasCommand("apt-get") && !exec.HasCommand("apk")) {
+			return fmt.Errorf("missing required binary \"haproxy\"")
+		}
+	}
+	if bundle.NginxNeeded && !exec.HasCommand("nginx") {
+		return fmt.Errorf("missing required binary \"nginx\"")
+	}
+	if bundle.WireGuardNeeded && !exec.HasCommand("wg-quick") {
+		return fmt.Errorf("missing required binary \"wg-quick\"")
+	}
+	return nil
+}
+
 func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecutor, opts ApplyOptions) (*ApplyResult, error) {
 	if exec == nil {
 		exec = OSExecutor{}
@@ -477,41 +564,6 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 
 	ropts, warnings := populateRenderOptions(ctx, st, store, exec, opts)
 
-	// Ensure a self-signed fallback cert exists whenever TLS is referenced before ACME/import.
-	certCreated := false
-	if !opts.DryRun {
-		if st.Role == state.RoleClient && st.Client.DNS.BlockAds {
-			adsDiskPath := mapTargetPath(opts.RootPrefix, filepath.Join(ropts.StateDir, "rules", "Domains.ads.txt"))
-			if _, statErr := os.Stat(adsDiskPath); os.IsNotExist(statErr) {
-				if werr := writeBytesExact(adsDiskPath, []byte{}, 0o644); werr != nil {
-					warnings = append(warnings, fmt.Sprintf("create placeholder Domains.ads.txt: %v", werr))
-				} else {
-					warnings = append(warnings, "Domains.ads.txt missing; created empty placeholder (run 'dex rules update --ads' to populate)")
-				}
-			}
-		}
-		isCustomExternalCert := st.Cert.Mode == "imported" &&
-			((st.Cert.CertFile != "" && st.Cert.CertFile != store.DefaultCert()) ||
-				(st.Cert.KeyFile != "" && st.Cert.KeyFile != store.DefaultKey()))
-		if !isCustomExternalCert {
-			certDisk := mapTargetPath(opts.RootPrefix, ropts.CertFile)
-			keyDisk := mapTargetPath(opts.RootPrefix, ropts.KeyFile)
-			prevCert, errC := os.ReadFile(certDisk)
-			prevKey, errK := os.ReadFile(keyDisk)
-			cn := st.Server.Domain
-			if cn == "" {
-				cn = st.Auth.ServerName
-			}
-			if cerr := cert.EnsureSelfSigned(certDisk, keyDisk, cn); cerr == nil {
-				afterCert, _ := os.ReadFile(certDisk)
-				afterKey, _ := os.ReadFile(keyDisk)
-				if errC != nil || errK != nil || !bytes.Equal(prevCert, afterCert) || !bytes.Equal(prevKey, afterKey) {
-					certCreated = true
-				}
-			}
-		}
-	}
-
 	bundle, err := render.RenderAll(st, ropts)
 	if err != nil {
 		return nil, err
@@ -522,6 +574,9 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		Warnings: warnings,
 	}
 	if opts.DryRun {
+		if err := dryRunPreflight(ctx, exec, store, st, ropts, opts.RootPrefix, bundle); err != nil {
+			return nil, err
+		}
 		return res, nil
 	}
 
@@ -541,6 +596,36 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		}); err != nil {
 			_, _ = store.RollbackTxn()
 			return nil, err
+		}
+	}
+
+	// Ensure placeholder rules & self-signed fallback cert exist only after RenderAll & unmanaged checks pass.
+	certCreated := false
+	if st.Role == state.RoleClient && st.Client.DNS.BlockAds {
+		adsDiskPath := mapTargetPath(opts.RootPrefix, filepath.Join(ropts.StateDir, "rules", "Domains.ads.txt"))
+		if _, statErr := os.Stat(adsDiskPath); os.IsNotExist(statErr) {
+			if werr := writeBytesExact(adsDiskPath, []byte{}, 0o644); werr != nil {
+				res.Warnings = append(res.Warnings, fmt.Sprintf("create placeholder Domains.ads.txt: %v", werr))
+			} else {
+				res.Warnings = append(res.Warnings, "Domains.ads.txt missing; created empty placeholder (run 'dex rules update --ads' to populate)")
+			}
+		}
+	}
+	if !isCustomExternalCertState(st, store) {
+		certDisk := mapTargetPath(opts.RootPrefix, ropts.CertFile)
+		keyDisk := mapTargetPath(opts.RootPrefix, ropts.KeyFile)
+		prevCert, errC := os.ReadFile(certDisk)
+		prevKey, errK := os.ReadFile(keyDisk)
+		cn := st.Server.Domain
+		if cn == "" {
+			cn = st.Auth.ServerName
+		}
+		if cerr := cert.EnsureSelfSigned(certDisk, keyDisk, cn); cerr == nil {
+			afterCert, _ := os.ReadFile(certDisk)
+			afterKey, _ := os.ReadFile(keyDisk)
+			if errC != nil || errK != nil || !bytes.Equal(prevCert, afterCert) || !bytes.Equal(prevKey, afterKey) {
+				certCreated = true
+			}
 		}
 	}
 
@@ -567,7 +652,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 
 	_, isOS := exec.(OSExecutor)
 
-	// Install haproxy automatically on real OS before pre-flight if a relay rule needs it.
+	// Install haproxy automatically on real OS before binary check & pre-flight if a relay rule needs it.
 	if bundle.HAProxyNeeded && isOS && !exec.HasCommand("haproxy") {
 		var ierr error
 		var out string
@@ -580,6 +665,14 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 			cleanupStaged()
 			_, _ = store.RollbackTxn()
 			return nil, fmt.Errorf("auto-install haproxy failed: %w (%s)", ierr, strings.TrimSpace(out))
+		}
+	}
+
+	if isOS && !opts.DryRun {
+		if err := checkRequiredBinaries(exec, ropts, bundle, false); err != nil {
+			cleanupStaged()
+			_, _ = store.RollbackTxn()
+			return nil, err
 		}
 	}
 
@@ -722,7 +815,26 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		name      string
 		wasActive bool
 	}
+	type svcSpec struct {
+		name   string
+		active bool
+		probe  bool
+	}
 	var touchedSvcs []touchedService
+	var orderedSpecs []svcSpec
+	stoppedActiveSet := make(map[string]bool)
+	stoppedEnabledOnlySet := make(map[string]bool)
+	recordStoppedUnit := func(name string) {
+		if exec.ServiceIsActive(ctx, ropts.InitSystem, name) {
+			stoppedActiveSet[name] = true
+			return
+		}
+		if isOS && ropts.InitSystem == "systemd" {
+			if _, enErr := exec.RunCommand(ctx, nil, "systemctl", "is-enabled", "--quiet", name); enErr == nil {
+				stoppedEnabledOnlySet[name] = true
+			}
+		}
+	}
 	nftWasActive := exec.ServiceIsActive(ctx, ropts.InitSystem, "dex-nft")
 	var prevNFTBytes []byte
 	for _, f := range bundle.Files {
@@ -766,11 +878,6 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		}
 
 		// Determine desired states of managed services
-		type svcSpec struct {
-			name   string
-			active bool
-			probe  bool
-		}
 		wgUnit := "wg-quick@wg0"
 		if ropts.InitSystem == "openrc" {
 			wgUnit = "wg-quick.wg0"
@@ -809,6 +916,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 				svcSpec{name: "dex-core-update.timer", active: bundle.CoreUpdateTimerNeeded, probe: false},
 			)
 		}
+		orderedSpecs = specs
 
 		// Stop/disable unneeded units (timers first) BEFORE deleting obsolete unit
 		// files or running daemon-reload, avoiding vanished-trigger failures
@@ -816,6 +924,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		for i := len(specs) - 1; i >= 0; i-- {
 			sp := specs[i]
 			if !sp.active {
+				recordStoppedUnit(sp.name)
 				_ = exec.ServiceStopDisable(ctx, ropts.InitSystem, sp.name)
 				res.ServicesOff = append(res.ServicesOff, sp.name)
 			}
@@ -884,6 +993,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 			}
 			res.ServicesOn = append(res.ServicesOn, "dex-daemon")
 		} else {
+			recordStoppedUnit("dex-daemon")
 			_ = exec.ServiceStopDisable(ctx, ropts.InitSystem, "dex-daemon")
 			res.ServicesOff = append(res.ServicesOff, "dex-daemon")
 		}
@@ -1002,7 +1112,30 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 			_ = exec.ServiceEnableStart(ctx, "systemd", "systemd-resolved")
 		}
 
-		// 3. Restart only services that were already active before this apply and were restarted.
+		// 3. Re-enable and start previously active services (or re-enable paused enabled-only services)
+		// in forward dependency order (base services -> dex-daemon -> timers).
+		restoreStoppedUnit := func(name string) {
+			if stoppedActiveSet[name] {
+				_ = exec.ServiceEnableStart(ctx, ropts.InitSystem, name)
+				return
+			}
+			if stoppedEnabledOnlySet[name] && ropts.InitSystem == "systemd" {
+				_, _ = exec.RunCommand(ctx, nil, "systemctl", "enable", name)
+			}
+		}
+		for _, sp := range orderedSpecs {
+			if !strings.HasSuffix(sp.name, ".timer") {
+				restoreStoppedUnit(sp.name)
+			}
+		}
+		restoreStoppedUnit("dex-daemon")
+		for _, sp := range orderedSpecs {
+			if strings.HasSuffix(sp.name, ".timer") {
+				restoreStoppedUnit(sp.name)
+			}
+		}
+
+		// 4. Restart only services that were already active before this apply and were restarted.
 		for _, ts := range touchedSvcs {
 			if ts.wasActive {
 				_ = exec.ServiceRestart(ctx, ropts.InitSystem, ts.name)

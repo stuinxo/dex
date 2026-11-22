@@ -489,6 +489,16 @@
 
     renderRelayTable($("client-relay-tbody"));
 
+    // RproxyS (optional on public client)
+    var crs = currentState.rproxys || {};
+    $("c-rs-enabled").checked = !!crs.enabled;
+    $("c-rs-domain").value = crs.domain || "";
+    $("c-rs-port").value = crs.listen_port || 20000;
+    $("c-rs-security").value = crs.security || "tls";
+    $("c-rs-uuids").value = (crs.uuids || []).join("\n");
+    $("c-rs-in-uuids").value = (crs.in_uuids || []).join("\n");
+    renderRproxySMappingsTo($("c-rs-map-tbody"));
+
     // RproxyC
     var rc = c.rproxyc || {};
     $("rc-enabled").checked = !!rc.enabled;
@@ -912,8 +922,7 @@
     });
   }
 
-  function renderRproxySMappings() {
-    var tbody = $("rs-map-tbody");
+  function renderRproxySMappingsTo(tbody) {
     clearEl(tbody);
     var maps = (currentState && currentState.rproxys && currentState.rproxys.mappings) || [];
     maps.forEach(function (m, idx) {
@@ -925,12 +934,16 @@
       bDel.type = "button";
       bDel.addEventListener("click", function () {
         currentState.rproxys.mappings.splice(idx, 1);
-        renderRproxySMappings();
+        renderRproxySMappingsTo(tbody);
       });
       td.appendChild(bDel);
       tr.appendChild(td);
       tbody.appendChild(tr);
     });
+  }
+
+  function renderRproxySMappings() {
+    renderRproxySMappingsTo($("rs-map-tbody"));
   }
 
   function renderWGPeers() {
@@ -1340,6 +1353,14 @@
     c.rproxyc.server_name = $("rc-sni").value.trim();
     c.rproxyc.pinned_peer_cert_sha256 = $("rc-pin").value.trim();
     c.rproxyc.out_direct = $("rc-out-direct").checked;
+
+    var crs = currentState.rproxys = currentState.rproxys || {};
+    crs.enabled = $("c-rs-enabled").checked;
+    crs.domain = $("c-rs-domain").value.trim();
+    crs.listen_port = Number($("c-rs-port").value || 20000);
+    crs.security = $("c-rs-security").value;
+    crs.uuids = splitList($("c-rs-uuids").value);
+    crs.in_uuids = splitList($("c-rs-in-uuids").value);
   }
 
   function collectWGFromUI() {
@@ -1683,9 +1704,38 @@
       body.appendChild(b);
     });
   });
+  function openRproxySAddMapModal(onAdded) {
+    openModal("添加 RproxyS 公网端口映射", function (body) {
+      function fld(lbl, el) {
+        var l = make("label", "field mt");
+        l.appendChild(make("span", "", lbl));
+        el.classList.add("form-control");
+        l.appendChild(el);
+        body.appendChild(l);
+        return el;
+      }
+      var fP = fld("公网监听端口", make("input")); fP.type = "number"; fP.value = "18080";
+      var fPr = make("select"); ["tcp", "udp", "tcp,udp"].forEach(function (p) { var o = make("option", "", p); o.value = p; fPr.appendChild(o); }); fld("协议", fPr);
+      var b = make("button", "btn btn-primary mt", "加入映射");
+      b.type = "button";
+      b.addEventListener("click", function () {
+        currentState.rproxys = currentState.rproxys || {};
+        currentState.rproxys.mappings = currentState.rproxys.mappings || [];
+        currentState.rproxys.mappings.push({ port: Number(fP.value), proto: fPr.value });
+        onAdded();
+        closeModal();
+      });
+      body.appendChild(b);
+    });
+  }
+
+  $("btn-c-rs-add-map").addEventListener("click", function () {
+    openRproxySAddMapModal(function () { renderRproxySMappingsTo($("c-rs-map-tbody")); });
+  });
+
   $("btn-save-forward").addEventListener("click", function () {
     collectForwardFromUI();
-    saveAndApplyState("转发与 RproxyC 已保存并应用");
+    saveAndApplyState("转发与 RproxyS/RproxyC 已保存并应用");
   });
 
   $("btn-wg-regen-server").addEventListener("click", async function () {
@@ -1756,27 +1806,7 @@
 
   $("btn-srv-add-relay").addEventListener("click", function () { openRelayModal($("srv-relay-tbody")); });
   $("btn-rs-add-map").addEventListener("click", function () {
-    openModal("添加 RproxyS 公网端口映射", function (body) {
-      function fld(lbl, el) {
-        var l = make("label", "field mt");
-        l.appendChild(make("span", "", lbl));
-        el.classList.add("form-control");
-        l.appendChild(el);
-        body.appendChild(l);
-        return el;
-      }
-      var fP = fld("公网监听端口", make("input")); fP.type = "number"; fP.value = "18080";
-      var fPr = make("select"); ["tcp", "udp", "tcp,udp"].forEach(function (p) { var o = make("option", "", p); o.value = p; fPr.appendChild(o); }); fld("协议", fPr);
-      var b = make("button", "btn btn-primary mt", "加入映射");
-      b.type = "button";
-      b.addEventListener("click", function () {
-        currentState.rproxys.mappings = currentState.rproxys.mappings || [];
-        currentState.rproxys.mappings.push({ port: Number(fP.value), proto: fPr.value });
-        renderRproxySMappings();
-        closeModal();
-      });
-      body.appendChild(b);
-    });
+    openRproxySAddMapModal(renderRproxySMappings);
   });
   $("btn-save-relay-rproxys").addEventListener("click", function () {
     collectRproxySFromUI();

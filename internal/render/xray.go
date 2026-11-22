@@ -708,8 +708,9 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 				},
 				"streamSettings": rpsStream,
 			})
+			var highPrioRules []map[string]any
 			if len(s.RproxyS.InUUIDs) > 0 {
-				rules = append(rules, map[string]any{
+				highPrioRules = append(highPrioRules, map[string]any{
 					"type":        "field",
 					"inboundTag":  []string{"rps-tunnel"},
 					"outboundTag": "portal",
@@ -732,11 +733,14 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 				})
 			}
 			if len(rpsTags) > 0 {
-				rules = append(rules, map[string]any{
+				highPrioRules = append(highPrioRules, map[string]any{
 					"type":        "field",
 					"inboundTag":  rpsTags,
 					"outboundTag": "portal",
 				})
+			}
+			if len(highPrioRules) > 0 {
+				rules = append(highPrioRules, rules...)
 			}
 		}
 

@@ -19,7 +19,7 @@
 curl -fsSL https://raw.githubusercontent.com/stuinxo/dex/main/scripts/install.sh -o install.sh && sh install.sh
 ```
 
-离线部署可将预先编译或下载的 `dex-linux-amd64`（或 `DEX_BIN=/path/to/dex`）及 `Xray-linux-64.zip` 置于 `/root/` 后直接运行 `sh install.sh [client|server|landing|relay]`。
+离线部署需显式指定本地二进制或压缩包路径环境变量（不隐式扫描 `.` 或 `/tmp`）：`DEX_BIN=/root/dex-linux-amd64 XRAY_ZIP=/root/Xray-linux-64.zip MOSDNS_ZIP=/root/mosdns-linux-amd64.zip sh install.sh [client|server|landing|relay]`。
 
 ## 四种运行角色
 
