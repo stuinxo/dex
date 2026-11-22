@@ -2,6 +2,9 @@ package cli
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -70,7 +73,7 @@ func TestCLISmokeEndToEnd(t *testing.T) {
 	}
 
 	// 5. init client --doh writes custom DoH and dry-run renders it
-	code, out, errOut = run("init", "--role", "client", "--doh", "https://vtw.example.com/dq")
+	code, out, errOut = run("init", "--force", "--role", "client", "--doh", "https://vtw.example.com/dq")
 	if code != 0 || !strings.Contains(out, "Initialized client state") {
 		t.Fatalf("init client --doh failed: code=%d out=%q err=%q", code, out, errOut)
 	}
@@ -102,7 +105,7 @@ func TestCLISmokeEndToEnd(t *testing.T) {
 	}
 
 	// 7. server extra add-reality + rproxy set/map-add + del
-	code, out, errOut = run("init", "--role", "server", "--domain", "srv.example.com")
+	code, out, errOut = run("init", "--force", "--role", "server", "--domain", "srv.example.com")
 	if code != 0 {
 		t.Fatalf("init server failed: %q", errOut)
 	}
@@ -454,5 +457,128 @@ func TestCmdCertSyncsStateAndReconcilesExternalPaths(t *testing.T) {
 	}
 	if stAfterImp.Cert.Mode != "imported" || stAfterImp.Cert.CertFile != store.DefaultCert() || stAfterImp.Cert.KeyFile != store.DefaultKey() {
 		t.Fatalf("unexpected cert state after import: %+v", stAfterImp.Cert)
+	}
+}
+
+func TestHardeningCLIInitForceDLModeNodeDelMenuPortRelayAndServices(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	run := func(args ...string) (int, string, string) {
+		var out, errBuf bytes.Buffer
+		full := append([]string{"--state-dir", stateDir}, args...)
+		code := Run(full, strings.NewReader(""), &out, &errBuf)
+		return code, out.String(), errBuf.String()
+	}
+
+	// 1. dex init refuses overwrite without --force, succeeds with --force
+	if code, _, errOut := run("init", "--role", "client"); code != 0 {
+		t.Fatalf("initial init failed: %s", errOut)
+	}
+	if code, _, errOut := run("init", "--role", "server", "--domain", "x.example.com"); code == 0 || !strings.Contains(errOut, "--force") {
+		t.Fatalf("expected init without --force rejected with --force hint, got code=%d err=%q", code, errOut)
+	}
+	if code, _, errOut := run("init", "--force", "--role", "client"); code != 0 {
+		t.Fatalf("init --force failed: %s", errOut)
+	}
+
+	// 2. DownloadVerifiedFile sets 0644 when !requireELF
+	payload := []byte("geoip-dat-content")
+	sum := sha256.Sum256(payload)
+	hexSum := hex.EncodeToString(sum[:])
+	dlSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(payload)
+	}))
+	defer dlSrv.Close()
+	dlDst := filepath.Join(dir, "rules", "geoip.dat")
+	if err := DownloadVerifiedFile(context.Background(), dlSrv.Client(), dlSrv.URL+"/geoip.dat", hexSum, dlDst, false); err != nil {
+		t.Fatalf("DownloadVerifiedFile failed: %v", err)
+	}
+	info, err := os.Stat(dlDst)
+	if err != nil || info.Mode().Perm() != 0o644 {
+		t.Fatalf("expected 0644 perm on non-ELF download, got %v err=%v", info.Mode().Perm(), err)
+	}
+
+	// 3. dex node del prunes all dangling references so Validate() remains valid
+	store := state.NewStore(stateDir)
+	_, err = store.Update(state.RoleClient, func(cur *state.State) error {
+		cur.Client.Nodes = []state.OutboundNode{
+			{ID: "n1", Name: "N1", Protocol: "vless-xhttp", Address: "1.1.1.1", Port: 443, UUID: "11111111-1111-4111-8111-111111111111"},
+			{ID: "n2", Name: "N2", Protocol: "vless-xhttp", Address: "2.2.2.2", Port: 443, UUID: "22222222-2222-4222-8222-222222222222"},
+		}
+		cur.Client.ActiveNodeID = "n1"
+		cur.Client.Routing.ServiceMap = map[string]string{"openai": "n1", "telegram": "n2"}
+		cur.Client.Routing.AppleNodeID = "n1"
+		cur.Client.Routing.Divert = state.DivertConfig{Enabled: true, NodeID: "n1"}
+		cur.Client.Routing.Custom = state.CustomRouteConfig{Enabled: true, NodeID: "n1"}
+		cur.Client.FWD1 = state.FWD1Config{Enabled: true, Port: 9801, UUIDs: []string{"33333333-3333-4333-8333-333333333333"}, UpstreamNodeID: "n1"}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed client refs: %v", err)
+	}
+	if code, _, errOut := run("node", "del", "n1"); code != 0 {
+		t.Fatalf("dex node del n1 failed: %s", errOut)
+	}
+	stAfterDel, _ := store.Load()
+	if stAfterDel.Client.ActiveNodeID != "n2" || len(stAfterDel.Client.Routing.ServiceMap) != 1 ||
+		stAfterDel.Client.Routing.AppleNodeID != "" || stAfterDel.Client.Routing.Divert.NodeID != "" ||
+		stAfterDel.Client.Routing.Custom.NodeID != "" || stAfterDel.Client.FWD1.UpstreamNodeID != "" {
+		t.Fatalf("expected all n1 references pruned after del, got %+v", stAfterDel.Client)
+	}
+
+	// 4. dex relay add on same port generates distinct IDs
+	if code, _, errOut := run("relay", "add", "--listen", "10001", "--target-host", "1.1.1.1", "--target-port", "443", "--proto", "tcp"); code != 0 {
+		t.Fatalf("relay add tcp failed: %s", errOut)
+	}
+	if code, out, errOut := run("relay", "add", "--listen", "10001", "--target-host", "1.1.1.1", "--target-port", "443", "--proto", "udp"); code != 0 || !strings.Contains(out, "fwd-udp-10001") {
+		t.Fatalf("relay add udp failed or missing distinct ID: code=%d out=%q err=%s", code, out, errOut)
+	}
+
+	// 5. menu case "8" preserves loopback host on server role
+	srvDir := filepath.Join(dir, "srv-state")
+	srvStore := state.NewStore(srvDir)
+	srvSt := state.NewDefaultState(state.RoleServer)
+	srvSt.Server.Domain = "srv.example.com"
+	srvSt.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	_ = srvStore.Save(srvSt)
+	var mOut, mErr bytes.Buffer
+	runInteractiveMenu(srvStore, &fakeOpsExec{}, strings.NewReader("8\n9443\nq\n"), &mOut, &mErr)
+	srvReloaded, _ := srvStore.Load()
+	if srvReloaded.Auth.ListenAddr != "127.0.0.1:9443" {
+		t.Fatalf("expected server ListenAddr to preserve 127.0.0.1 host, got %q", srvReloaded.Auth.ListenAddr)
+	}
+
+	// 6. serviceNamesForState accuracy across roles
+	relNFT := state.NewDefaultState(state.RoleRelay)
+	relNFT.Relay.Forwards = []state.ForwardRule{{ID: "f1", ListenPort: 10001, TargetHost: "1.1.1.1", TargetPort: 443, Proto: "tcp", Engine: "nft"}}
+	if got := serviceNamesForState(relNFT, "systemd"); !reflect.DeepEqual(got, []string{"dex-nft"}) {
+		t.Fatalf("expected relay nft services=[dex-nft], got %v", got)
+	}
+	relHap := state.NewDefaultState(state.RoleRelay)
+	relHap.Relay.Forwards = []state.ForwardRule{{ID: "f2", ListenPort: 10002, TargetHost: "1.1.1.1", TargetPort: 443, Proto: "tcp", Engine: "haproxy"}}
+	if got := serviceNamesForState(relHap, "systemd"); !reflect.DeepEqual(got, []string{"haproxy"}) {
+		t.Fatalf("expected relay haproxy services=[haproxy], got %v", got)
+	}
+	land := state.NewDefaultState(state.RoleLanding)
+	if got := serviceNamesForState(land, "systemd"); !reflect.DeepEqual(got, []string{"dex-xray"}) {
+		t.Fatalf("expected landing services=[dex-xray], got %v", got)
+	}
+
+	// 7. dex cert inspect uses resolveActiveCertPaths (reads external imported cert when configured)
+	extDir := filepath.Join(dir, "ext-cert-inspect")
+	extStore := state.NewStore(filepath.Join(extDir, "etc", "dex"))
+	extCert := filepath.Join(dir, "ext-custom.cer")
+	extKey := filepath.Join(dir, "ext-custom.key")
+	if err := cert.EnsureSelfSigned(extCert, extKey, "ext-inspect.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	extSt := state.NewDefaultState(state.RoleServer)
+	extSt.Server.Domain = "ext-inspect.example.com"
+	extSt.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	extSt.Cert = state.CertConfig{Mode: "imported", CertFile: extCert, KeyFile: extKey}
+	_ = extStore.Save(extSt)
+	var ciOut, ciErr bytes.Buffer
+	if code := cmdCertWithOpts(extStore, nil, reconcile.ApplyOptions{}, []string{"inspect"}, &ciOut, &ciErr); code != 0 || !strings.Contains(ciOut.String(), "ext-inspect.example.com") {
+		t.Fatalf("expected cert inspect to read active external cert, code=%d out=%q err=%q", code, ciOut.String(), ciErr.String())
 	}
 }

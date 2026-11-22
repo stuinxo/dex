@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/stuinxo/de_GWD/v3/internal/cryptoext"
 	"github.com/stuinxo/de_GWD/v3/internal/state"
 )
 
@@ -207,48 +206,9 @@ func importExtraFromVtrui(xcfg map[string]any, optDir string) ([]state.ExtraInbo
 	if len(filtered) == 0 {
 		return nil, nil
 	}
-	tmpBytes, _ := json.Marshal(filtered)
-	tmpFile, err := os.CreateTemp("", "dex-migrate-extra-*.json")
-	if err != nil {
-		return nil, nil
-	}
-	tmpPath := tmpFile.Name()
-	_ = tmpFile.Close()
-	defer os.Remove(tmpPath)
-	_ = os.WriteFile(tmpPath, tmpBytes, 0o600)
-
-	// Temporarily read extra_ports.json / extra_domains.json from optDir while decoding filtered inbounds
 	portsMap := readStringIntMap(filepath.Join(optDir, "extra_ports.json"))
 	domainsMap := readStringMap(filepath.Join(optDir, "extra_domains.json"))
-	inbsOut, notes := decodeExtraInboundsList(filtered, portsMap, domainsMap)
-	realityInfoPub := readRealityPubKeyFromInfo(filepath.Join(optDir, "vtrui", "reality.info"))
-	for i := range inbsOut {
-		if inbsOut[i].Protocol == "vless-reality" && inbsOut[i].RealityPubKey == "" {
-			if realityInfoPub != "" {
-				inbsOut[i].RealityPubKey = realityInfoPub
-			} else if inbsOut[i].RealityPrivKey != "" {
-				if derived, derr := cryptoext.DeriveRealityPublicKey(inbsOut[i].RealityPrivKey); derr == nil {
-					inbsOut[i].RealityPubKey = derived
-				}
-			}
-		}
-	}
-	return inbsOut, notes
-}
-
-func decodeExtraInboundsList(rawList []map[string]any, portsMap map[string]int, domainsMap map[string]string) ([]state.ExtraInbound, []string) {
-	tmpDir, err := os.MkdirTemp("", "dex-mig-extra-*")
-	if err != nil {
-		return nil, nil
-	}
-	defer os.RemoveAll(tmpDir)
-	b1, _ := json.Marshal(rawList)
-	b2, _ := json.Marshal(portsMap)
-	b3, _ := json.Marshal(domainsMap)
-	_ = os.WriteFile(filepath.Join(tmpDir, "extra_inbounds.json"), b1, 0o600)
-	_ = os.WriteFile(filepath.Join(tmpDir, "extra_ports.json"), b2, 0o600)
-	_ = os.WriteFile(filepath.Join(tmpDir, "extra_domains.json"), b3, 0o600)
-	return importExtraInboundsDir(tmpDir)
+	return decodeExtraInbounds(filtered, portsMap, domainsMap, filepath.Join(optDir, "vtrui", "reality.info"))
 }
 
 func parseHAProxyRules(cfg string) []state.ForwardRule {

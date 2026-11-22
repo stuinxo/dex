@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/stuinxo/de_GWD/v3/internal/state"
 )
@@ -188,10 +189,21 @@ func ImportDEXS(statePath string) (*state.State, []string, error) {
 			Path:       "/" + first.UUID[max(0, len(first.UUID)-6):],
 			EnableDoH:  false,
 		}
+		seenExtraTags := make(map[string]bool, len(doc.Nodes))
 		for i := 1; i < len(doc.Nodes); i++ {
 			n := doc.Nodes[i]
+			name := strings.TrimSpace(n.Name)
+			if name == "" {
+				name = fmt.Sprintf("node-%d", i+1)
+			}
+			baseTag := "dexs-" + name
+			tag := baseTag
+			for suffix := 2; seenExtraTags[tag]; suffix++ {
+				tag = fmt.Sprintf("%s-%d", baseTag, suffix)
+			}
+			seenExtraTags[tag] = true
 			st.ExtraInbounds = append(st.ExtraInbounds, state.ExtraInbound{
-				Tag:        "dexs-" + n.Name,
+				Tag:        tag,
 				Protocol:   "vless-ws",
 				ListenPort: n.Port,
 				UUID:       n.UUID,
@@ -203,10 +215,21 @@ func ImportDEXS(statePath string) (*state.State, []string, error) {
 		notes = append(notes, fmt.Sprintf("Imported %d dexs node(s) (main + extra VLESS-WS-TLS)", len(doc.Nodes)))
 	}
 
-	for _, r := range doc.Relays {
+	seenRelayIDs := make(map[string]bool, len(doc.Relays))
+	for idx, r := range doc.Relays {
+		name := strings.TrimSpace(r.Name)
+		if name == "" {
+			name = fmt.Sprintf("relay-%d", idx+1)
+		}
+		baseID := "dexs-" + name
+		id := baseID
+		for suffix := 2; seenRelayIDs[id]; suffix++ {
+			id = fmt.Sprintf("%s-%d", baseID, suffix)
+		}
+		seenRelayIDs[id] = true
 		st.Relay.Forwards = append(st.Relay.Forwards, state.ForwardRule{
-			ID:         "dexs-" + r.Name,
-			Name:       r.Name,
+			ID:         id,
+			Name:       name,
 			ListenPort: r.Port,
 			TargetHost: r.Host,
 			TargetPort: r.TargetPort,

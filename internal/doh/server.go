@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -158,10 +159,25 @@ func (h *Handler) exchange(ctx context.Context, req []byte) ([]byte, error) {
 	return nil, lastErr
 }
 
-func exchangeSingle(ctx context.Context, upstream string, req []byte) ([]byte, error) {
-	if !strings.Contains(upstream, ":") {
-		upstream += ":53"
+func normalizeUpstreamAddr(upstream string) string {
+	upstream = strings.TrimSpace(upstream)
+	if ip, err := netip.ParseAddr(strings.Trim(upstream, "[]")); err == nil {
+		return net.JoinHostPort(ip.String(), "53")
 	}
+	if host, port, err := net.SplitHostPort(upstream); err == nil {
+		if port == "" {
+			port = "53"
+		}
+		return net.JoinHostPort(strings.Trim(host, "[]"), port)
+	}
+	if !strings.Contains(upstream, ":") {
+		return net.JoinHostPort(upstream, "53")
+	}
+	return upstream
+}
+
+func exchangeSingle(ctx context.Context, upstream string, req []byte) ([]byte, error) {
+	upstream = normalizeUpstreamAddr(upstream)
 	resp, truncated, err := exchangeUDP(ctx, upstream, req)
 	if err == nil && !truncated {
 		return resp, nil

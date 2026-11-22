@@ -159,6 +159,9 @@ func inspectPairAt(certPEM, keyPEM []byte, now time.Time, customRoots *x509.Cert
 	for _, d := range leaf.DNSNames {
 		addSAN(d)
 	}
+	for _, ip := range leaf.IPAddresses {
+		addSAN(ip.String())
+	}
 	if leaf.Subject.CommonName != "" {
 		addSAN(leaf.Subject.CommonName)
 	}

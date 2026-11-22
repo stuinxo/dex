@@ -104,20 +104,28 @@ MTU = 1420
 `, wg.ServerPrivateKey, srvAddr, wg.ListenPort)
 
 	files := make([]RenderedFile, 0, 1+len(wg.Peers))
+	seenPeerFiles := make(map[string]bool, len(wg.Peers))
 	for i, peer := range wg.Peers {
 		fmt.Fprintf(&b, "\n# Peer: %s\n[Peer]\nPublicKey = %s\nAllowedIPs = %s\n",
 			peer.Name, peer.PublicKey, normalizePeerAllowedIP(peer.IP))
 
-		peerFileName := fmt.Sprintf("peer-%d.conf", i+1)
+		baseName := fmt.Sprintf("peer-%d", i+1)
 		if peer.Name != "" {
-			safe := strings.Map(func(r rune) rune {
+			safe := strings.Trim(strings.Map(func(r rune) rune {
 				if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
 					return r
 				}
 				return '_'
-			}, peer.Name)
-			peerFileName = "peer-" + safe + ".conf"
+			}, peer.Name), "_")
+			if safe != "" {
+				baseName = "peer-" + safe
+			}
 		}
+		peerFileName := baseName + ".conf"
+		for suffix := i + 1; seenPeerFiles[peerFileName]; suffix++ {
+			peerFileName = fmt.Sprintf("%s-%d.conf", baseName, suffix)
+		}
+		seenPeerFiles[peerFileName] = true
 		files = append(files, RenderedFile{
 			RelName:    "wg-peers/" + peerFileName,
 			TargetPath: filepath.Join(opts.GeneratedDir, "wg-peers", peerFileName),

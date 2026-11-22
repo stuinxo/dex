@@ -360,3 +360,75 @@ func TestImportV2ClientFWD1PortConflictAvoidance(t *testing.T) {
 		t.Fatalf("expected ListenAddr shifted to :8444 avoiding FWD0:443 & FWD1:8443, got %q", st2.Auth.ListenAddr)
 	}
 }
+
+func TestHardeningV2ServerInMemoryExtraAndDEXSEmptyNames(t *testing.T) {
+	// 1. ImportV2Server decodes vtrui extra_inbounds in memory (without /tmp temp files) and ImportV2Client sets acme_cf
+	root := t.TempDir()
+	vtruiDir := filepath.Join(root, "opt", "de_GWD", "vtrui")
+	_ = os.MkdirAll(vtruiDir, 0o755)
+	_ = os.WriteFile(filepath.Join(vtruiDir, "config.json"), []byte(`{
+  "inbounds": [
+    {
+      "tag": "main",
+      "port": 9890,
+      "protocol": "vless",
+      "settings": {"clients": [{"id": "11111111-1111-4111-8111-111111111111"}]},
+      "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/1111"}}
+    },
+    {
+      "tag": "inbound-socks5",
+      "port": 1080,
+      "protocol": "socks",
+      "settings": {"accounts": [{"user": "u1", "pass": "p1"}]}
+    }
+  ]
+}`), 0o600)
+	stSrv, _, err := ImportV2Server(root)
+	if err != nil {
+		t.Fatalf("ImportV2Server: %v", err)
+	}
+	if len(stSrv.ExtraInbounds) != 1 || stSrv.ExtraInbounds[0].Tag != "inbound-socks5" || stSrv.ExtraInbounds[0].SocksUser != "u1" {
+		t.Fatalf("expected decoded extra inbound from vtrui, got %+v", stSrv.ExtraInbounds)
+	}
+
+	confCF := filepath.Join(t.TempDir(), "0conf-cf")
+	_ = os.WriteFile(confCF, []byte(`{
+  "FORWARD": {"domain": "cf.example.com", "token": "cf-tok-1"}
+}`), 0o600)
+	stCF, _, err := ImportV2Client(confCF, "")
+	if err != nil {
+		t.Fatalf("ImportV2Client cf: %v", err)
+	}
+	if stCF.Cert.Mode != "acme_cf" {
+		t.Fatalf("expected Cert.Mode=acme_cf, got %q", stCF.Cert.Mode)
+	}
+
+	// 2. ImportDEXS falls back to node-<i+1> / relay-<idx+1> when Name is empty
+	dexsPath := filepath.Join(t.TempDir(), "dexs-state.json")
+	_ = os.WriteFile(dexsPath, []byte(`{
+  "version": 1,
+  "domain": "dexs.example.com",
+  "nodes": [
+    {"name": "", "port": 443, "uuid": "11111111-1111-4111-8111-111111111111"},
+    {"name": "", "port": 8443, "uuid": "22222222-2222-4222-8222-222222222222"},
+    {"name": "", "port": 8444, "uuid": "33333333-3333-4333-8333-333333333333"}
+  ],
+  "relays": [
+    {"name": "", "port": 10001, "host": "1.1.1.1", "target_port": 443, "network": "tcp"},
+    {"name": "", "port": 10002, "host": "1.1.1.1", "target_port": 443, "network": "udp"}
+  ]
+}`), 0o600)
+	stDexs, _, err := ImportDEXS(dexsPath)
+	if err != nil {
+		t.Fatalf("ImportDEXS: %v", err)
+	}
+	if err := stDexs.Validate(); err != nil {
+		t.Fatalf("ImportDEXS state Validate failed: %v", err)
+	}
+	if stDexs.ExtraInbounds[0].Tag != "dexs-node-2" || stDexs.ExtraInbounds[1].Tag != "dexs-node-3" {
+		t.Fatalf("unexpected fallback extra tags: %+v", stDexs.ExtraInbounds)
+	}
+	if stDexs.Relay.Forwards[0].ID != "dexs-relay-1" || stDexs.Relay.Forwards[1].ID != "dexs-relay-2" {
+		t.Fatalf("unexpected fallback relay IDs: %+v", stDexs.Relay.Forwards)
+	}
+}

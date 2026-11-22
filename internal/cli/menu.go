@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"strconv"
 	"strings"
 
@@ -164,14 +165,27 @@ func runInteractiveMenu(store *state.Store, exec reconcile.SystemExecutor, stdin
 			}
 			pStr := ask("Web UI port", defPort)
 			if p, perr := strconv.Atoi(pStr); perr == nil && p >= 1 && p <= 65535 {
+				newAddr := ""
 				if _, uerr := store.Update(st.Role, func(cur *state.State) error {
-					cur.Auth.ListenAddr = fmt.Sprintf(":%d", p)
+					host := ""
+					if h, _, serr := net.SplitHostPort(cur.Auth.ListenAddr); serr == nil {
+						host = h
+					}
+					if host == "" && cur.Role == state.RoleServer {
+						host = "127.0.0.1"
+					}
+					if host == "" {
+						newAddr = fmt.Sprintf(":%d", p)
+					} else {
+						newAddr = net.JoinHostPort(host, strconv.Itoa(p))
+					}
+					cur.Auth.ListenAddr = newAddr
 					return nil
 				}); uerr != nil {
 					fmt.Fprintf(stderr, "update failed: %v\n", uerr)
 					continue
 				}
-				fmt.Fprintf(stdout, "Web listen port set to :%d\n", p)
+				fmt.Fprintf(stdout, "Web listen port set to %s\n", newAddr)
 				if exec != nil {
 					initSys := exec.DetectInitSystem()
 					if exec.ServiceIsActive(context.Background(), initSys, "dex-daemon") {

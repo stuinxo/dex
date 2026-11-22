@@ -47,7 +47,7 @@ type AuthConfig struct {
 }
 
 type CertConfig struct {
-	Mode      string `json:"mode"` // self_signed | imported | acme_cf
+	Mode      string `json:"mode"` // self_signed | imported | acme_cf | acme_http
 	Domain    string `json:"domain,omitempty"`
 	CertFile  string `json:"cert_file,omitempty"`
 	KeyFile   string `json:"key_file,omitempty"`
@@ -361,6 +361,40 @@ func (c *ClientConfig) ActiveNode() *OutboundNode {
 		return &c.Nodes[0]
 	}
 	return nil
+}
+
+// PruneNodeRefs removes or updates any dangling references to a deleted node ID.
+func (c *ClientConfig) PruneNodeRefs(id string) {
+	if c == nil || id == "" {
+		return
+	}
+	if c.ActiveNodeID == id {
+		fallback := ""
+		for _, n := range c.Nodes {
+			if n.ID != id {
+				fallback = n.ID
+				break
+			}
+		}
+		c.ActiveNodeID = fallback
+	}
+	for k, v := range c.Routing.ServiceMap {
+		if v == id {
+			delete(c.Routing.ServiceMap, k)
+		}
+	}
+	if c.Routing.AppleNodeID == id {
+		c.Routing.AppleNodeID = ""
+	}
+	if c.Routing.Divert.NodeID == id {
+		c.Routing.Divert.NodeID = ""
+	}
+	if c.Routing.Custom.NodeID == id {
+		c.Routing.Custom.NodeID = ""
+	}
+	if c.FWD1.UpstreamNodeID == id {
+		c.FWD1.UpstreamNodeID = ""
+	}
 }
 
 // EffectiveSNI returns the TLS serverName for a node, defaulting to its address.

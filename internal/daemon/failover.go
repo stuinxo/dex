@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/stuinxo/de_GWD/v3/internal/render"
@@ -82,7 +83,7 @@ func ProbeNodeHealth(ctx context.Context, n state.OutboundNode, timeout time.Dur
 				return http.ErrUseLastResponse
 			},
 		}
-		reqURL := fmt.Sprintf("https://%s:%d%s", sni, port, path)
+		reqURL := fmt.Sprintf("https://%s%s", net.JoinHostPort(strings.Trim(sni, "[]"), strconv.Itoa(port)), path)
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 		if err != nil {
 			return ProbeNodeResult{NodeID: n.ID, Healthy: false, Error: err.Error()}
@@ -143,8 +144,9 @@ type FailoverController struct {
 	SwitchNode       func(ctx context.Context, nodeID string) error
 	Hub              *TaskHub
 
-	failCount     int
-	recoverCounts map[string]int
+	failCount          int
+	recoverCounts      map[string]int
+	autoSwitchedNodeID string
 }
 
 // NewFailoverController creates a FailoverController with standard 3-strike thresholds.
@@ -172,6 +174,7 @@ func (f *FailoverController) log(level, msg string) {
 func (f *FailoverController) Step(ctx context.Context, st *state.State) {
 	if st == nil || st.Role != state.RoleClient || !st.Client.FailoverEnabled || len(st.Client.Nodes) < 2 {
 		f.failCount = 0
+		f.autoSwitchedNodeID = ""
 		for k := range f.recoverCounts {
 			delete(f.recoverCounts, k)
 		}
@@ -182,8 +185,11 @@ func (f *FailoverController) Step(ctx context.Context, st *state.State) {
 	if active == nil {
 		return
 	}
+	if f.autoSwitchedNodeID != "" && active.ID != f.autoSwitchedNodeID {
+		f.autoSwitchedNodeID = ""
+	}
 	// Pause automatic switching when manual Reality node is active (matches v2 ui-failover).
-	if active.Protocol == "vless-reality" {
+	if active.Protocol == "vless-reality" && f.autoSwitchedNodeID != active.ID {
 		f.failCount = 0
 		for k := range f.recoverCounts {
 			delete(f.recoverCounts, k)
@@ -213,6 +219,11 @@ func (f *FailoverController) Step(ctx context.Context, st *state.State) {
 						f.log("ERROR", fmt.Sprintf("failback switch to %s failed: %v", cand.ID, err))
 					} else {
 						f.log("INFO", fmt.Sprintf("FAILBACK switched active node to [%s] %s", cand.ID, cand.Name))
+						if cand.Protocol == "vless-reality" {
+							f.autoSwitchedNodeID = cand.ID
+						} else {
+							f.autoSwitchedNodeID = ""
+						}
 						f.failCount = 0
 						for k := range f.recoverCounts {
 							delete(f.recoverCounts, k)
@@ -257,6 +268,11 @@ func (f *FailoverController) Step(ctx context.Context, st *state.State) {
 			continue
 		}
 		f.log("WARN", fmt.Sprintf("FAILOVER switched active node from [%s] to [%s] %s", active.ID, cand.ID, cand.Name))
+		if cand.Protocol == "vless-reality" {
+			f.autoSwitchedNodeID = cand.ID
+		} else {
+			f.autoSwitchedNodeID = ""
+		}
 		f.failCount = 0
 		for k := range f.recoverCounts {
 			delete(f.recoverCounts, k)

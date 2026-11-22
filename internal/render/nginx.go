@@ -7,11 +7,21 @@ import (
 	"github.com/stuinxo/de_GWD/v3/internal/state"
 )
 
-func listenSSLDirective(port int, legacyHTTP2 bool) string {
+func listenSSLDirective(port int, legacyHTTP2, enableIPv6 bool) string {
+	var b strings.Builder
 	if legacyHTTP2 {
-		return fmt.Sprintf("  listen %d ssl http2;", port)
+		fmt.Fprintf(&b, "  listen %d ssl http2;", port)
+		if enableIPv6 {
+			fmt.Fprintf(&b, "\n  listen [::]:%d ssl http2;", port)
+		}
+		return b.String()
 	}
-	return fmt.Sprintf("  listen %d ssl;\n  http2 on;", port)
+	fmt.Fprintf(&b, "  listen %d ssl;", port)
+	if enableIPv6 {
+		fmt.Fprintf(&b, "\n  listen [::]:%d ssl;", port)
+	}
+	b.WriteString("\n  http2 on;")
+	return b.String()
 }
 
 // RenderNginx generates a single declarative Nginx config (/etc/nginx/conf.d/dex-server.conf)
@@ -49,13 +59,17 @@ func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, 
 		}
 
 		if port == 443 {
+			listen80 := "  listen 80;"
+			if s.System.EnableIPv6 {
+				listen80 += "\n  listen [::]:80;"
+			}
 			fmt.Fprintf(&b, `server {
-  listen 80;
+%s
   server_name %s;
   return 301 https://$server_name$request_uri;
 }
 
-`, domain)
+`, listen80, domain)
 		}
 
 		b.WriteString(`upstream dex_xray {
@@ -87,7 +101,7 @@ func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, 
   ssl_buffer_size 4k;
   ssl_early_data on;
 
-`, listenSSLDirective(port, opts.NginxLegacyHTTP2), domain, webRoot, port, opts.CertFile, opts.KeyFile)
+`, listenSSLDirective(port, opts.NginxLegacyHTTP2, s.System.EnableIPv6), domain, webRoot, port, opts.CertFile, opts.KeyFile)
 
 		if s.Server.EnableDoH {
 			b.WriteString(`  location /dq {
@@ -175,7 +189,7 @@ server {
     proxy_read_timeout 600s;
   }
 }
-`, listenSSLDirective(ex.ListenPort, opts.NginxLegacyHTTP2), dom, opts.CertFile, opts.KeyFile, path, internalPort, wsHeaders)
+`, listenSSLDirective(ex.ListenPort, opts.NginxLegacyHTTP2, s.System.EnableIPv6), dom, opts.CertFile, opts.KeyFile, path, internalPort, wsHeaders)
 	}
 
 	return []byte(b.String()), true, nil

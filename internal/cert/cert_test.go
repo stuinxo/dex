@@ -321,3 +321,101 @@ func TestWave2ForceSelfSignedAndIssueHTTPACME(t *testing.T) {
 		}
 	}
 }
+
+type failIssueRunner struct {
+	failAction string // "issue" | "install"
+	acmeHome   string
+	mainDom    string
+	certBytes  []byte
+	keyBytes   []byte
+}
+
+func (f *failIssueRunner) Run(_ context.Context, _ []string, _ string, args ...string) ([]byte, error) {
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "--issue") {
+		_ = os.WriteFile(filepath.Join(f.acmeHome, "account.conf"), []byte("SAVED_CF_Token='secret-token'\nOTHER='1'\n"), 0o600)
+		if f.failAction == "issue" {
+			return []byte("simulated acme issue error"), os.ErrInvalid
+		}
+		d := filepath.Join(f.acmeHome, f.mainDom+"_ecc")
+		_ = os.MkdirAll(d, 0o755)
+		_ = os.WriteFile(filepath.Join(d, "fullchain.cer"), f.certBytes, 0o644)
+		_ = os.WriteFile(filepath.Join(d, f.mainDom+".key"), f.keyBytes, 0o600)
+	}
+	if strings.Contains(joined, "--install-cert") && f.failAction == "install" {
+		return []byte("simulated install-cert error"), os.ErrPermission
+	}
+	return []byte("ok"), nil
+}
+
+func TestHardeningCertIPSANsAndACMEErrorHandling(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1. Self-signed cert includes 127.0.0.1 and ::1 IP SANs; IP CN goes to IPAddresses (not DNSNames)
+	cIP := filepath.Join(dir, "ip.cer")
+	kIP := filepath.Join(dir, "ip.key")
+	if err := EnsureSelfSigned(cIP, kIP, "10.0.0.230"); err != nil {
+		t.Fatalf("EnsureSelfSigned IP CN: %v", err)
+	}
+	cb, _ := os.ReadFile(cIP)
+	kb, _ := os.ReadFile(kIP)
+	rep, err := InspectPair(cb, kb)
+	if err != nil {
+		t.Fatalf("InspectPair IP CN: %v", err)
+	}
+	for _, wantSAN := range []string{"localhost", "127.0.0.1", "::1", "10.0.0.230"} {
+		if !CoversDomain(rep, wantSAN) {
+			t.Fatalf("expected IP self-signed cert to cover %q, SANs=%v", wantSAN, rep.SANs)
+		}
+	}
+	block, _ := pem.Decode(cb)
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range leaf.DNSNames {
+		if d == "10.0.0.230" {
+			t.Fatalf("IP CN must NOT be placed in DNSNames, got %v", leaf.DNSNames)
+		}
+	}
+
+	// 2. IssueCloudflareACME scrubs CF token even when --issue fails and AutoRenew=false
+	acmeHome := filepath.Join(dir, "acme-fail")
+	_ = os.MkdirAll(acmeHome, 0o755)
+	if _, err := IssueCloudflareACME(context.Background(), &failIssueRunner{failAction: "issue", acmeHome: acmeHome}, ACMEConfig{
+		Domain:    "sub.example.com",
+		CFToken:   "secret-token",
+		AutoRenew: false,
+		AcmeBin:   filepath.Join(acmeHome, "acme.sh"),
+		AcmeHome:  acmeHome,
+		CertPath:  filepath.Join(dir, "out.cer"),
+		KeyPath:   filepath.Join(dir, "out.key"),
+	}); err == nil {
+		t.Fatalf("expected IssueCloudflareACME failure when --issue fails")
+	}
+	accRaw, _ := os.ReadFile(filepath.Join(acmeHome, "account.conf"))
+	if strings.Contains(string(accRaw), "CF_Token") || !strings.Contains(string(accRaw), "OTHER='1'") {
+		t.Fatalf("expected CF_Token scrubbed on failure, got %q", string(accRaw))
+	}
+
+	// 3. stageAndInstallACMECert returns error when --install-cert fails
+	now := time.Now()
+	cPEM, kPEM, _, _ := genTestCert(t, "example.com", []string{"example.com", "*.example.com"}, now.Add(-time.Hour), now.Add(90*24*time.Hour), nil, nil)
+	if _, err := IssueCloudflareACME(context.Background(), &failIssueRunner{
+		failAction: "install",
+		acmeHome:   acmeHome,
+		mainDom:    "example.com",
+		certBytes:  cPEM,
+		keyBytes:   kPEM,
+	}, ACMEConfig{
+		Domain:    "sub.example.com",
+		CFToken:   "secret-token",
+		AutoRenew: false,
+		AcmeBin:   filepath.Join(acmeHome, "acme.sh"),
+		AcmeHome:  acmeHome,
+		CertPath:  filepath.Join(dir, "out2.cer"),
+		KeyPath:   filepath.Join(dir, "out2.key"),
+	}); err == nil || !strings.Contains(err.Error(), "install-cert") {
+		t.Fatalf("expected install-cert error propagated, got %v", err)
+	}
+}

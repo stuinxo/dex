@@ -383,11 +383,11 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 		}
 		if tok := strVal(fwd["token"]); tok != "" {
 			st.Cert.CFToken = tok
-			st.Cert.Mode = "acme"
+			st.Cert.Mode = "acme_cf"
 			st.Cert.AutoRenew = true
 		} else if key := strVal(fwd["APIkey"]); key != "" {
 			st.Cert.CFToken = key
-			st.Cert.Mode = "acme"
+			st.Cert.Mode = "acme_cf"
 		}
 		if strings.EqualFold(strVal(fwd["block53"]), "on") {
 			st.Client.DNS.BlockExternal53 = true
@@ -687,7 +687,10 @@ func importExtraInboundsDir(dir string) ([]state.ExtraInbound, []string) {
 	}
 	portsMap := readStringIntMap(filepath.Join(dir, "extra_ports.json"))
 	domainsMap := readStringMap(filepath.Join(dir, "extra_domains.json"))
+	return decodeExtraInbounds(rawList, portsMap, domainsMap, filepath.Join(dir, "vtrui", "reality.info"))
+}
 
+func decodeExtraInbounds(rawList []map[string]any, portsMap map[string]int, domainsMap map[string]string, realityInfoPath string) ([]state.ExtraInbound, []string) {
 	var out []state.ExtraInbound
 	for _, inb := range rawList {
 		tag := strVal(inb["tag"])
@@ -725,8 +728,8 @@ func importExtraInboundsDir(dir string) ([]state.ExtraInbound, []string) {
 					ex.RealityShortID = sids[0]
 				}
 			}
-			if ex.RealityPubKey == "" {
-				ex.RealityPubKey = readRealityPubKeyFromInfo(filepath.Join(dir, "vtrui", "reality.info"))
+			if ex.RealityPubKey == "" && realityInfoPath != "" {
+				ex.RealityPubKey = readRealityPubKeyFromInfo(realityInfoPath)
 			}
 			if ex.RealityPubKey == "" && ex.RealityPrivKey != "" {
 				if derived, derr := cryptoext.DeriveRealityPublicKey(ex.RealityPrivKey); derr == nil {

@@ -161,8 +161,14 @@ func cmdInit(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 	uuid := fs.String("uuid", "", "primary UUID (auto-generated if omitted)")
 	doh := fs.String("doh", "", "custom DoH URL(s), comma-separated (client role)")
 	doApply := fs.Bool("apply", false, "apply configuration immediately")
+	force := fs.Bool("force", false, "overwrite existing state file")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+
+	if _, err := os.Stat(store.StatePath()); err == nil && !*force {
+		fmt.Fprintf(stderr, "state file already exists at %s; use 'dex apply' to apply configuration or pass '--force' to overwrite\n", store.StatePath())
+		return 1
 	}
 
 	st := state.NewDefaultState(*role)
@@ -318,8 +324,24 @@ func serviceNamesForState(st *state.State, initSys string) []string {
 	if st == nil {
 		return svcs
 	}
+	hasNFTForward := false
+	hasHAProxyForward := false
+	hasXrayForward := false
+	for _, f := range st.Relay.Forwards {
+		switch f.Engine {
+		case "nft":
+			hasNFTForward = true
+		case "haproxy":
+			hasHAProxyForward = true
+		case "xray":
+			hasXrayForward = true
+		}
+	}
 	if st.Role == state.RoleClient {
 		svcs = append(svcs, "dex-xray", "dex-mosdns", "dex-nft")
+		if hasHAProxyForward {
+			svcs = append(svcs, "haproxy")
+		}
 		if st.Client.WireGuard.Enabled {
 			if initSys == "openrc" {
 				svcs = append(svcs, "wg-quick.wg0")
@@ -328,9 +350,16 @@ func serviceNamesForState(st *state.State, initSys string) []string {
 			}
 		}
 	} else {
-		svcs = append(svcs, "dex-xray")
-		if len(st.Relay.Forwards) > 0 {
+		needsXray := st.Role == state.RoleServer || st.Role == state.RoleLanding ||
+			hasXrayForward || st.RproxyS.Enabled || len(st.ExtraInbounds) > 0
+		if needsXray {
+			svcs = append(svcs, "dex-xray")
+		}
+		if hasNFTForward {
 			svcs = append(svcs, "dex-nft")
+		}
+		if hasHAProxyForward {
+			svcs = append(svcs, "haproxy")
 		}
 		needsNginx := (st.Role == state.RoleServer && st.Server.TLSMode == "nginx")
 		for _, ex := range st.ExtraInbounds {
@@ -346,7 +375,9 @@ func serviceNamesForState(st *state.State, initSys string) []string {
 			svcs = append(svcs, "dex-doh")
 		}
 	}
-	svcs = append(svcs, "dex-daemon")
+	if st.Role == state.RoleClient || st.Role == state.RoleServer {
+		svcs = append(svcs, "dex-daemon")
+	}
 	return svcs
 }
 
@@ -937,13 +968,7 @@ func cmdNode(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 				return fmt.Errorf("node %q not found", id)
 			}
 			cur.Client.Nodes = next
-			if cur.Client.ActiveNodeID == id {
-				if len(next) > 0 {
-					cur.Client.ActiveNodeID = next[0].ID
-				} else {
-					cur.Client.ActiveNodeID = ""
-				}
-			}
+			cur.Client.PruneNodeRefs(id)
 			return nil
 		}
 		if err := applyOrSave(store, exec, state.RoleClient, doApply, mut); err != nil {
@@ -986,10 +1011,24 @@ func cmdCert(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 
 func cmdCertWithOpts(store *state.Store, exec reconcile.SystemExecutor, applyOpts reconcile.ApplyOptions, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "inspect" {
-		cb, err1 := os.ReadFile(store.DefaultCert())
-		kb, err2 := os.ReadFile(store.DefaultKey())
+		st, _ := store.Load()
+		certFile, keyFile := resolveActiveCertPaths(store, st)
+		if applyOpts.RootPrefix != "" {
+			cleanRoot := filepath.Clean(applyOpts.RootPrefix)
+			prefixPath := func(p string) string {
+				cp := filepath.Clean(p)
+				if cp == cleanRoot || strings.HasPrefix(cp, cleanRoot+string(filepath.Separator)) {
+					return cp
+				}
+				return filepath.Join(cleanRoot, strings.TrimPrefix(cp, string(filepath.Separator)))
+			}
+			certFile = prefixPath(certFile)
+			keyFile = prefixPath(keyFile)
+		}
+		cb, err1 := os.ReadFile(certFile)
+		kb, err2 := os.ReadFile(keyFile)
 		if err1 != nil || err2 != nil {
-			fmt.Fprintf(stderr, "cannot read cert/key in %s: %v / %v\n", store.CertDir(), err1, err2)
+			fmt.Fprintf(stderr, "cannot read cert/key (%s / %s): %v / %v\n", certFile, keyFile, err1, err2)
 			return 1
 		}
 		rep, err := cert.InspectPair(cb, kb)
@@ -1162,11 +1201,19 @@ func cmdCertWithOpts(store *state.Store, exec reconcile.SystemExecutor, applyOpt
 			return 1
 		}
 		if st != nil {
-			_, _ = store.Update(st.Role, func(cur *state.State) error {
-				cur.Cert.Mode = "acme"
+			hadCustomExternal := (st.Cert.CertFile != "" && st.Cert.CertFile != store.DefaultCert()) ||
+				(st.Cert.KeyFile != "" && st.Cert.KeyFile != store.DefaultKey())
+			certMode := "acme_cf"
+			if acmeMode == "http" || acmeMode == "http-01" {
+				certMode = "acme_http"
+			}
+			if _, uerr := store.Update(st.Role, func(cur *state.State) error {
+				cur.Cert.Mode = certMode
 				cur.Cert.Domain = *dom
+				cur.Cert.CertFile = ""
+				cur.Cert.KeyFile = ""
 				cur.Cert.AutoRenew = *renew
-				if acmeMode == "http" || acmeMode == "http-01" {
+				if certMode == "acme_http" {
 					// HTTP-01 does not rely on CF API tokens
 				} else if *renew {
 					cur.Cert.CFToken = *tok
@@ -1176,7 +1223,16 @@ func cmdCertWithOpts(store *state.Store, exec reconcile.SystemExecutor, applyOpt
 					cur.Cert.CFEmail = ""
 				}
 				return nil
-			})
+			}); uerr != nil {
+				fmt.Fprintf(stderr, "update state after issue failed: %v\n", uerr)
+				return 1
+			}
+			if hadCustomExternal {
+				if _, rerr := reconcile.Reconcile(context.Background(), store, exec, applyOpts); rerr != nil {
+					fmt.Fprintf(stderr, "reconcile after cert issue failed: %v\n", rerr)
+					return 1
+				}
+			}
 		}
 		reloadCertConsumers(context.Background(), exec, stdout)
 		fmt.Fprintf(stdout, "Certificate issued for %s (expires %s)\n", strings.Join(rep.SANs, ", "), rep.NotAfter.Format("2006-01-02"))
@@ -1695,12 +1751,28 @@ func cmdRelay(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 			fmt.Fprintln(stderr, "--listen and --target-host are required")
 			return 2
 		}
-		if *id == "" {
-			*id = fmt.Sprintf("fwd-%d", *listen)
-		}
+		assignedID := strings.TrimSpace(*id)
 		if err := applyOrSave(store, exec, state.RoleRelay, *doApply, func(cur *state.State) error {
+			if assignedID == "" {
+				used := make(map[string]bool, len(cur.Relay.Forwards))
+				for _, f := range cur.Relay.Forwards {
+					used[f.ID] = true
+				}
+				cand := fmt.Sprintf("fwd-%d", *listen)
+				if used[cand] {
+					pTag := strings.ReplaceAll(strings.TrimSpace(*proto), ",", "-")
+					if pTag == "" {
+						pTag = "tcp"
+					}
+					cand = fmt.Sprintf("fwd-%s-%d", pTag, *listen)
+					for suffix := 2; used[cand]; suffix++ {
+						cand = fmt.Sprintf("fwd-%s-%d-%d", pTag, *listen, suffix)
+					}
+				}
+				assignedID = cand
+			}
 			cur.Relay.Forwards = append(cur.Relay.Forwards, state.ForwardRule{
-				ID:         *id,
+				ID:         assignedID,
 				ListenPort: *listen,
 				PublicPort: *listen,
 				TargetHost: *targetHost,
@@ -1713,7 +1785,7 @@ func cmdRelay(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 			fmt.Fprintf(stderr, "relay add failed: %v\n", err)
 			return 1
 		}
-		fmt.Fprintf(stdout, "Added relay %s :%d -> %s:%d (%s)\n", *id, *listen, *targetHost, *targetPort, *engine)
+		fmt.Fprintf(stdout, "Added relay %s :%d -> %s:%d (%s)\n", assignedID, *listen, *targetHost, *targetPort, *engine)
 		return 0
 	case "del":
 		if len(args) < 2 {

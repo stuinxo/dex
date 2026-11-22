@@ -24,8 +24,8 @@ type CloudflareDDNS struct {
 	Hub          *TaskHub
 
 	mu        sync.Mutex
-	lastIP4   string
-	lastIP6   string
+	lastIP4   map[string]string // normalized domain -> last IPv4
+	lastIP6   map[string]string // normalized domain -> last IPv6
 	zoneCache map[string]string // domain -> zoneID
 	recCache4 map[string]string // domain -> recordID
 	recCache6 map[string]string // domain -> recordID
@@ -124,6 +124,8 @@ func NewCloudflareDDNS(hub *TaskHub) *CloudflareDDNS {
 		BaseURL:    "https://api.cloudflare.com/client/v4",
 		HTTPClient: c,
 		Hub:        hub,
+		lastIP4:    make(map[string]string),
+		lastIP6:    make(map[string]string),
 		zoneCache:  make(map[string]string),
 		recCache4:  make(map[string]string),
 		recCache6:  make(map[string]string),
@@ -183,10 +185,14 @@ func (d *CloudflareDDNS) SyncOnce(ctx context.Context, domain, cfToken string, e
 	return d.SyncOnceWithEmail(ctx, domain, cfToken, "", enableIPv6, force)
 }
 
+func normalizeDDNSDomain(domain string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
+}
+
 // SyncOnceWithEmail checks public IPv4/IPv6 and updates Cloudflare using Bearer API Token
 // or Global API Key (X-Auth-Email + X-Auth-Key) when cfEmail is non-empty.
 func (d *CloudflareDDNS) SyncOnceWithEmail(ctx context.Context, domain, cfToken, cfEmail string, enableIPv6, force bool) (*SyncResult, error) {
-	domain = strings.TrimSpace(domain)
+	domain = normalizeDDNSDomain(domain)
 	cfToken = strings.TrimSpace(cfToken)
 	cfEmail = strings.TrimSpace(cfEmail)
 	if domain == "" || cfToken == "" {
@@ -201,14 +207,17 @@ func (d *CloudflareDDNS) SyncOnceWithEmail(ctx context.Context, domain, cfToken,
 	res.IPv4 = ip4
 
 	d.mu.Lock()
-	need4 := force || ip4 != d.lastIP4
+	if d.lastIP4 == nil {
+		d.lastIP4 = make(map[string]string)
+	}
+	need4 := force || ip4 != d.lastIP4[domain]
 	d.mu.Unlock()
 	if need4 {
 		if err := d.upsertRecord(ctx, domain, cfToken, cfEmail, "A", ip4); err != nil {
 			return nil, fmt.Errorf("update A record: %w", err)
 		}
 		d.mu.Lock()
-		d.lastIP4 = ip4
+		d.lastIP4[domain] = ip4
 		d.mu.Unlock()
 		res.Updated4 = true
 		if d.Hub != nil {
@@ -220,14 +229,17 @@ func (d *CloudflareDDNS) SyncOnceWithEmail(ctx context.Context, domain, cfToken,
 		if ip6, err6 := d.FetchPublic6(ctx); err6 == nil && ip6 != "" {
 			res.IPv6 = ip6
 			d.mu.Lock()
-			need6 := force || ip6 != d.lastIP6
+			if d.lastIP6 == nil {
+				d.lastIP6 = make(map[string]string)
+			}
+			need6 := force || ip6 != d.lastIP6[domain]
 			d.mu.Unlock()
 			if need6 {
 				if err := d.upsertRecord(ctx, domain, cfToken, cfEmail, "AAAA", ip6); err != nil {
 					return res, fmt.Errorf("update AAAA record: %w", err)
 				}
 				d.mu.Lock()
-				d.lastIP6 = ip6
+				d.lastIP6[domain] = ip6
 				d.mu.Unlock()
 				res.Updated6 = true
 				if d.Hub != nil {
@@ -286,6 +298,7 @@ func (d *CloudflareDDNS) cfRequest(ctx context.Context, method, path, token, ema
 }
 
 func (d *CloudflareDDNS) findZoneID(ctx context.Context, domain, token, email string) (string, error) {
+	domain = normalizeDDNSDomain(domain)
 	d.mu.Lock()
 	zid := d.zoneCache[domain]
 	d.mu.Unlock()
@@ -369,6 +382,7 @@ func (d *CloudflareDDNS) lookupRecord(ctx context.Context, zoneID, domain, token
 }
 
 func (d *CloudflareDDNS) upsertRecord(ctx context.Context, domain, token, email, recType, ip string) error {
+	domain = normalizeDDNSDomain(domain)
 	zoneID, err := d.findZoneID(ctx, domain, token, email)
 	if err != nil {
 		return err
@@ -403,6 +417,9 @@ func (d *CloudflareDDNS) upsertRecord(ctx context.Context, domain, token, email,
 
 	lookedID, existingContent, err := d.lookupRecord(ctx, zoneID, domain, token, email, recType)
 	if err != nil {
+		d.mu.Lock()
+		delete(d.zoneCache, domain)
+		d.mu.Unlock()
 		return err
 	}
 	if lookedID != "" {
@@ -413,13 +430,23 @@ func (d *CloudflareDDNS) upsertRecord(ctx context.Context, domain, token, email,
 		if existingContent == ip {
 			return nil // already matches remote record
 		}
-		return d.cfRequest(ctx, http.MethodPut, fmt.Sprintf("/zones/%s/dns_records/%s", zoneID, recID), token, email, payload, nil)
+		if err := d.cfRequest(ctx, http.MethodPut, fmt.Sprintf("/zones/%s/dns_records/%s", zoneID, recID), token, email, payload, nil); err != nil {
+			d.mu.Lock()
+			delete(cache, domain)
+			delete(d.zoneCache, domain)
+			d.mu.Unlock()
+			return err
+		}
+		return nil
 	}
 
 	var created struct {
 		ID string `json:"id"`
 	}
 	if err := d.cfRequest(ctx, http.MethodPost, fmt.Sprintf("/zones/%s/dns_records", zoneID), token, email, payload, &created); err != nil {
+		d.mu.Lock()
+		delete(d.zoneCache, domain)
+		d.mu.Unlock()
 		return err
 	}
 	if created.ID != "" {

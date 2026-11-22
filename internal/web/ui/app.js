@@ -383,6 +383,25 @@
     });
   }
 
+  function refreshClientNodeSelects(deletedNodeID) {
+    var nodes = (currentState && currentState.client && currentState.client.nodes) || [];
+    var targets = [
+      { el: $("divert-node"), emptyLabel: "(同主节点)" },
+      { el: $("apple-node"), emptyLabel: "(中国直连)" },
+      { el: $("custom-node"), emptyLabel: "(同主节点)" },
+      { el: $("fwd1-upstream"), emptyLabel: "(跟随默认)" }
+    ];
+    targets.forEach(function (t) {
+      if (!t.el) { return; }
+      var curVal = t.el.value === deletedNodeID ? "" : t.el.value;
+      renderNodeSelectOptions(t.el, nodes, curVal, t.emptyLabel);
+    });
+    document.querySelectorAll("[data-nodesm-svc]").forEach(function (sel) {
+      var curVal = sel.value === deletedNodeID ? "" : sel.value;
+      renderNodeSelectOptions(sel, nodes, curVal, "(跟随默认)");
+    });
+  }
+
   function renderStateForms() {
     if (!currentState) { return; }
     var role = currentState.role;
@@ -631,7 +650,23 @@
         if (currentState.client.active_node_id === n.id) {
           currentState.client.active_node_id = currentState.client.nodes[0] ? currentState.client.nodes[0].id : "";
         }
+        var c = currentState.client;
+        if (c.routing) {
+          if (c.routing.service_map) {
+            Object.keys(c.routing.service_map).forEach(function (svc) {
+              if (c.routing.service_map[svc] === n.id) {
+                delete c.routing.service_map[svc];
+              }
+            });
+          }
+          if (c.routing.apple_node_id === n.id) { c.routing.apple_node_id = ""; }
+          if (c.routing.divert && c.routing.divert.node_id === n.id) { c.routing.divert.node_id = ""; }
+          if (c.routing.custom && c.routing.custom.node_id === n.id) { c.routing.custom.node_id = ""; }
+        }
+        if (c.fwd1 && c.fwd1.upstream_node_id === n.id) { c.fwd1.upstream_node_id = ""; }
         renderNodesTable();
+        renderOverviewNodes();
+        refreshClientNodeSelects(n.id);
       });
 
       actWrap.appendChild(bSel);
@@ -826,8 +861,20 @@
           return;
         }
         currentState.relay.forwards = currentState.relay.forwards || [];
+        var existingIDs = {};
+        currentState.relay.forwards.forEach(function (f) { if (f.id) { existingIDs[f.id] = true; } });
+        var fwdID = "fwd-" + lp;
+        if (existingIDs[fwdID]) {
+          var pTag = (fProto.value || "tcp").replace(/,/g, "-");
+          fwdID = "fwd-" + pTag + "-" + lp;
+          var suffix = 2;
+          while (existingIDs[fwdID]) {
+            fwdID = "fwd-" + pTag + "-" + lp + "-" + suffix;
+            suffix++;
+          }
+        }
         currentState.relay.forwards.push({
-          id: "fwd-" + lp,
+          id: fwdID,
           listen_port: lp,
           public_port: Number(fPP.value || 0),
           target_host: fTH.value.trim(),
@@ -902,7 +949,19 @@
       bCfg.type = "button";
       bCfg.addEventListener("click", async function () {
         try {
-          var resp = await fetch("/api/v1/wireguard/peers/" + encodeURIComponent(p.name) + "/config");
+          var resp = await fetch("/api/v1/wireguard/peers/" + encodeURIComponent(p.name) + "/config", {
+            credentials: "same-origin"
+          });
+          if (!resp.ok) {
+            var errText = await resp.text();
+            var errMsg = "获取配置失败 (" + resp.status + ")";
+            try {
+              var errObj = JSON.parse(errText);
+              if (errObj && errObj.error) { errMsg = errObj.error; }
+            } catch (_) {}
+            showToast(errMsg, true);
+            return;
+          }
           var cfg = await resp.text();
           openModal("WireGuard Peer: " + p.name, function (body) {
             var qrBox = make("div", "qr-wrap");
@@ -1404,6 +1463,10 @@
         var box = $("log-box");
         var src = entry.subsystem || entry.source || "-";
         box.textContent += "[" + (entry.time || "").slice(11, 19) + "] " + (entry.level || "INFO") + " [" + src + "] " + (entry.message || "") + "\n";
+        var lines = box.textContent.split("\n");
+        if (lines.length > 501) {
+          box.textContent = lines.slice(lines.length - 501).join("\n");
+        }
         if (!logsPaused) { box.scrollTop = box.scrollHeight; }
       } catch (_) {}
     };
@@ -1830,7 +1893,6 @@
   });
   $("btn-logs-clear").addEventListener("click", function () {
     $("log-box").textContent = "";
-    lastLogSeq = 0;
   });
 
   initSession();

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -121,7 +122,20 @@ func generateAndWriteSelfSigned(certPath, keyPath, cn string) error {
 
 	now := time.Now().Add(-1 * time.Hour)
 	dnsNames := []string{"localhost"}
-	if !strings.EqualFold(cn, "localhost") && !strings.ContainsAny(cn, " \t\r\n") {
+	ipAddrs := []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback}
+	if ip, err := netip.ParseAddr(strings.Trim(strings.TrimSpace(cn), "[]")); err == nil {
+		stdIP := net.IP(ip.AsSlice())
+		dup := false
+		for _, existing := range ipAddrs {
+			if existing.Equal(stdIP) {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			ipAddrs = append(ipAddrs, stdIP)
+		}
+	} else if !strings.EqualFold(cn, "localhost") && !strings.ContainsAny(cn, " \t\r\n") {
 		dnsNames = append(dnsNames, cn)
 	}
 	tmpl := &x509.Certificate{
@@ -136,6 +150,7 @@ func generateAndWriteSelfSigned(certPath, keyPath, cn string) error {
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 		DNSNames:              dnsNames,
+		IPAddresses:           ipAddrs,
 	}
 
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
@@ -259,7 +274,9 @@ func stageAndInstallACMECert(ctx context.Context, runner ACMERunner, env []strin
 	if cfg.ReloadCmd != "" {
 		installArgs = append(installArgs, "--reloadcmd", cfg.ReloadCmd)
 	}
-	_, _ = runner.Run(ctx, env, cfg.AcmeBin, installArgs...)
+	if out, err := runner.Run(ctx, env, cfg.AcmeBin, installArgs...); err != nil {
+		return nil, fmt.Errorf("acme install-cert failed: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
 	return report, nil
 }
 
@@ -283,6 +300,9 @@ func IssueCloudflareACME(ctx context.Context, runner ACMERunner, cfg ACMEConfig)
 
 	accountConf := filepath.Join(cfg.AcmeHome, "account.conf")
 	scrubLegacyKeys(accountConf)
+	if !cfg.AutoRenew {
+		defer scrubTokenFromAccountConf(accountConf)
+	}
 
 	env := []string{"CF_Token=" + strings.TrimSpace(cfg.CFToken)}
 	if strings.TrimSpace(cfg.CFEmail) != "" {
@@ -307,9 +327,6 @@ func IssueCloudflareACME(ctx context.Context, runner ACMERunner, cfg ACMEConfig)
 	report, err := stageAndInstallACMECert(ctx, runner, env, cfg, mainDomain)
 	if err != nil {
 		return nil, err
-	}
-	if !cfg.AutoRenew {
-		scrubTokenFromAccountConf(accountConf)
 	}
 	return report, nil
 }

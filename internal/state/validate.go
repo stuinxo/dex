@@ -318,15 +318,58 @@ func (s *State) Validate() error {
 			if !wgKeyRe.MatchString(s.Client.WireGuard.ServerPrivateKey) || !wgKeyRe.MatchString(s.Client.WireGuard.ServerPublicKey) {
 				return errors.New("client.wireguard: invalid server keypair")
 			}
+			var wgServerAddr netip.Addr
+			subRaw := strings.TrimSpace(s.Client.WireGuard.SubnetCIDR)
+			if subRaw == "" {
+				subRaw = "172.16.66.1/24"
+			}
+			if pfx, err := netip.ParsePrefix(subRaw); err == nil {
+				wgServerAddr = pfx.Addr()
+			} else if a, err2 := netip.ParseAddr(subRaw); err2 == nil {
+				wgServerAddr = a
+			}
+			srvPub := strings.TrimSpace(s.Client.WireGuard.ServerPublicKey)
+			seenPeerNames := make(map[string]struct{}, len(s.Client.WireGuard.Peers))
+			seenPeerPubs := make(map[string]struct{}, len(s.Client.WireGuard.Peers))
+			seenPeerIPs := make(map[netip.Addr]struct{}, len(s.Client.WireGuard.Peers))
 			for i, p := range s.Client.WireGuard.Peers {
+				pName := strings.TrimSpace(p.Name)
+				if pName == "" {
+					return fmt.Errorf("client.wireguard.peers[%d]: empty name", i)
+				}
+				if _, dup := seenPeerNames[pName]; dup {
+					return fmt.Errorf("client.wireguard.peers: duplicate name %q", pName)
+				}
+				seenPeerNames[pName] = struct{}{}
+
 				if !wgKeyRe.MatchString(p.PrivateKey) || !wgKeyRe.MatchString(p.PublicKey) {
 					return fmt.Errorf("client.wireguard.peers[%d]: invalid keypair", i)
 				}
-				if _, err := netip.ParsePrefix(p.IP); err != nil {
-					if _, err2 := netip.ParseAddr(p.IP); err2 != nil {
-						return fmt.Errorf("client.wireguard.peers[%d]: invalid ip %q", i, p.IP)
-					}
+				pPub := strings.TrimSpace(p.PublicKey)
+				if pPub == srvPub {
+					return fmt.Errorf("client.wireguard.peers[%d]: public_key conflicts with server_public_key", i)
 				}
+				if _, dup := seenPeerPubs[pPub]; dup {
+					return fmt.Errorf("client.wireguard.peers[%d]: duplicate public_key", i)
+				}
+				seenPeerPubs[pPub] = struct{}{}
+
+				var peerAddr netip.Addr
+				pIPRaw := strings.TrimSpace(p.IP)
+				if pfx, err := netip.ParsePrefix(pIPRaw); err == nil {
+					peerAddr = pfx.Addr()
+				} else if a, err2 := netip.ParseAddr(pIPRaw); err2 == nil {
+					peerAddr = a
+				} else {
+					return fmt.Errorf("client.wireguard.peers[%d]: invalid ip %q", i, p.IP)
+				}
+				if wgServerAddr.IsValid() && peerAddr == wgServerAddr {
+					return fmt.Errorf("client.wireguard.peers[%d]: ip %q conflicts with server tunnel ip", i, peerAddr.String())
+				}
+				if _, dup := seenPeerIPs[peerAddr]; dup {
+					return fmt.Errorf("client.wireguard.peers[%d]: duplicate ip %q", i, peerAddr.String())
+				}
+				seenPeerIPs[peerAddr] = struct{}{}
 			}
 		}
 
@@ -387,7 +430,15 @@ func (s *State) Validate() error {
 	}
 
 	// Relay rules (Option 44)
+	seenFwdIDs := make(map[string]struct{}, len(s.Relay.Forwards))
 	for i, fwd := range s.Relay.Forwards {
+		if strings.TrimSpace(fwd.ID) == "" {
+			return fmt.Errorf("relay.forwards[%d]: empty id", i)
+		}
+		if _, dup := seenFwdIDs[fwd.ID]; dup {
+			return fmt.Errorf("relay.forwards: duplicate id %q", fwd.ID)
+		}
+		seenFwdIDs[fwd.ID] = struct{}{}
 		if !isValidNetProto(fwd.Proto) {
 			return fmt.Errorf("relay.forwards[%d]: invalid proto %q", i, fwd.Proto)
 		}
@@ -483,6 +534,14 @@ func (s *State) Validate() error {
 				return err
 			}
 		} else {
+			if s.Role == RoleClient || s.Role == RoleLanding {
+				return fmt.Errorf("extra %q: via_nginx is not supported on %s role", ex.Tag, s.Role)
+			}
+			switch ex.Protocol {
+			case "vless-xhttp", "vless-ws", "vmess-ws":
+			default:
+				return fmt.Errorf("extra %q: via_nginx is only supported for vless-xhttp, vless-ws, or vmess-ws (got %q)", ex.Tag, ex.Protocol)
+			}
 			if ex.ListenPort < 1 || ex.ListenPort > 65535 {
 				return fmt.Errorf("extra_inbounds[%d]: invalid internal port %d", i, ex.ListenPort)
 			}

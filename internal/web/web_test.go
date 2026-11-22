@@ -713,3 +713,169 @@ func TestHardeningWebPathWhitelistProxyRateLimitAndBodyLimits(t *testing.T) {
 		t.Fatalf("expected trailing JSON token rejected")
 	}
 }
+
+type pausedXrayExec struct {
+	stubExec
+	active map[string]bool
+}
+
+func (p *pausedXrayExec) ServiceIsActive(_ context.Context, _, unit string) bool {
+	if p.active != nil {
+		return p.active[unit]
+	}
+	return unit == "dex-daemon" || unit == "nginx" || unit == "dex-doh"
+}
+
+func (p *pausedXrayExec) ServiceEnableStart(_ context.Context, _, unit string) error {
+	if p.active == nil {
+		p.active = map[string]bool{"dex-daemon": true, "nginx": true, "dex-doh": true}
+	}
+	p.active[unit] = true
+	return nil
+}
+
+func (p *pausedXrayExec) ServiceStopDisable(_ context.Context, _, unit string) error {
+	if p.active == nil {
+		p.active = map[string]bool{"dex-daemon": true, "nginx": true, "dex-doh": true}
+	}
+	p.active[unit] = false
+	return nil
+}
+
+func TestHardeningWebStatusServerPauseAndCertExternalReconcile(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "etc", "dex")
+	store := state.NewStore(stateDir)
+	extCert := filepath.Join(root, "var", "www", "ssl", "de_GWD.cer")
+	extKey := filepath.Join(root, "var", "www", "ssl", "de_GWD.key")
+	if err := cert.EnsureSelfSigned(extCert, extKey, "srv.example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	st := state.NewDefaultState(state.RoleServer)
+	st.Server.Domain = "srv.example.com"
+	st.Server.TLSMode = "nginx"
+	st.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	st.Cert = state.CertConfig{
+		Mode:     "imported",
+		CertFile: extCert,
+		KeyFile:  extKey,
+	}
+	hash, _ := cryptoext.HashPassword("myPass123")
+	st.Auth.PasswordHash = hash
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+
+	hub := daemon.NewTaskHub(20)
+	exec := &pausedXrayExec{active: map[string]bool{"dex-daemon": true, "nginx": true, "dex-doh": true}}
+	srv := NewServer(store, exec, hub, daemon.NewCloudflareDDNS(hub), reconcile.ApplyOptions{
+		RootPrefix: root,
+	})
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	loginReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/auth/login", strings.NewReader(`{"password":"myPass123"}`))
+	loginReq.Header.Set("Content-Type", "application/json")
+	loginRec := httptest.NewRecorder()
+	srv.ServeHTTP(loginRec, loginReq)
+	var lData map[string]any
+	_ = json.Unmarshal(loginRec.Body.Bytes(), &lData)
+	csrf := lData["csrf_token"].(string)
+	cookies := loginRec.Result().Cookies()
+
+	doReq := func(method, path, body string) *httptest.ResponseRecorder {
+		var rBody io.Reader
+		if body != "" {
+			rBody = strings.NewReader(body)
+		}
+		req, _ := http.NewRequest(method, ts.URL+path, rBody)
+		req.Header.Set("X-CSRF-Token", csrf)
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. Server status reports proxy_paused=true when dex-xray is inactive and omits dex-nft when no nft forwards exist
+	stRec := doReq(http.MethodGet, "/api/v1/status", "")
+	if stRec.Code != 200 {
+		t.Fatalf("status failed: %d %s", stRec.Code, stRec.Body.String())
+	}
+	var stBody map[string]any
+	_ = json.Unmarshal(stRec.Body.Bytes(), &stBody)
+	if stBody["proxy_paused"] != true {
+		t.Fatalf("expected proxy_paused=true on server with dex-xray inactive, got %v", stBody["proxy_paused"])
+	}
+	svcs := stBody["services"].(map[string]any)
+	if _, hasNFT := svcs["dex-nft"]; hasNFT {
+		t.Fatalf("expected dex-nft omitted on server without nft forwards, got %+v", svcs)
+	}
+
+	// 2. handleCertSelfSign reconciles nginx back to store.DefaultCert() when switching away from external path
+	ssRec := doReq(http.MethodPost, "/api/v1/cert/self-sign", `{"cn":"srv.example.com","force":true}`)
+	if ssRec.Code != 200 {
+		t.Fatalf("cert/self-sign failed: %d %s", ssRec.Code, ssRec.Body.String())
+	}
+	ngBytes, err := os.ReadFile(filepath.Join(root, "etc", "nginx", "conf.d", "dex-server.conf"))
+	if err != nil || !strings.Contains(string(ngBytes), store.DefaultCert()) {
+		t.Fatalf("expected nginx config reconciled to DefaultCert %q after self-sign, err=%v", store.DefaultCert(), err)
+	}
+
+	// 3. RoleRelay with nft-only forward reports proxy_paused=false while dex-nft is active, and true when dex-nft stops
+	relRoot := t.TempDir()
+	relStore := state.NewStore(filepath.Join(relRoot, "etc", "dex"))
+	relSt := state.NewDefaultState(state.RoleRelay)
+	relSt.Auth.PasswordHash = hash
+	relSt.Relay.Forwards = []state.ForwardRule{{
+		ID:         "fwd-10001",
+		ListenPort: 10001,
+		TargetHost: "1.1.1.1",
+		TargetPort: 443,
+		Proto:      "tcp",
+		Engine:     "nft",
+	}}
+	if err := relStore.Save(relSt); err != nil {
+		t.Fatal(err)
+	}
+	relExec := &pausedXrayExec{active: map[string]bool{"dex-nft": true, "dex-xray": false, "dex-daemon": false}}
+	relSrv := NewServer(relStore, relExec, daemon.NewTaskHub(10), daemon.NewCloudflareDDNS(hub), reconcile.ApplyOptions{
+		RootPrefix: relRoot,
+	})
+	relTS := httptest.NewServer(relSrv)
+	defer relTS.Close()
+
+	relLoginReq, _ := http.NewRequest(http.MethodPost, relTS.URL+"/api/v1/auth/login", strings.NewReader(`{"password":"myPass123"}`))
+	relLoginReq.Header.Set("Content-Type", "application/json")
+	relLoginRec := httptest.NewRecorder()
+	relSrv.ServeHTTP(relLoginRec, relLoginReq)
+	relCookies := relLoginRec.Result().Cookies()
+
+	getRelStatus := func() map[string]any {
+		req, _ := http.NewRequest(http.MethodGet, relTS.URL+"/api/v1/status", nil)
+		for _, c := range relCookies {
+			req.AddCookie(c)
+		}
+		rec := httptest.NewRecorder()
+		relSrv.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("relay status failed: %d %s", rec.Code, rec.Body.String())
+		}
+		var out map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return out
+	}
+
+	if got := getRelStatus()["proxy_paused"]; got != false {
+		t.Fatalf("expected RoleRelay nft-only with dex-nft active to report proxy_paused=false, got %v", got)
+	}
+	relExec.active["dex-nft"] = false
+	if got := getRelStatus()["proxy_paused"]; got != true {
+		t.Fatalf("expected RoleRelay nft-only with dex-nft inactive to report proxy_paused=true, got %v", got)
+	}
+}

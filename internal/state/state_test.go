@@ -542,3 +542,151 @@ func TestHardeningValidationRules(t *testing.T) {
 		t.Fatalf("unexpected allocated via_nginx internal ports: %+v", ports)
 	}
 }
+
+func TestHardeningAuditRegressions(t *testing.T) {
+	// 1. PruneNodeRefs clears all 5 node reference locations and updates ActiveNodeID
+	c := &ClientConfig{
+		ActiveNodeID: "n1",
+		Nodes: []OutboundNode{
+			{ID: "n1", Name: "N1"},
+			{ID: "n2", Name: "N2"},
+		},
+		Routing: RoutingConfig{
+			ServiceMap:  map[string]string{"ai": "n1", "stream": "n2"},
+			AppleNodeID: "n1",
+			Divert:      DivertConfig{Enabled: true, NodeID: "n1"},
+			Custom:      CustomRouteConfig{Enabled: true, NodeID: "n1"},
+		},
+		FWD1: FWD1Config{Enabled: true, UpstreamNodeID: "n1"},
+	}
+	c.Nodes = c.Nodes[1:] // remove n1
+	c.PruneNodeRefs("n1")
+	if c.ActiveNodeID != "n2" {
+		t.Fatalf("expected ActiveNodeID fallback to n2, got %q", c.ActiveNodeID)
+	}
+	if _, exists := c.Routing.ServiceMap["ai"]; exists || c.Routing.ServiceMap["stream"] != "n2" {
+		t.Fatalf("expected ServiceMap[ai] pruned and stream kept, got %+v", c.Routing.ServiceMap)
+	}
+	if c.Routing.AppleNodeID != "" || c.Routing.Divert.NodeID != "" || c.Routing.Custom.NodeID != "" || c.FWD1.UpstreamNodeID != "" {
+		t.Fatalf("expected all n1 refs pruned, got apple=%q divert=%q custom=%q fwd1=%q",
+			c.Routing.AppleNodeID, c.Routing.Divert.NodeID, c.Routing.Custom.NodeID, c.FWD1.UpstreamNodeID)
+	}
+
+	// 2. WireGuard peer uniqueness validation (name, pubkey, tunnel IP)
+	baseWG := func() *State {
+		st := NewDefaultState(RoleClient)
+		st.Client.WireGuard = WireGuardConfig{
+			Enabled:          true,
+			EndpointHost:     "wg.example.com",
+			ListenPort:       51820,
+			SubnetCIDR:       "172.16.66.1/24",
+			ServerPrivateKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+			ServerPublicKey:  "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+			Peers: []WGPeer{
+				{
+					Name:       "phone",
+					IP:         "172.16.66.11",
+					PrivateKey: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=",
+					PublicKey:  "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD=",
+				},
+			},
+		}
+		return st
+	}
+	if err := baseWG().Validate(); err != nil {
+		t.Fatalf("valid WG failed: %v", err)
+	}
+	wgEmptyName := baseWG()
+	wgEmptyName.Client.WireGuard.Peers[0].Name = "  "
+	if err := wgEmptyName.Validate(); err == nil {
+		t.Fatalf("expected empty WG peer name rejected")
+	}
+	wgDupName := baseWG()
+	wgDupName.Client.WireGuard.Peers = append(wgDupName.Client.WireGuard.Peers, WGPeer{
+		Name:       "phone",
+		IP:         "172.16.66.12",
+		PrivateKey: "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE=",
+		PublicKey:  "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF=",
+	})
+	if err := wgDupName.Validate(); err == nil {
+		t.Fatalf("expected duplicate WG peer name rejected")
+	}
+	wgDupPub := baseWG()
+	wgDupPub.Client.WireGuard.Peers = append(wgDupPub.Client.WireGuard.Peers, WGPeer{
+		Name:       "tablet",
+		IP:         "172.16.66.12",
+		PrivateKey: "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE=",
+		PublicKey:  "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD=",
+	})
+	if err := wgDupPub.Validate(); err == nil {
+		t.Fatalf("expected duplicate WG peer pubkey rejected")
+	}
+	wgSrvPub := baseWG()
+	wgSrvPub.Client.WireGuard.Peers[0].PublicKey = wgSrvPub.Client.WireGuard.ServerPublicKey
+	if err := wgSrvPub.Validate(); err == nil {
+		t.Fatalf("expected WG peer pubkey matching server pubkey rejected")
+	}
+	wgDupIP := baseWG()
+	wgDupIP.Client.WireGuard.Peers = append(wgDupIP.Client.WireGuard.Peers, WGPeer{
+		Name:       "tablet",
+		IP:         "172.16.66.11/32",
+		PrivateKey: "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE=",
+		PublicKey:  "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF=",
+	})
+	if err := wgDupIP.Validate(); err == nil {
+		t.Fatalf("expected duplicate WG peer IP (with /32) rejected")
+	}
+	wgSrvIP := baseWG()
+	wgSrvIP.Client.WireGuard.Peers[0].IP = "172.16.66.1/32"
+	if err := wgSrvIP.Validate(); err == nil {
+		t.Fatalf("expected WG peer IP matching server tunnel IP rejected")
+	}
+
+	// 3. ViaNginx protocol/role validation
+	for _, role := range []string{RoleClient, RoleLanding} {
+		stRole := NewDefaultState(role)
+		if role == RoleLanding {
+			stRole.Server.Domain = "land.example.com"
+			stRole.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+		}
+		stRole.ExtraInbounds = []ExtraInbound{{
+			Tag:        "vn-bad-role",
+			Protocol:   "vless-xhttp",
+			ListenPort: 8444,
+			UUID:       "22222222-2222-4222-8222-222222222222",
+			ViaNginx:   true,
+		}}
+		if err := stRole.Validate(); err == nil {
+			t.Errorf("expected via_nginx rejected on role %s", role)
+		}
+	}
+	badViaProtos := []ExtraInbound{
+		{Tag: "vn-real", Protocol: "vless-reality", ListenPort: 8444, UUID: "22222222-2222-4222-8222-222222222222", RealityPrivKey: "priv", RealityDest: "www.apple.com:443", RealitySNI: "www.apple.com", ViaNginx: true},
+		{Tag: "vn-s5", Protocol: "socks5", ListenPort: 8444, ViaNginx: true},
+		{Tag: "vn-doko", Protocol: "dokodemo", ListenPort: 8444, TargetAddr: "1.1.1.1", TargetPort: 53, ViaNginx: true},
+	}
+	for _, ex := range badViaProtos {
+		stSrv := NewDefaultState(RoleServer)
+		stSrv.Server.Domain = "srv.example.com"
+		stSrv.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+		stSrv.ExtraInbounds = []ExtraInbound{ex}
+		if err := stSrv.Validate(); err == nil {
+			t.Errorf("expected via_nginx rejected for protocol %s", ex.Protocol)
+		}
+	}
+
+	// 4. Relay.Forwards ID uniqueness & non-empty
+	stRelEmpty := NewDefaultState(RoleRelay)
+	stRelEmpty.Relay.Forwards = []ForwardRule{{ID: "", ListenPort: 10001, TargetHost: "1.1.1.1", TargetPort: 443, Proto: "tcp", Engine: "nft"}}
+	if err := stRelEmpty.Validate(); err == nil {
+		t.Fatalf("expected empty relay forward ID rejected")
+	}
+	stRelDup := NewDefaultState(RoleRelay)
+	stRelDup.Relay.Forwards = []ForwardRule{
+		{ID: "fwd-10001", ListenPort: 10001, TargetHost: "1.1.1.1", TargetPort: 443, Proto: "tcp", Engine: "nft"},
+		{ID: "fwd-10001", ListenPort: 10001, TargetHost: "1.1.1.1", TargetPort: 443, Proto: "udp", Engine: "nft"},
+	}
+	if err := stRelDup.Validate(); err == nil {
+		t.Fatalf("expected duplicate relay forward ID rejected")
+	}
+}

@@ -228,6 +228,8 @@ func DownloadVerifiedFile(ctx context.Context, client *http.Client, rawURL, expe
 			return fmt.Errorf("downloaded file %s is not a valid ELF binary", rawURL)
 		}
 		_ = os.Chmod(stagePath, 0o755)
+	} else {
+		_ = os.Chmod(stagePath, 0o644)
 	}
 	return os.Rename(stagePath, dstPath)
 }

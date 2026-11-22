@@ -213,3 +213,23 @@ func TestDoHConcurrencyLimitReturns503(t *testing.T) {
 	<-inFlightDone
 	<-inFlightDone
 }
+
+func TestNormalizeUpstreamAddrIPv6(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"1.1.1.1", "1.1.1.1:53"},
+		{"1.1.1.1:5353", "1.1.1.1:5353"},
+		{"2606:4700:4700::1111", "[2606:4700:4700::1111]:53"},
+		{"[2606:4700:4700::1111]", "[2606:4700:4700::1111]:53"},
+		{"[2606:4700:4700::1111]:5353", "[2606:4700:4700::1111]:5353"},
+		{"dns.google", "dns.google:53"},
+		{"dns.google:8053", "dns.google:8053"},
+	}
+	for _, tc := range cases {
+		if got := normalizeUpstreamAddr(tc.in); got != tc.want {
+			t.Errorf("normalizeUpstreamAddr(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

@@ -176,8 +176,13 @@ func mapTargetPath(rootPrefix, targetPath string) string {
 	if rootPrefix == "" {
 		return targetPath
 	}
-	clean := strings.TrimPrefix(filepath.Clean(targetPath), string(filepath.Separator))
-	return filepath.Join(rootPrefix, clean)
+	cleanRoot := filepath.Clean(rootPrefix)
+	cleanTarget := filepath.Clean(targetPath)
+	if cleanTarget == cleanRoot || strings.HasPrefix(cleanTarget, cleanRoot+string(filepath.Separator)) {
+		return cleanTarget
+	}
+	clean := strings.TrimPrefix(cleanTarget, string(filepath.Separator))
+	return filepath.Join(cleanRoot, clean)
 }
 
 func readChnRouteFile(path string) []string {
@@ -485,19 +490,24 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 				}
 			}
 		}
-		certTarget := ropts.CertFile
-		keyTarget := ropts.KeyFile
-		if st.Cert.Mode == "imported" && st.Cert.CertFile != "" && st.Cert.KeyFile != "" {
-			certTarget = st.Cert.CertFile
-			keyTarget = st.Cert.KeyFile
-		}
-		if _, err := os.Stat(certTarget); os.IsNotExist(err) {
+		isCustomExternalCert := st.Cert.Mode == "imported" &&
+			((st.Cert.CertFile != "" && st.Cert.CertFile != store.DefaultCert()) ||
+				(st.Cert.KeyFile != "" && st.Cert.KeyFile != store.DefaultKey()))
+		if !isCustomExternalCert {
+			certDisk := mapTargetPath(opts.RootPrefix, ropts.CertFile)
+			keyDisk := mapTargetPath(opts.RootPrefix, ropts.KeyFile)
+			prevCert, errC := os.ReadFile(certDisk)
+			prevKey, errK := os.ReadFile(keyDisk)
 			cn := st.Server.Domain
 			if cn == "" {
 				cn = st.Auth.ServerName
 			}
-			if cerr := cert.EnsureSelfSigned(certTarget, keyTarget, cn); cerr == nil {
-				certCreated = true
+			if cerr := cert.EnsureSelfSigned(certDisk, keyDisk, cn); cerr == nil {
+				afterCert, _ := os.ReadFile(certDisk)
+				afterKey, _ := os.ReadFile(keyDisk)
+				if errC != nil || errK != nil || !bytes.Equal(prevCert, afterCert) || !bytes.Equal(prevKey, afterKey) {
+					certCreated = true
+				}
 			}
 		}
 	}
@@ -732,6 +742,20 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 			}
 		}
 
+		// Read original DNS config BEFORE stopping systemd-resolved so /run/systemd/resolve/resolv.conf is still available if /etc/resolv.conf is a 127.0.0.53 stub.
+		var backupResolvBytes []byte
+		if isOS && bundle.MosDNSNeeded {
+			resolvPath := mapTargetPath(opts.RootPrefix, "/etc/resolv.conf")
+			if b, rerr := os.ReadFile(resolvPath); rerr == nil && hasNonLoopbackNameserver(b) {
+				backupResolvBytes = b
+			} else {
+				runResolvePath := mapTargetPath(opts.RootPrefix, "/run/systemd/resolve/resolv.conf")
+				if rb, rerr2 := os.ReadFile(runResolvePath); rerr2 == nil && hasNonLoopbackNameserver(rb) {
+					backupResolvBytes = rb
+				}
+			}
+		}
+
 		// Stop/disable systemd-resolved on systemd hosts so it neither holds :53 nor bypasses /etc/resolv.conf via nss-resolve
 		if isOS && bundle.MosDNSNeeded && ropts.InitSystem == "systemd" {
 			_ = os.Remove(mapTargetPath(opts.RootPrefix, "/etc/systemd/resolved.conf.d/99-dex.conf"))
@@ -918,8 +942,11 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 			origPath := filepath.Join(store.Dir, "resolv.conf.orig")
 			curResolvBytes, readResolvErr := os.ReadFile(resolvPath)
 			curResolvLink, linkErr := os.Readlink(resolvPath)
-			if _, statOrigErr := os.Stat(origPath); os.IsNotExist(statOrigErr) {
-				if readResolvErr == nil && strings.TrimSpace(string(curResolvBytes)) != "nameserver 127.0.0.1" {
+			existingOrig, existingOrigErr := os.ReadFile(origPath)
+			if existingOrigErr != nil || !hasNonLoopbackNameserver(existingOrig) {
+				if len(backupResolvBytes) > 0 {
+					_ = writeBytesExact(origPath, backupResolvBytes, 0o644)
+				} else if readResolvErr == nil && hasNonLoopbackNameserver(curResolvBytes) {
 					_ = writeBytesExact(origPath, curResolvBytes, 0o644)
 				}
 			}
@@ -1027,17 +1054,43 @@ func loadHostsFileCache(path string) map[string][]netip.Addr {
 	return out
 }
 
-func restoreResolvConfIfNeeded(resolvPath, origPath string) error {
-	origBytes, err := os.ReadFile(origPath)
-	if err != nil || len(bytes.TrimSpace(origBytes)) == 0 {
-		return nil
+const fallbackPublicDNS = "nameserver 223.5.5.5\nnameserver 1.1.1.1\n"
+
+func hasNonLoopbackNameserver(content []byte) bool {
+	sc := bufio.NewScanner(bytes.NewReader(content))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "nameserver" {
+			ns := strings.Trim(strings.TrimSpace(fields[1]), "[]")
+			if ns == "127.0.0.1" || ns == "127.0.0.53" || ns == "::1" {
+				continue
+			}
+			if ip, err := netip.ParseAddr(ns); err == nil && ip.IsLoopback() {
+				continue
+			}
+			if ns != "" {
+				return true
+			}
+		}
 	}
+	return false
+}
+
+func restoreResolvConfIfNeeded(resolvPath, origPath string) error {
 	curBytes, err := os.ReadFile(resolvPath)
 	if err != nil {
 		return nil
 	}
 	if strings.TrimSpace(string(curBytes)) != "nameserver 127.0.0.1" {
 		return nil
+	}
+	origBytes, err := os.ReadFile(origPath)
+	if err != nil || len(bytes.TrimSpace(origBytes)) == 0 || !hasNonLoopbackNameserver(origBytes) {
+		return writeBytesExact(resolvPath, []byte(fallbackPublicDNS), 0o644)
 	}
 	return writeBytesExact(resolvPath, origBytes, 0o644)
 }

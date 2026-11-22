@@ -222,6 +222,33 @@ parse_mosdns_api_digest() {
   '
 }
 
+fetch_valid_text_rule() {
+  url="$1"
+  dst="$2"
+  min_lines="$3"
+  fallback_url="${4:-}"
+  [ -s "$dst" ] && return 0
+
+  for u in "$url" "$fallback_url"; do
+    [ -n "$u" ] || continue
+    tmp_txt=$(mktemp "${STATE_DIR}/rules/.rule.XXXXXX")
+    if gh_fetch "$u" "$tmp_txt"; then
+      if grep -qiE '<!doctype|<html' "$tmp_txt"; then
+        rm -f "$tmp_txt"
+        continue
+      fi
+      valid_lines=$(awk '!/^[[:space:]]*(#|$)/ {c++} END {print c+0}' "$tmp_txt")
+      if [ "$valid_lines" -ge "$min_lines" ]; then
+        chmod 0644 "$tmp_txt"
+        mv -f "$tmp_txt" "$dst"
+        return 0
+      fi
+    fi
+    rm -f "$tmp_txt"
+  done
+  return 1
+}
+
 fetch_verified_rule_dat() {
   name="$1"
   url="$2"
@@ -329,25 +356,11 @@ install_mosdns_and_rules() {
 
   fetch_verified_rule_dat "geoip.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" "${STATE_DIR}/rules/geoip.dat"
   fetch_verified_rule_dat "geosite.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" "${STATE_DIR}/rules/geosite.dat"
-  if [ ! -s "${STATE_DIR}/rules/IPchnroute" ]; then
-    gh_fetch "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text/cn.txt" "${STATE_DIR}/rules/IPchnroute" || warn "Failed to fetch IPchnroute"
-  fi
-  if [ ! -s "${STATE_DIR}/rules/Domains.chn.txt" ]; then
-    gh_fetch "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt" "${STATE_DIR}/rules/Domains.chn.txt" || warn "Failed to fetch Domains.chn.txt"
-  fi
-  if [ ! -s "${STATE_DIR}/rules/Domains.ads.txt" ]; then
-    gh_fetch "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/reject-list.txt" "${STATE_DIR}/rules/Domains.ads.txt" || warn "Failed to fetch Domains.ads.txt"
-  fi
-  if [ ! -s "${STATE_DIR}/rules/Domains.apple.txt" ]; then
-    gh_fetch "https://raw.githubusercontent.com/stuinxo/de_GWD/main/resource/chnroute/mosdns_chnlist/Domains.apple.txt" "${STATE_DIR}/rules/Domains.apple.txt" \
-      || gh_fetch "https://raw.githubusercontent.com/jacyl4/chnroute/main/mosdns_chnlist/Domains.apple.txt" "${STATE_DIR}/rules/Domains.apple.txt" \
-      || warn "Failed to fetch Domains.apple.txt"
-  fi
-  if [ ! -s "${STATE_DIR}/rules/Domains.games.txt" ]; then
-    gh_fetch "https://raw.githubusercontent.com/stuinxo/de_GWD/main/resource/chnroute/mosdns_chnlist/Domains.games.txt" "${STATE_DIR}/rules/Domains.games.txt" \
-      || gh_fetch "https://raw.githubusercontent.com/jacyl4/chnroute/main/mosdns_chnlist/Domains.games.txt" "${STATE_DIR}/rules/Domains.games.txt" \
-      || warn "Failed to fetch Domains.games.txt"
-  fi
+  fetch_valid_text_rule "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text/cn.txt" "${STATE_DIR}/rules/IPchnroute" 1000 || warn "Failed to fetch valid IPchnroute"
+  fetch_valid_text_rule "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt" "${STATE_DIR}/rules/Domains.chn.txt" 10000 || warn "Failed to fetch valid Domains.chn.txt"
+  fetch_valid_text_rule "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/reject-list.txt" "${STATE_DIR}/rules/Domains.ads.txt" 1000 || warn "Failed to fetch valid Domains.ads.txt"
+  fetch_valid_text_rule "https://raw.githubusercontent.com/stuinxo/de_GWD/main/resource/chnroute/mosdns_chnlist/Domains.apple.txt" "${STATE_DIR}/rules/Domains.apple.txt" 50 "https://raw.githubusercontent.com/jacyl4/chnroute/main/mosdns_chnlist/Domains.apple.txt" || warn "Failed to fetch valid Domains.apple.txt"
+  fetch_valid_text_rule "https://raw.githubusercontent.com/stuinxo/de_GWD/main/resource/chnroute/mosdns_chnlist/Domains.games.txt" "${STATE_DIR}/rules/Domains.games.txt" 50 "https://raw.githubusercontent.com/jacyl4/chnroute/main/mosdns_chnlist/Domains.games.txt" || warn "Failed to fetch valid Domains.games.txt"
 }
 
 ensure_ntp() {
@@ -404,7 +417,11 @@ main() {
       ensure_ntp
       install_xray_core
       install_mosdns_and_rules
-      "$INSTALL_BIN" init --role client --apply
+      if [ -s "${STATE_DIR}/state.json" ]; then
+        "$INSTALL_BIN" apply
+      else
+        "$INSTALL_BIN" init --role client --apply
+      fi
       say "[+] Client Web UI listening on :443 (HTTPS) with :80 -> HTTPS redirect."
       ;;
     server|landing)
@@ -422,9 +439,12 @@ main() {
             ;;
         esac
         rm -f /etc/nginx/sites-enabled/default
-        ensure_ntp
       fi
+      ensure_ntp
       install_xray_core
+      mkdir -p "${STATE_DIR}/rules"
+      fetch_verified_rule_dat "geoip.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" "${STATE_DIR}/rules/geoip.dat"
+      fetch_verified_rule_dat "geosite.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" "${STATE_DIR}/rules/geosite.dat"
       say "[+] Ready. Run 'dex init --role $role --domain <dom> --apply' or 'dex' for interactive menu."
       ;;
     relay)

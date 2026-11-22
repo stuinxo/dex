@@ -689,22 +689,45 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, _ *session
 	checkSvc := func(unit string) bool {
 		return s.Exec.ServiceIsActive(r.Context(), initSys, unit)
 	}
+	hasNFTForward := false
+	hasHAProxyForward := false
+	hasXrayForward := false
+	for _, f := range st.Relay.Forwards {
+		switch f.Engine {
+		case "nft":
+			hasNFTForward = true
+		case "haproxy":
+			hasHAProxyForward = true
+		case "xray":
+			hasXrayForward = true
+		}
+	}
 	svcs := map[string]bool{
-		"dex-xray":   checkSvc("dex-xray"),
 		"dex-daemon": checkSvc("dex-daemon"),
 	}
+	var proxyPaused bool
 	if st.Role == state.RoleClient {
+		svcs["dex-xray"] = checkSvc("dex-xray")
 		svcs["dex-mosdns"] = checkSvc("dex-mosdns")
 		svcs["dex-nft"] = checkSvc("dex-nft")
 		if st.Client.WireGuard.Enabled || checkSvc(wgUnit) {
 			svcs["wireguard"] = checkSvc(wgUnit)
 		}
-		for _, opt := range []string{"haproxy", "nginx", "dex-doh"} {
+		if hasHAProxyForward || checkSvc("haproxy") {
+			svcs["haproxy"] = checkSvc("haproxy")
+		}
+		for _, opt := range []string{"nginx", "dex-doh"} {
 			if checkSvc(opt) {
 				svcs[opt] = true
 			}
 		}
+		proxyPaused = !svcs["dex-xray"] && !svcs["dex-nft"]
 	} else {
+		needsXray := st.Role == state.RoleServer || st.Role == state.RoleLanding ||
+			hasXrayForward || st.RproxyS.Enabled || len(st.ExtraInbounds) > 0
+		if needsXray || checkSvc("dex-xray") {
+			svcs["dex-xray"] = checkSvc("dex-xray")
+		}
 		needsNginx := st.Role == state.RoleServer && st.Server.TLSMode == "nginx"
 		for _, ex := range st.ExtraInbounds {
 			if ex.ViaNginx {
@@ -718,14 +741,23 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, _ *session
 		if (st.Role == state.RoleServer && st.Server.TLSMode == "nginx" && st.Server.EnableDoH) || checkSvc("dex-doh") {
 			svcs["dex-doh"] = checkSvc("dex-doh")
 		}
-		if len(st.Relay.Forwards) > 0 || checkSvc("dex-nft") {
+		if hasNFTForward || checkSvc("dex-nft") {
 			svcs["dex-nft"] = checkSvc("dex-nft")
 		}
-		if checkSvc("haproxy") {
-			svcs["haproxy"] = true
+		if hasHAProxyForward || checkSvc("haproxy") {
+			svcs["haproxy"] = checkSvc("haproxy")
+		}
+		switch {
+		case needsXray && hasNFTForward:
+			proxyPaused = !svcs["dex-xray"] && !svcs["dex-nft"]
+		case needsXray:
+			proxyPaused = !svcs["dex-xray"]
+		case hasNFTForward:
+			proxyPaused = !svcs["dex-nft"]
+		default:
+			proxyPaused = false
 		}
 	}
-	proxyPaused := st.Role == state.RoleClient && !svcs["dex-xray"] && !svcs["dex-nft"]
 
 	var certSummary any
 	certPath := s.Store.DefaultCert()
@@ -1789,13 +1821,19 @@ func (s *Server) handleCertIssue(w http.ResponseWriter, r *http.Request, _ *sess
 		return
 	}
 
-	_, _ = s.Store.Update(st.Role, func(cur *state.State) error {
-		cur.Cert.Mode = "acme"
+	hadCustomExternal := (st.Cert.CertFile != "" && st.Cert.CertFile != s.Store.DefaultCert()) ||
+		(st.Cert.KeyFile != "" && st.Cert.KeyFile != s.Store.DefaultKey())
+	certMode := "acme_cf"
+	if mode == "http" || mode == "http-01" {
+		certMode = "acme_http"
+	}
+	if _, uerr := s.Store.Update(st.Role, func(cur *state.State) error {
+		cur.Cert.Mode = certMode
 		cur.Cert.Domain = dom
 		cur.Cert.CertFile = ""
 		cur.Cert.KeyFile = ""
 		cur.Cert.AutoRenew = autoRenew
-		if mode == "http" || mode == "http-01" {
+		if certMode == "acme_http" {
 			// HTTP-01 does not touch CF token
 		} else if autoRenew {
 			cur.Cert.CFToken = tok
@@ -1805,7 +1843,16 @@ func (s *Server) handleCertIssue(w http.ResponseWriter, r *http.Request, _ *sess
 			cur.Cert.CFEmail = ""
 		}
 		return nil
-	})
+	}); uerr != nil {
+		writeJSONError(w, http.StatusInternalServerError, uerr.Error())
+		return
+	}
+	if hadCustomExternal {
+		if _, rerr := reconcile.Reconcile(r.Context(), s.Store, s.Exec, s.ApplyOpts); rerr != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("reconcile after cert issue: %v", rerr))
+			return
+		}
+	}
 	if s.ReloadCertFn != nil {
 		s.ReloadCertFn(r.Context())
 	}
@@ -1882,18 +1929,29 @@ func (s *Server) handleCertImport(w http.ResponseWriter, r *http.Request, _ *ses
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	_, _ = s.Store.Update(st.Role, func(cur *state.State) error {
+	hadCustomExternal := (st.Cert.CertFile != "" && st.Cert.CertFile != s.Store.DefaultCert()) ||
+		(st.Cert.KeyFile != "" && st.Cert.KeyFile != s.Store.DefaultKey())
+	if _, uerr := s.Store.Update(st.Role, func(cur *state.State) error {
 		cur.Cert.Mode = "imported"
 		cur.Cert.CertFile = s.Store.DefaultCert()
 		cur.Cert.KeyFile = s.Store.DefaultKey()
 		return nil
-	})
-	if changed && s.ReloadCertFn != nil {
+	}); uerr != nil {
+		writeJSONError(w, http.StatusInternalServerError, uerr.Error())
+		return
+	}
+	if hadCustomExternal {
+		if _, rerr := reconcile.Reconcile(r.Context(), s.Store, s.Exec, s.ApplyOpts); rerr != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("reconcile after cert import: %v", rerr))
+			return
+		}
+	}
+	if (changed || hadCustomExternal) && s.ReloadCertFn != nil {
 		s.ReloadCertFn(r.Context())
 	}
 	s.Hub.Log("INFO", "cert", fmt.Sprintf("imported certificate CN=%s changed=%v", rep.CommonName, changed))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "changed": changed, "cert": rep})
-	if changed {
+	if changed || hadCustomExternal {
 		s.scheduleDaemonRestart("TLS certificate imported")
 	}
 }
@@ -1923,12 +1981,23 @@ func (s *Server) handleCertSelfSign(w http.ResponseWriter, r *http.Request, _ *s
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	_, _ = s.Store.Update(st.Role, func(cur *state.State) error {
+	hadCustomExternal := (st.Cert.CertFile != "" && st.Cert.CertFile != s.Store.DefaultCert()) ||
+		(st.Cert.KeyFile != "" && st.Cert.KeyFile != s.Store.DefaultKey())
+	if _, uerr := s.Store.Update(st.Role, func(cur *state.State) error {
 		cur.Cert.Mode = "self_signed"
 		cur.Cert.CertFile = ""
 		cur.Cert.KeyFile = ""
 		return nil
-	})
+	}); uerr != nil {
+		writeJSONError(w, http.StatusInternalServerError, uerr.Error())
+		return
+	}
+	if hadCustomExternal {
+		if _, rerr := reconcile.Reconcile(r.Context(), s.Store, s.Exec, s.ApplyOpts); rerr != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("reconcile after self-sign: %v", rerr))
+			return
+		}
+	}
 	if s.ReloadCertFn != nil {
 		s.ReloadCertFn(r.Context())
 	}

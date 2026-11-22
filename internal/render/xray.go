@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/stuinxo/de_GWD/v3/internal/socks5out"
 	"github.com/stuinxo/de_GWD/v3/internal/state"
 )
 
@@ -620,12 +621,33 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 	viaNginxPorts := AllocateViaNginxInternalPorts(s)
 
 	addCommonRelayAndExtra := func(mark int) {
+		usedTags := make(map[string]bool, len(inbounds)+len(s.Relay.Forwards)+len(s.ExtraInbounds)+2)
+		for _, inb := range inbounds {
+			if t, ok := inb["tag"].(string); ok && t != "" {
+				usedTags[t] = true
+			}
+		}
+		for _, ex := range s.ExtraInbounds {
+			if ex.Tag != "" {
+				usedTags[ex.Tag] = true
+			}
+		}
 		var fwdTags []string
 		for _, fwd := range s.Relay.Forwards {
 			if fwd.Engine != "xray" {
 				continue
 			}
-			tag := fmt.Sprintf("fwd-%d", fwd.ListenPort)
+			baseTag := strings.TrimSpace(fwd.ID)
+			if baseTag == "" {
+				baseTag = fmt.Sprintf("fwd-%d", fwd.ListenPort)
+			} else if !strings.HasPrefix(baseTag, "fwd-") {
+				baseTag = "fwd-" + baseTag
+			}
+			tag := baseTag
+			for suffix := 2; usedTags[tag]; suffix++ {
+				tag = fmt.Sprintf("%s-%d", baseTag, suffix)
+			}
+			usedTags[tag] = true
 			fwdTags = append(fwdTags, tag)
 			inbounds = append(inbounds, map[string]any{
 				"tag":      tag,
@@ -1009,7 +1031,7 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 				outbounds = append(outbounds, buildFreedomOutbound(
 					mTag,
 					clientMark,
-					fmt.Sprintf("%s:%d", m.IntIP, m.IntPort),
+					socks5out.FormatEndpoint(m.IntIP, m.IntPort),
 				))
 				bridgeRules = append(bridgeRules, map[string]any{
 					"type":        "field",

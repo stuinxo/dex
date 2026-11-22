@@ -937,3 +937,82 @@ func TestReconcileHostsCacheObsoleteGuardResolvRestoreAndStalePrevCleanup(t *tes
 		t.Fatalf("expected custom /etc/resolv.conf untouched, got %q", string(gotResolv2))
 	}
 }
+
+func TestHardeningResolvFallbackAndExternalCertPreservation(t *testing.T) {
+	dir := t.TempDir()
+	resolvPath := filepath.Join(dir, "resolv.conf")
+	origPath := filepath.Join(dir, "resolv.conf.orig")
+
+	// 1. restoreResolvConfIfNeeded falls back to public DNS when orig contains only 127.0.0.53 or is missing
+	_ = os.WriteFile(resolvPath, []byte("nameserver 127.0.0.1\n"), 0o644)
+	_ = os.WriteFile(origPath, []byte("nameserver 127.0.0.53\noptions edns0 trust-ad\n"), 0o644)
+	if err := restoreResolvConfIfNeeded(resolvPath, origPath); err != nil {
+		t.Fatalf("restoreResolvConfIfNeeded stub orig: %v", err)
+	}
+	got, _ := os.ReadFile(resolvPath)
+	if !strings.Contains(string(got), "nameserver 223.5.5.5") || strings.Contains(string(got), "127.0.0.53") {
+		t.Fatalf("expected safe public DNS fallback instead of 127.0.0.53, got %q", string(got))
+	}
+
+	_ = os.WriteFile(resolvPath, []byte("nameserver 127.0.0.1\n"), 0o644)
+	_ = os.Remove(origPath)
+	if err := restoreResolvConfIfNeeded(resolvPath, origPath); err != nil {
+		t.Fatalf("restoreResolvConfIfNeeded missing orig: %v", err)
+	}
+	got2, _ := os.ReadFile(resolvPath)
+	if string(got2) != fallbackPublicDNS {
+		t.Fatalf("expected fallbackPublicDNS when orig missing, got %q", string(got2))
+	}
+
+	// 2. Reconcile must NOT overwrite or create files at custom external imported cert/key paths
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "etc", "dex")
+	store := state.NewStore(stateDir)
+	extCert := filepath.Join(dir, "external", "missing.cer")
+	extKey := filepath.Join(dir, "external", "missing.key")
+
+	srv := state.NewDefaultState(state.RoleServer)
+	srv.Server.Domain = "srv.example.com"
+	srv.Server.TLSMode = "nginx"
+	srv.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	srv.Cert = state.CertConfig{
+		Mode:     "imported",
+		CertFile: extCert,
+		KeyFile:  extKey,
+	}
+	if err := store.Save(srv); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Reconcile(context.Background(), store, &mockExecutor{}, ApplyOptions{RootPrefix: root}); err != nil {
+		t.Fatalf("Reconcile with custom external cert: %v", err)
+	}
+	if _, err := os.Stat(extCert); !os.IsNotExist(err) {
+		t.Fatalf("expected custom external cert path %s untouched, stat err=%v", extCert, err)
+	}
+	if _, err := os.Stat(extKey); !os.IsNotExist(err) {
+		t.Fatalf("expected custom external key path %s untouched, stat err=%v", extKey, err)
+	}
+
+	// 3. When default cert exists but default key is missing, Reconcile regenerates key+cert and triggers service restarts
+	srvDef := state.NewDefaultState(state.RoleServer)
+	srvDef.Server.Domain = "srv.example.com"
+	srvDef.Server.TLSMode = "nginx"
+	srvDef.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	srvDef.Cert = state.CertConfig{Mode: "self_signed"}
+	if err := store.Save(srvDef); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.MkdirAll(filepath.Dir(store.DefaultCert()), 0o755)
+	_ = os.WriteFile(store.DefaultCert(), []byte("corrupt-or-orphan-cert"), 0o644)
+	_ = os.Remove(store.DefaultKey())
+	res, err := Reconcile(context.Background(), store, &mockExecutor{}, ApplyOptions{RootPrefix: root})
+	if err != nil {
+		t.Fatalf("Reconcile default cert with missing key: %v", err)
+	}
+	if _, err := os.Stat(store.DefaultKey()); err != nil {
+		t.Fatalf("expected missing default key regenerated: %v", err)
+	}
+	if len(res.ServicesRestarted) == 0 {
+		t.Fatalf("expected services restarted when default cert/key regenerated")
+	}
+}

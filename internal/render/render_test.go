@@ -1085,3 +1085,131 @@ func TestHardeningMosDNSDoHLoopNodeFallbackIPv6AndMultiViaNginx(t *testing.T) {
 		t.Fatalf("expected vn-a=10443 and vn-b=10444 in xray.json, got %+v", portsByTag)
 	}
 }
+
+func TestHardeningWGPeerCollisionRelayTagsIPv6RproxyAndNginxDualStack(t *testing.T) {
+	// 1. WireGuard Chinese / colliding peer names produce 100% unique TargetPath
+	wgState := state.NewDefaultState(state.RoleClient)
+	wgState.Client.WireGuard = state.WireGuardConfig{
+		Enabled:          true,
+		EndpointHost:     "wg.example.com",
+		ListenPort:       51820,
+		SubnetCIDR:       "172.16.66.1/24",
+		ServerPrivateKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		ServerPublicKey:  "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+		Peers: []state.WGPeer{
+			{Name: "手机", IP: "172.16.66.11", PrivateKey: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=", PublicKey: "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD="},
+			{Name: "平板", IP: "172.16.66.12", PrivateKey: "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE=", PublicKey: "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF="},
+			{Name: "phone!", IP: "172.16.66.13", PrivateKey: "GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG=", PublicKey: "HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH="},
+			{Name: "phone?", IP: "172.16.66.14", PrivateKey: "IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII=", PublicKey: "JJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJ="},
+		},
+	}
+	wgFiles, needed, err := RenderWireGuard(wgState, RenderOptions{})
+	if err != nil || !needed {
+		t.Fatalf("RenderWireGuard: err=%v needed=%v", err, needed)
+	}
+	seenPaths := make(map[string]bool)
+	for _, f := range wgFiles {
+		if seenPaths[f.TargetPath] {
+			t.Fatalf("duplicate WireGuard TargetPath %q", f.TargetPath)
+		}
+		seenPaths[f.TargetPath] = true
+	}
+	if len(wgFiles) != 5 {
+		t.Fatalf("expected 5 rendered WG files, got %d", len(wgFiles))
+	}
+
+	// 2. Xray relay forwards on same port (TCP + UDP) get unique tags from fwd.ID + RproxyC IPv6 bracket formatting
+	cli := state.NewDefaultState(state.RoleClient)
+	cli.Client.Nodes = []state.OutboundNode{{
+		ID:       "n1",
+		Name:     "Primary",
+		Protocol: "vless-xhttp",
+		Address:  "1.1.1.1",
+		Port:     443,
+		UUID:     "11111111-1111-4111-8111-111111111111",
+	}}
+	cli.Client.ActiveNodeID = "n1"
+	cli.Client.RproxyC = state.RproxyCConfig{
+		Enabled:       true,
+		TunnelAddress: "rps.example.com",
+		TunnelPort:    20000,
+		TunnelUUID:    "11111111-1111-4111-8111-111111111111",
+		Mappings: []state.RproxyClientMapping{
+			{ExtPort: 20080, Proto: "tcp", IntIP: "fd00::10", IntPort: 8080},
+		},
+	}
+	cli.Relay.Forwards = []state.ForwardRule{
+		{ID: "fwd-10001", ListenPort: 10001, TargetHost: "8.8.8.8", TargetPort: 53, Proto: "tcp", Engine: "xray"},
+		{ID: "fwd-udp-10001", ListenPort: 10001, TargetHost: "8.8.8.8", TargetPort: 53, Proto: "udp", Engine: "xray"},
+	}
+	xb, needed, err := RenderXray(cli, RenderOptions{})
+	if err != nil || !needed {
+		t.Fatalf("RenderXray: err=%v needed=%v", err, needed)
+	}
+	var xcfg map[string]any
+	_ = json.Unmarshal(xb, &xcfg)
+	inbTags := make(map[string]bool)
+	for _, raw := range xcfg["inbounds"].([]any) {
+		tag := raw.(map[string]any)["tag"].(string)
+		if inbTags[tag] {
+			t.Fatalf("duplicate xray inbound tag %q", tag)
+		}
+		inbTags[tag] = true
+	}
+	if !inbTags["fwd-10001"] || !inbTags["fwd-udp-10001"] {
+		t.Fatalf("expected distinct fwd tags in xray inbounds, got %+v", inbTags)
+	}
+	foundIPv6Redirect := false
+	for _, raw := range xcfg["outbounds"].([]any) {
+		m := raw.(map[string]any)
+		if m["tag"] == "mapping0" {
+			redir := m["settings"].(map[string]any)["redirect"]
+			if redir == "[fd00::10]:8080" {
+				foundIPv6Redirect = true
+			}
+		}
+	}
+	if !foundIPv6Redirect {
+		t.Fatalf("expected IPv6 RproxyC redirect [fd00::10]:8080 in xray outbounds")
+	}
+
+	// 3. RenderNginx dual-stack IPv6 listen directives when EnableIPv6=true vs IPv4-only when false
+	srv := state.NewDefaultState(state.RoleServer)
+	srv.Server.Domain = "srv.example.com"
+	srv.Server.TLSMode = "nginx"
+	srv.Server.ListenPort = 443
+	srv.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	srv.ExtraInbounds = []state.ExtraInbound{{
+		Tag:        "vn-extra",
+		Protocol:   "vless-ws",
+		ListenPort: 8444,
+		Domain:     "extra.example.com",
+		UUID:       "22222222-2222-4222-8222-222222222222",
+		ViaNginx:   true,
+	}}
+	ngV4, _, err := RenderNginx(srv, RenderOptions{})
+	if err != nil {
+		t.Fatalf("RenderNginx v4: %v", err)
+	}
+	if strings.Contains(string(ngV4), "[::]:") {
+		t.Fatalf("expected no IPv6 listen when EnableIPv6=false, got:\n%s", string(ngV4))
+	}
+	srv.System.EnableIPv6 = true
+	ngDual, _, err := RenderNginx(srv, RenderOptions{})
+	if err != nil {
+		t.Fatalf("RenderNginx dual-stack: %v", err)
+	}
+	ngDualStr := string(ngDual)
+	for _, want := range []string{"listen [::]:80;", "listen [::]:443 ssl;", "listen [::]:8444 ssl;"} {
+		if !strings.Contains(ngDualStr, want) {
+			t.Fatalf("expected %q in dual-stack nginx config:\n%s", want, ngDualStr)
+		}
+	}
+	ngLegacyDual, _, err := RenderNginx(srv, RenderOptions{NginxLegacyHTTP2: true})
+	if err != nil {
+		t.Fatalf("RenderNginx legacy dual-stack: %v", err)
+	}
+	if !strings.Contains(string(ngLegacyDual), "listen [::]:443 ssl http2;") {
+		t.Fatalf("expected legacy IPv6 http2 directive:\n%s", string(ngLegacyDual))
+	}
+}
