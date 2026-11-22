@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/stuinxo/de_GWD/v3/internal/state"
+	"github.com/stuinxo/dex/internal/state"
 )
 
 // RenderMosDNS generates the single-core MosDNS v5 config and companion rule text files

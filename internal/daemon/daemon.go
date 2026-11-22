@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/stuinxo/de_GWD/v3/internal/reconcile"
-	"github.com/stuinxo/de_GWD/v3/internal/state"
+	"github.com/stuinxo/dex/internal/reconcile"
+	"github.com/stuinxo/dex/internal/state"
 )
 
 // Runner executes background loops (failover/failback, Cloudflare DDNS) alongside the Web UI.

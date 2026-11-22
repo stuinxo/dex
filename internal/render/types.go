@@ -12,9 +12,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/stuinxo/de_GWD/v3/internal/cryptoext"
-	"github.com/stuinxo/de_GWD/v3/internal/socks5out"
-	"github.com/stuinxo/de_GWD/v3/internal/state"
+	"github.com/stuinxo/dex/internal/cryptoext"
+	"github.com/stuinxo/dex/internal/socks5out"
+	"github.com/stuinxo/dex/internal/state"
 )
 
 // RenderOptions supplies environment and runtime-resolved inputs to pure renderers.

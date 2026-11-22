@@ -1,9 +1,9 @@
 #!/bin/sh
-# DEX v3 Bootstrap Installer (POSIX sh)
+# DEX Bootstrap Installer (POSIX sh)
 # Supports Debian 12/13, Ubuntu (apt + systemd), and Alpine 3.x (apk + OpenRC) on amd64/arm64.
 set -eu
 
-DEX_REPO="${DEX_REPO:-stuinxo/de_GWD}"
+DEX_REPO="${DEX_REPO:-stuinxo/dex}"
 DEX_VERSION="${DEX_VERSION:-latest}"
 DEX_BIN="${DEX_BIN:-}"
 XRAY_ZIP="${XRAY_ZIP:-}"
@@ -359,8 +359,8 @@ install_mosdns_and_rules() {
   fetch_valid_text_rule "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text/cn.txt" "${STATE_DIR}/rules/IPchnroute" 1000 || warn "Failed to fetch valid IPchnroute"
   fetch_valid_text_rule "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt" "${STATE_DIR}/rules/Domains.chn.txt" 10000 || warn "Failed to fetch valid Domains.chn.txt"
   fetch_valid_text_rule "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/reject-list.txt" "${STATE_DIR}/rules/Domains.ads.txt" 1000 || warn "Failed to fetch valid Domains.ads.txt"
-  fetch_valid_text_rule "https://raw.githubusercontent.com/stuinxo/de_GWD/main/resource/chnroute/mosdns_chnlist/Domains.apple.txt" "${STATE_DIR}/rules/Domains.apple.txt" 50 "https://raw.githubusercontent.com/jacyl4/chnroute/main/mosdns_chnlist/Domains.apple.txt" || warn "Failed to fetch valid Domains.apple.txt"
-  fetch_valid_text_rule "https://raw.githubusercontent.com/stuinxo/de_GWD/main/resource/chnroute/mosdns_chnlist/Domains.games.txt" "${STATE_DIR}/rules/Domains.games.txt" 50 "https://raw.githubusercontent.com/jacyl4/chnroute/main/mosdns_chnlist/Domains.games.txt" || warn "Failed to fetch valid Domains.games.txt"
+  fetch_valid_text_rule "https://raw.githubusercontent.com/${DEX_REPO}/main/rules/Domains.apple.txt" "${STATE_DIR}/rules/Domains.apple.txt" 50 "https://raw.githubusercontent.com/stuinxo/de_GWD/main/resource/chnroute/mosdns_chnlist/Domains.apple.txt" || warn "Failed to fetch valid Domains.apple.txt"
+  fetch_valid_text_rule "https://raw.githubusercontent.com/${DEX_REPO}/main/rules/Domains.games.txt" "${STATE_DIR}/rules/Domains.games.txt" 50 "https://raw.githubusercontent.com/stuinxo/de_GWD/main/resource/chnroute/mosdns_chnlist/Domains.games.txt" || warn "Failed to fetch valid Domains.games.txt"
 }
 
 ensure_ntp() {
@@ -461,7 +461,7 @@ main() {
       say "[+] Ready. Run 'dex init --role relay --apply' or 'dex' for interactive menu."
       ;;
     "")
-      say "[+] DEX v3 installed. Run 'dex' to open menu, or re-run with: install.sh [client|server|landing|relay]"
+      say "[+] DEX installed. Run 'dex' to open menu, or re-run with: install.sh [client|server|landing|relay]"
       ;;
     *)
       die "Usage: $0 [client|server|landing|relay]"

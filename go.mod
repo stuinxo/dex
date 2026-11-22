@@ -1,3 +1,3 @@
-module github.com/stuinxo/de_GWD/v3
+module github.com/stuinxo/dex
 
 go 1.24

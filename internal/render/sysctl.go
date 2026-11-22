@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/stuinxo/de_GWD/v3/internal/state"
+	"github.com/stuinxo/dex/internal/state"
 )
 
 // RenderSysctl renders minimal, safe kernel tuning for routing/forwarding, BBR, and CAKE.

@@ -19,8 +19,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/stuinxo/de_GWD/v3/internal/reconcile"
-	"github.com/stuinxo/de_GWD/v3/internal/state"
+	"github.com/stuinxo/dex/internal/reconcile"
+	"github.com/stuinxo/dex/internal/state"
 )
 
 // OpsConfig configures remote sources and install targets for dex rules/update (overridable in tests).
@@ -69,17 +69,17 @@ func (c OpsConfig) withDefaults(versionTag string) OpsConfig {
 	if c.DomainsAdsURL == "" {
 		c.DomainsAdsURL = "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/reject-list.txt"
 	}
-	if c.DomainsAppleURL == "" {
-		c.DomainsAppleURL = "https://raw.githubusercontent.com/stuinxo/de_GWD/main/resource/chnroute/mosdns_chnlist/Domains.apple.txt"
-	}
-	if c.DomainsGamesURL == "" {
-		c.DomainsGamesURL = "https://raw.githubusercontent.com/stuinxo/de_GWD/main/resource/chnroute/mosdns_chnlist/Domains.games.txt"
-	}
 	if c.DexRepo == "" {
 		c.DexRepo = strings.TrimSpace(os.Getenv("DEX_REPO"))
 		if c.DexRepo == "" {
-			c.DexRepo = "stuinxo/de_GWD"
+			c.DexRepo = "stuinxo/dex"
 		}
+	}
+	if c.DomainsAppleURL == "" {
+		c.DomainsAppleURL = fmt.Sprintf("https://raw.githubusercontent.com/%s/main/rules/Domains.apple.txt", c.DexRepo)
+	}
+	if c.DomainsGamesURL == "" {
+		c.DomainsGamesURL = fmt.Sprintf("https://raw.githubusercontent.com/%s/main/rules/Domains.games.txt", c.DexRepo)
 	}
 	if c.DexReleaseBase == "" {
 		if versionTag == "" || versionTag == "latest" {
@@ -469,7 +469,7 @@ func cmdUpdate(store *state.Store, exec reconcile.SystemExecutor, args []string,
 	fs := flag.NewFlagSet("update", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	component := fs.String("component", "all", "all|dex|xray|mosdns|rules")
-	ver := fs.String("version", "latest", "target dex version tag (e.g. latest or v3.0.0)")
+	ver := fs.String("version", "latest", "target dex version tag (e.g. latest or v0.0.1)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}

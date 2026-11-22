@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/stuinxo/de_GWD/v3/internal/state"
+	"github.com/stuinxo/dex/internal/state"
 )
 
 func listenSSLDirective(port int, legacyHTTP2, enableIPv6 bool) string {

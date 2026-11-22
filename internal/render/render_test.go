@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/stuinxo/de_GWD/v3/internal/state"
+	"github.com/stuinxo/dex/internal/state"
 )
 
 func findFile(bundle *RenderBundle, rel string) (RenderedFile, bool) {

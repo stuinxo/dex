@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/stuinxo/de_GWD/v3/internal/state"
+	"github.com/stuinxo/dex/internal/state"
 )
 
 var baseReservedIPv4 = []string{

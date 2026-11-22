@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/stuinxo/de_GWD/v3/internal/render"
-	"github.com/stuinxo/de_GWD/v3/internal/socks5out"
-	"github.com/stuinxo/de_GWD/v3/internal/state"
+	"github.com/stuinxo/dex/internal/render"
+	"github.com/stuinxo/dex/internal/socks5out"
+	"github.com/stuinxo/dex/internal/state"
 )
 
 // ProbeNodeResult reports reachability and RTT for a single OutboundNode.

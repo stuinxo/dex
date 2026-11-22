@@ -1,11 +1,11 @@
-name: DEX v3 CI & Release
+name: DEX CI & Release
 
 on:
   push:
-    branches: [v3]
-    tags: ["v3*"]
+    branches: [main]
+    tags: ["v*"]
   pull_request:
-    branches: [v3]
+    branches: [main]
 
 jobs:
   verify:
@@ -31,11 +31,14 @@ jobs:
       - name: Cross-compile static binaries
         run: |
           mkdir -p dist
-          VERSION="${GITHUB_REF_NAME:-3.0.0}"
-          VERSION="${VERSION#v}"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.1-dev"
+          fi
           COMMIT="${GITHUB_SHA::7}"
           BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          LDFLAGS="-s -w -X github.com/stuinxo/de_GWD/v3/internal/version.Version=${VERSION} -X github.com/stuinxo/de_GWD/v3/internal/version.Commit=${COMMIT} -X github.com/stuinxo/de_GWD/v3/internal/version.BuildTime=${BUILD_TIME}"
+          LDFLAGS="-s -w -X github.com/stuinxo/dex/internal/version.Version=${VERSION} -X github.com/stuinxo/dex/internal/version.Commit=${COMMIT} -X github.com/stuinxo/dex/internal/version.BuildTime=${BUILD_TIME}"
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="${LDFLAGS}" -o dist/dex-linux-amd64 ./cmd/dex
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="${LDFLAGS}" -o dist/dex-linux-arm64 ./cmd/dex
           (cd dist && sha256sum dex-linux-amd64 dex-linux-arm64 > SHA256SUMS)
@@ -49,11 +52,13 @@ jobs:
 
   release:
     needs: verify
-    if: startsWith(github.ref, 'refs/tags/v3')
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: dex-binaries
@@ -63,9 +68,18 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            dist/dex-linux-amd64 \
-            dist/dex-linux-arm64 \
-            dist/SHA256SUMS \
-            --title "DEX ${GITHUB_REF_NAME}" \
-            --generate-notes
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" --clobber \
+              dist/dex-linux-amd64 \
+              dist/dex-linux-arm64 \
+              dist/SHA256SUMS \
+              scripts/install.sh
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              dist/dex-linux-amd64 \
+              dist/dex-linux-arm64 \
+              dist/SHA256SUMS \
+              scripts/install.sh \
+              --title "DEX ${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi

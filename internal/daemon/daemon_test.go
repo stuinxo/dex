@@ -20,8 +20,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stuinxo/de_GWD/v3/internal/reconcile"
-	"github.com/stuinxo/de_GWD/v3/internal/state"
+	"github.com/stuinxo/dex/internal/reconcile"
+	"github.com/stuinxo/dex/internal/state"
 )
 
 func TestProbeNodeHealthEnforcesSNI(t *testing.T) {

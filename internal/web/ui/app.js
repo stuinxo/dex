@@ -242,7 +242,7 @@
   function renderStatus() {
     if (!statusInfo) { return; }
     var alias = statusInfo.device_alias || statusInfo.hostname || "";
-    document.title = alias ? (alias + " · 寒月 DEX v3") : "寒月 · DEX v3";
+    document.title = alias ? (alias + " · 寒月 DEX") : "寒月 · DEX";
 
     var hostLabel = $("nav-host-label");
     if (alias) {
@@ -255,7 +255,7 @@
 
     $("role-badge").textContent = statusInfo.role || "client";
     $("arch-badge").textContent = formatArchShort(statusInfo.arch);
-    $("kpi-version").textContent = "DEX " + (statusInfo.version || "v3");
+    $("kpi-version").textContent = statusInfo.version ? ("DEX " + statusInfo.version) : "DEX";
     $("kpi-role-arch").textContent = (statusInfo.role || "client") + " · " + formatArchShort(statusInfo.arch).toLowerCase();
     $("kpi-uptime").textContent = formatDuration(statusInfo.uptime_sec);
     $("kpi-kernel").textContent = statusInfo.kernel ? ("Linux " + statusInfo.kernel.split("-")[0]) : "-";

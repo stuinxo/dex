@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/stuinxo/de_GWD/v3/internal/cryptoext"
-	"github.com/stuinxo/de_GWD/v3/internal/state"
+	"github.com/stuinxo/dex/internal/cryptoext"
+	"github.com/stuinxo/dex/internal/state"
 )
 
 func strVal(v any) string {

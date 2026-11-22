@@ -14,9 +14,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/stuinxo/de_GWD/v3/internal/cert"
-	"github.com/stuinxo/de_GWD/v3/internal/reconcile"
-	"github.com/stuinxo/de_GWD/v3/internal/state"
+	"github.com/stuinxo/dex/internal/cert"
+	"github.com/stuinxo/dex/internal/reconcile"
+	"github.com/stuinxo/dex/internal/state"
 )
 
 func TestCLISmokeEndToEnd(t *testing.T) {
@@ -32,7 +32,7 @@ func TestCLISmokeEndToEnd(t *testing.T) {
 
 	// 1. version
 	code, out, errOut := run("version")
-	if code != 0 || !strings.Contains(out, "v3.") {
+	if code != 0 || !strings.Contains(out, "v0.") {
 		t.Fatalf("version failed: code=%d out=%q err=%q", code, out, errOut)
 	}
 

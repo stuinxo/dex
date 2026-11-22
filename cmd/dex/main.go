@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/stuinxo/de_GWD/v3/internal/cli"
+	"github.com/stuinxo/dex/internal/cli"
 )
 
 func main() {

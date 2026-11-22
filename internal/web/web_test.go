@@ -15,12 +15,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stuinxo/de_GWD/v3/internal/cert"
-	"github.com/stuinxo/de_GWD/v3/internal/cryptoext"
-	"github.com/stuinxo/de_GWD/v3/internal/daemon"
-	"github.com/stuinxo/de_GWD/v3/internal/reconcile"
-	"github.com/stuinxo/de_GWD/v3/internal/socks5out"
-	"github.com/stuinxo/de_GWD/v3/internal/state"
+	"github.com/stuinxo/dex/internal/cert"
+	"github.com/stuinxo/dex/internal/cryptoext"
+	"github.com/stuinxo/dex/internal/daemon"
+	"github.com/stuinxo/dex/internal/reconcile"
+	"github.com/stuinxo/dex/internal/socks5out"
+	"github.com/stuinxo/dex/internal/state"
 )
 
 type stubExec struct{}
@@ -96,7 +96,7 @@ func TestWebSecurityAuthRateLimitCSRFAndRedaction(t *testing.T) {
 	}
 	uiBody, _ := io.ReadAll(uiResp.Body)
 	_ = uiResp.Body.Close()
-	if uiResp.StatusCode != 200 || !strings.Contains(string(uiBody), "DEX v3") {
+	if uiResp.StatusCode != 200 || !strings.Contains(string(uiBody), "寒月 · DEX") {
 		t.Fatalf("expected embedded index.html, got status=%d", uiResp.StatusCode)
 	}
 	if uiResp.Header.Get("X-Frame-Options") != "DENY" || uiResp.Header.Get("X-Content-Type-Options") != "nosniff" {

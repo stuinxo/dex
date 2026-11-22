@@ -9,7 +9,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/stuinxo/de_GWD/v3/internal/render"
+	"github.com/stuinxo/dex/internal/render"
 )
 
 var ErrManualModificationDetected = errors.New("managed config modified outside dex")

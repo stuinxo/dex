@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/stuinxo/de_GWD/v3/internal/state"
+	"github.com/stuinxo/dex/internal/state"
 )
 
 // RenderHAProxy generates a low-memory L4 TCP forwarding configuration with dynamic DNS resolution

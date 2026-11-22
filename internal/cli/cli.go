@@ -19,17 +19,17 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/stuinxo/de_GWD/v3/internal/cert"
-	"github.com/stuinxo/de_GWD/v3/internal/cryptoext"
-	"github.com/stuinxo/de_GWD/v3/internal/daemon"
-	"github.com/stuinxo/de_GWD/v3/internal/doh"
-	"github.com/stuinxo/de_GWD/v3/internal/migrate"
-	"github.com/stuinxo/de_GWD/v3/internal/reconcile"
-	"github.com/stuinxo/de_GWD/v3/internal/render"
-	"github.com/stuinxo/de_GWD/v3/internal/socks5out"
-	"github.com/stuinxo/de_GWD/v3/internal/state"
-	"github.com/stuinxo/de_GWD/v3/internal/version"
-	"github.com/stuinxo/de_GWD/v3/internal/web"
+	"github.com/stuinxo/dex/internal/cert"
+	"github.com/stuinxo/dex/internal/cryptoext"
+	"github.com/stuinxo/dex/internal/daemon"
+	"github.com/stuinxo/dex/internal/doh"
+	"github.com/stuinxo/dex/internal/migrate"
+	"github.com/stuinxo/dex/internal/reconcile"
+	"github.com/stuinxo/dex/internal/render"
+	"github.com/stuinxo/dex/internal/socks5out"
+	"github.com/stuinxo/dex/internal/state"
+	"github.com/stuinxo/dex/internal/version"
+	"github.com/stuinxo/dex/internal/web"
 )
 
 // Run is the main CLI entrypoint invoked by cmd/dex/main.go and tests.
@@ -119,7 +119,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprint(w, `DEX v3 — Unified Bypass Gateway & Node Controller
+	fmt.Fprint(w, `DEX — Unified Bypass Gateway & Node Controller
 
 Usage:
   dex [--state-dir DIR] [command] [flags]

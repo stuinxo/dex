@@ -1,8 +1,8 @@
-# DEX v3（寒月）
+# DEX（寒月）
 
-双端自建透明代理旁路网关与轻量落地/中转统一控制面。**v3 基于零依赖 Go 单二进制（`dex`）彻底重写**，保留并升格了 `des` 的声明式事务引擎与 `de_GWD v2.2` 的全部核心协议/安全不变量。
+双端自建透明代理旁路网关与轻量落地/中转统一控制面。**基于零依赖 Go 单二进制（`dex`）彻底重写**，保留并升格了 `des` 的声明式事务引擎与 `de_GWD v2` 的全部核心协议/安全不变量，支持从 `de_GWD v2`、`des`、`dexs` 无损平滑迁移。
 
-## 核心变化（相比 v2）
+## 核心变化（相比 de_GWD v2 / des / dexs）
 
 - **单二进制控制面（`CGO_ENABLED=0`）**：彻底取代 11,000+ 行巨石 Bash、80 个 `ui-script`、PHP-FPM + 75 个 `act/*.php`、`sudoers` 白名单与 `ttyd`。
 - **统一声明式状态 + 事务回滚**：唯一状态源 `/etc/dex/state.json`（`flock` 排他锁 + `.bak`/`.txn`）；所有配置由纯函数渲染至 `/etc/dex/generated/`，经 `xray run -test` / `nft -c` / `haproxy -c` / `nginx -t` 预检通过后原子替换，失败自动回滚；支持托管文件 SHA256 防误覆盖检查。
@@ -16,8 +16,7 @@
 支持 **Debian 12/13 / Ubuntu**（`apt + systemd`）与 **Alpine 3.x**（`apk + OpenRC`），`amd64` / `arm64`：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/stuinxo/de_GWD/v3/scripts/install.sh -o install.sh
-sh install.sh
+curl -fsSL https://raw.githubusercontent.com/stuinxo/dex/main/scripts/install.sh -o install.sh && sh install.sh
 ```
 
 离线部署可将预先编译或下载的 `dex-linux-amd64`（或 `DEX_BIN=/path/to/dex`）及 `Xray-linux-64.zip` 置于 `/root/` 后直接运行 `sh install.sh [client|server|landing|relay]`。

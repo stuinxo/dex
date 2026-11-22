@@ -25,15 +25,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/stuinxo/de_GWD/v3/internal/cert"
-	"github.com/stuinxo/de_GWD/v3/internal/cryptoext"
-	"github.com/stuinxo/de_GWD/v3/internal/daemon"
-	"github.com/stuinxo/de_GWD/v3/internal/migrate"
-	"github.com/stuinxo/de_GWD/v3/internal/reconcile"
-	"github.com/stuinxo/de_GWD/v3/internal/render"
-	"github.com/stuinxo/de_GWD/v3/internal/socks5out"
-	"github.com/stuinxo/de_GWD/v3/internal/state"
-	"github.com/stuinxo/de_GWD/v3/internal/version"
+	"github.com/stuinxo/dex/internal/cert"
+	"github.com/stuinxo/dex/internal/cryptoext"
+	"github.com/stuinxo/dex/internal/daemon"
+	"github.com/stuinxo/dex/internal/migrate"
+	"github.com/stuinxo/dex/internal/reconcile"
+	"github.com/stuinxo/dex/internal/render"
+	"github.com/stuinxo/dex/internal/socks5out"
+	"github.com/stuinxo/dex/internal/state"
+	"github.com/stuinxo/dex/internal/version"
 )
 
 //go:embed ui/*

@@ -16,9 +16,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/stuinxo/de_GWD/v3/internal/reconcile"
-	"github.com/stuinxo/de_GWD/v3/internal/render"
-	"github.com/stuinxo/de_GWD/v3/internal/state"
+	"github.com/stuinxo/dex/internal/reconcile"
+	"github.com/stuinxo/dex/internal/render"
+	"github.com/stuinxo/dex/internal/state"
 )
 
 type fakeOpsExec struct {

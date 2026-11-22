@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/stuinxo/de_GWD/v3/internal/cert"
-	"github.com/stuinxo/de_GWD/v3/internal/render"
-	"github.com/stuinxo/de_GWD/v3/internal/state"
+	"github.com/stuinxo/dex/internal/cert"
+	"github.com/stuinxo/dex/internal/render"
+	"github.com/stuinxo/dex/internal/state"
 )
 
 // ApplyOptions controls transactional reconciliation behavior.

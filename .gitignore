@@ -1,14 +1,15 @@
 # Build outputs
 /dex
 /dex-*
-/dist/
+dex-linux-*
+dist/
 /bin/
 *.exe
 *.test
 *.out
 coverage.*
 
-# Archives and external runtime binaries/data (never commit to v3)
+# Archives and external runtime binaries/data (never commit)
 *.zip
 *.tar
 *.tar.gz
@@ -17,6 +18,8 @@ coverage.*
 *.dat
 IPchnroute*
 Domains.*.txt
+!rules/Domains.apple.txt
+!rules/Domains.games.txt
 xray
 mosdns
 coredns

@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stuinxo/de_GWD/v3/internal/cryptoext"
-	"github.com/stuinxo/de_GWD/v3/internal/render"
-	"github.com/stuinxo/de_GWD/v3/internal/state"
+	"github.com/stuinxo/dex/internal/cryptoext"
+	"github.com/stuinxo/dex/internal/render"
+	"github.com/stuinxo/dex/internal/state"
 )
 
 type mockExecutor struct {

@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/stuinxo/de_GWD/v3/internal/cryptoext"
-	"github.com/stuinxo/de_GWD/v3/internal/render"
+	"github.com/stuinxo/dex/internal/cryptoext"
+	"github.com/stuinxo/dex/internal/render"
 )
 
 func TestImportV2ClientAndRender(t *testing.T) {

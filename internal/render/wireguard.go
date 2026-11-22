@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/stuinxo/de_GWD/v3/internal/state"
+	"github.com/stuinxo/dex/internal/state"
 )
 
 // NextAvailableWGIP allocates the lowest unused host IP (>= .11) inside subnetCIDR for a WireGuard peer.

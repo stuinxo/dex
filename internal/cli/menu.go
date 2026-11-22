@@ -9,11 +9,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/stuinxo/de_GWD/v3/internal/cryptoext"
-	"github.com/stuinxo/de_GWD/v3/internal/reconcile"
-	"github.com/stuinxo/de_GWD/v3/internal/render"
-	"github.com/stuinxo/de_GWD/v3/internal/state"
-	"github.com/stuinxo/de_GWD/v3/internal/version"
+	"github.com/stuinxo/dex/internal/cryptoext"
+	"github.com/stuinxo/dex/internal/reconcile"
+	"github.com/stuinxo/dex/internal/render"
+	"github.com/stuinxo/dex/internal/state"
+	"github.com/stuinxo/dex/internal/version"
 )
 
 func runInteractiveMenu(store *state.Store, exec reconcile.SystemExecutor, stdin io.Reader, stdout, stderr io.Writer) int {
