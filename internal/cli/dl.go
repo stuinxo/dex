@@ -110,7 +110,12 @@ func DownloadWithMirrors(ctx context.Context, client *http.Client, rawURL, dstPa
 		client = &http.Client{Timeout: 90 * time.Second}
 	}
 	if mirrors == nil {
-		mirrors = defaultMirrors
+		if strings.HasPrefix(rawURL, "https://github.com/") ||
+			strings.HasPrefix(rawURL, "https://raw.githubusercontent.com/") {
+			mirrors = defaultMirrors
+		} else {
+			mirrors = []string{}
+		}
 	}
 
 	var attempts []string

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -24,28 +25,29 @@ import (
 
 // OpsConfig configures remote sources and install targets for dex rules/update (overridable in tests).
 type OpsConfig struct {
-	Client            *http.Client
-	GeoIPURL          string
-	GeoSiteURL        string
-	ChnRouteURL       string
-	DomainsChnURL     string
-	DomainsAdsURL     string
-	DomainsAppleURL   string
-	DomainsGamesURL   string
-	DexRepo           string
-	DexReleaseBase    string // optional override base URL instead of GitHub repo releases
-	XrayReleaseBase   string
-	MosDNSBase        string
-	DexBinPath        string
-	XrayBinPath       string
-	MosDNSBinPath     string
-	GOARCH            string
-	MinChnRouteCIDR   int
-	MinChnDomains     int
-	MinAdsDomains     int
-	MinAppleDomains   int
-	MinGamesDomains   int
-	SkipDaemonRestart bool
+	Client              *http.Client
+	GeoIPURL            string
+	GeoSiteURL          string
+	ChnRouteURL         string
+	DomainsChnURL       string
+	DomainsAdsURL       string
+	DomainsAppleURL     string
+	DomainsGamesURL     string
+	DexRepo             string
+	DexReleaseBase      string // optional override base URL instead of GitHub repo releases
+	XrayReleaseBase     string
+	MosDNSBase          string
+	MosDNSReleaseAPIURL string
+	DexBinPath          string
+	XrayBinPath         string
+	MosDNSBinPath       string
+	GOARCH              string
+	MinChnRouteCIDR     int
+	MinChnDomains       int
+	MinAdsDomains       int
+	MinAppleDomains     int
+	MinGamesDomains     int
+	SkipDaemonRestart   bool
 }
 
 func (c OpsConfig) withDefaults(versionTag string) OpsConfig {
@@ -91,6 +93,9 @@ func (c OpsConfig) withDefaults(versionTag string) OpsConfig {
 	}
 	if c.MosDNSBase == "" {
 		c.MosDNSBase = "https://github.com/IrineSistiana/mosdns/releases/latest/download"
+	}
+	if c.MosDNSReleaseAPIURL == "" {
+		c.MosDNSReleaseAPIURL = "https://api.github.com/repos/IrineSistiana/mosdns/releases/latest"
 	}
 	if c.DexBinPath == "" {
 		c.DexBinPath = "/usr/local/bin/dex"
@@ -757,6 +762,61 @@ func updateXrayBinary(ctx context.Context, exec reconcile.SystemExecutor, cfg Op
 	return nil
 }
 
+func parseMosDNSReleaseDigest(apiJSON []byte, assetName string) (string, error) {
+	var rel struct {
+		Assets []struct {
+			Name   string `json:"name"`
+			Digest string `json:"digest"`
+		} `json:"assets"`
+	}
+	if err := json.Unmarshal(apiJSON, &rel); err != nil {
+		return "", fmt.Errorf("parse mosdns release metadata: %w", err)
+	}
+	for _, a := range rel.Assets {
+		if a.Name != assetName {
+			continue
+		}
+		dig := strings.TrimSpace(a.Digest)
+		if rest, ok := strings.CutPrefix(strings.ToLower(dig), "sha256:"); ok {
+			return NormalizeSHA256(rest)
+		}
+		return "", fmt.Errorf("mosdns asset %s missing sha256 digest (%q)", assetName, a.Digest)
+	}
+	return "", fmt.Errorf("mosdns asset %s not found in release metadata", assetName)
+}
+
+func resolveMosDNSSHA256(ctx context.Context, cfg OpsConfig, tmpDir, base, zipName string) (string, error) {
+	sumPath := filepath.Join(tmpDir, zipName+".sha256sum")
+	var sumErr error
+	if err := DownloadWithMirrors(ctx, cfg.Client, base+"/"+zipName+".sha256sum", sumPath, nil); err == nil {
+		if sumsData, rerr := os.ReadFile(sumPath); rerr == nil {
+			if expected, perr := findSHA256Entry(sumsData, zipName); perr == nil {
+				return expected, nil
+			} else if len(strings.Fields(string(sumsData))) == 1 {
+				if expected, nerr := NormalizeSHA256(string(sumsData)); nerr == nil {
+					return expected, nil
+				}
+			} else {
+				sumErr = perr
+			}
+		} else {
+			sumErr = rerr
+		}
+	} else {
+		sumErr = err
+	}
+
+	apiPath := filepath.Join(tmpDir, "mosdns-release.json")
+	if err := DownloadWithMirrors(ctx, cfg.Client, cfg.MosDNSReleaseAPIURL, apiPath, nil); err != nil {
+		return "", fmt.Errorf("fetch mosdns checksum (.sha256sum: %v; release API: %w)", sumErr, err)
+	}
+	apiData, err := os.ReadFile(apiPath)
+	if err != nil {
+		return "", err
+	}
+	return parseMosDNSReleaseDigest(apiData, zipName)
+}
+
 func updateMosDNSBinary(ctx context.Context, exec reconcile.SystemExecutor, cfg OpsConfig, mosArch string, stdout io.Writer) error {
 	zipName := fmt.Sprintf("mosdns-linux-%s.zip", mosArch)
 	tmpDir, err := os.MkdirTemp("", "dex-mos-upd-*")
@@ -771,6 +831,13 @@ func updateMosDNSBinary(ctx context.Context, exec reconcile.SystemExecutor, cfg 
 		fmt.Fprintf(stdout, "[*] Downloading %s...\n", zipName)
 	}
 	if err := DownloadWithMirrors(ctx, cfg.Client, base+"/"+zipName, zipPath, nil); err != nil {
+		return err
+	}
+	expected, err := resolveMosDNSSHA256(ctx, cfg, tmpDir, base, zipName)
+	if err != nil {
+		return err
+	}
+	if err := VerifyFileSHA256(zipPath, expected); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(cfg.MosDNSBinPath), 0o755); err != nil {

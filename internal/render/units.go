@@ -236,8 +236,10 @@ WantedBy=multi-user.target
 			tproxyStart = "\nExecStart=/usr/sbin/ip route replace local default dev lo scope host table 220\nExecStart=/bin/sh -c '/usr/sbin/ip rule list priority 100 | grep -Fq \"fwmark 0x9 lookup 220\" || /usr/sbin/ip rule add fwmark 0x9 table 220 priority 100'"
 			if s.System.EnableIPv6 {
 				tproxyStart += "\nExecStart=/usr/sbin/ip -6 route replace local default dev lo table 220\nExecStart=/bin/sh -c '/usr/sbin/ip -6 rule list priority 100 | grep -Fq \"fwmark 0x9 lookup 220\" || /usr/sbin/ip -6 rule add fwmark 0x9 table 220 priority 100'"
+				tproxyStop = "\nExecStop=/bin/sh -c '/usr/sbin/ip rule del fwmark 0x9 table 220 priority 100 2>/dev/null || true; /usr/sbin/ip route del local default dev lo table 220 2>/dev/null || true; /usr/sbin/ip -6 rule del fwmark 0x9 table 220 priority 100 2>/dev/null || true; /usr/sbin/ip -6 route del local default dev lo table 220 2>/dev/null || true'"
+			} else {
+				tproxyStop = "\nExecStop=/bin/sh -c '/usr/sbin/ip rule del fwmark 0x9 table 220 priority 100 2>/dev/null || true; /usr/sbin/ip route del local default dev lo table 220 2>/dev/null || true'"
 			}
-			tproxyStop = "\nExecStop=/bin/sh -c '/usr/sbin/ip rule del fwmark 0x9 table 220 priority 100 2>/dev/null || true; /usr/sbin/ip route del local default dev lo table 220 2>/dev/null || true'"
 		}
 		unit := fmt.Sprintf(`[Unit]
 Description=DEX nftables Rules

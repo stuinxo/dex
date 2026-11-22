@@ -293,21 +293,53 @@ func (d *CloudflareDDNS) findZoneID(ctx context.Context, domain, token, email st
 		return zid, nil
 	}
 
-	var zones []struct {
+	type cfZone struct {
 		ID   string `json:"id"`
 		Name string `json:"name"`
 	}
-	if err := d.cfRequest(ctx, http.MethodGet, "/zones?per_page=50", token, email, nil, &zones); err != nil {
-		return "", err
-	}
-	bestLen := -1
-	for _, z := range zones {
-		if domain == z.Name || strings.HasSuffix(domain, "."+z.Name) {
-			if len(z.Name) > bestLen {
-				bestLen = len(z.Name)
-				zid = z.ID
+	normDom := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
+	pickBestZone := func(zones []cfZone) string {
+		bestLen := -1
+		bestID := ""
+		for _, z := range zones {
+			zn := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(z.Name)), ".")
+			if zn == "" {
+				continue
+			}
+			if normDom == zn || strings.HasSuffix(normDom, "."+zn) {
+				if len(zn) > bestLen {
+					bestLen = len(zn)
+					bestID = z.ID
+				}
 			}
 		}
+		return bestID
+	}
+
+	var lastErr error
+	labels := strings.Split(normDom, ".")
+	for i := 0; i <= len(labels)-2; i++ {
+		cand := strings.Join(labels[i:], ".")
+		var zones []cfZone
+		if err := d.cfRequest(ctx, http.MethodGet, "/zones?name="+url.QueryEscape(cand), token, email, nil, &zones); err != nil {
+			lastErr = err
+			continue
+		}
+		if id := pickBestZone(zones); id != "" {
+			zid = id
+			break
+		}
+	}
+
+	if zid == "" {
+		var zones []cfZone
+		if err := d.cfRequest(ctx, http.MethodGet, "/zones?per_page=50", token, email, nil, &zones); err != nil {
+			if lastErr != nil {
+				return "", lastErr
+			}
+			return "", err
+		}
+		zid = pickBestZone(zones)
 	}
 	if zid == "" {
 		return "", fmt.Errorf("no matching Cloudflare zone for %q", domain)
@@ -316,6 +348,24 @@ func (d *CloudflareDDNS) findZoneID(ctx context.Context, domain, token, email st
 	d.zoneCache[domain] = zid
 	d.mu.Unlock()
 	return zid, nil
+}
+
+func (d *CloudflareDDNS) lookupRecord(ctx context.Context, zoneID, domain, token, email, recType string) (recID string, content string, err error) {
+	var recs []struct {
+		ID      string `json:"id"`
+		Name    string `json:"name"`
+		Content string `json:"content"`
+	}
+	q := fmt.Sprintf("/zones/%s/dns_records?type=%s&name=%s", zoneID, recType, url.QueryEscape(domain))
+	if err := d.cfRequest(ctx, http.MethodGet, q, token, email, nil, &recs); err != nil {
+		return "", "", err
+	}
+	for _, r := range recs {
+		if strings.EqualFold(r.Name, domain) {
+			return r.ID, r.Content, nil
+		}
+	}
+	return "", "", nil
 }
 
 func (d *CloudflareDDNS) upsertRecord(ctx context.Context, domain, token, email, recType, ip string) error {
@@ -332,30 +382,6 @@ func (d *CloudflareDDNS) upsertRecord(ctx context.Context, domain, token, email,
 	recID := cache[domain]
 	d.mu.Unlock()
 
-	if recID == "" {
-		var recs []struct {
-			ID      string `json:"id"`
-			Name    string `json:"name"`
-			Content string `json:"content"`
-		}
-		q := fmt.Sprintf("/zones/%s/dns_records?type=%s&name=%s", zoneID, recType, url.QueryEscape(domain))
-		if err := d.cfRequest(ctx, http.MethodGet, q, token, email, nil, &recs); err != nil {
-			return err
-		}
-		for _, r := range recs {
-			if strings.EqualFold(r.Name, domain) {
-				recID = r.ID
-				d.mu.Lock()
-				cache[domain] = recID
-				d.mu.Unlock()
-				if r.Content == ip {
-					return nil // already matches remote record
-				}
-				break
-			}
-		}
-	}
-
 	payload := map[string]any{
 		"type":    recType,
 		"name":    domain,
@@ -363,9 +389,33 @@ func (d *CloudflareDDNS) upsertRecord(ctx context.Context, domain, token, email,
 		"ttl":     1,
 		"proxied": false,
 	}
+
 	if recID != "" {
+		if err := d.cfRequest(ctx, http.MethodPut, fmt.Sprintf("/zones/%s/dns_records/%s", zoneID, recID), token, email, payload, nil); err == nil {
+			return nil
+		}
+		// Stale or deleted record ID in cache: clear cache and re-query once.
+		d.mu.Lock()
+		delete(cache, domain)
+		d.mu.Unlock()
+		recID = ""
+	}
+
+	lookedID, existingContent, err := d.lookupRecord(ctx, zoneID, domain, token, email, recType)
+	if err != nil {
+		return err
+	}
+	if lookedID != "" {
+		recID = lookedID
+		d.mu.Lock()
+		cache[domain] = recID
+		d.mu.Unlock()
+		if existingContent == ip {
+			return nil // already matches remote record
+		}
 		return d.cfRequest(ctx, http.MethodPut, fmt.Sprintf("/zones/%s/dns_records/%s", zoneID, recID), token, email, payload, nil)
 	}
+
 	var created struct {
 		ID string `json:"id"`
 	}

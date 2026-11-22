@@ -981,6 +981,10 @@ func cmdNode(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 }
 
 func cmdCert(store *state.Store, exec reconcile.SystemExecutor, args []string, stdout, stderr io.Writer) int {
+	return cmdCertWithOpts(store, exec, reconcile.ApplyOptions{}, args, stdout, stderr)
+}
+
+func cmdCertWithOpts(store *state.Store, exec reconcile.SystemExecutor, applyOpts reconcile.ApplyOptions, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "inspect" {
 		cb, err1 := os.ReadFile(store.DefaultCert())
 		kb, err2 := os.ReadFile(store.DefaultKey())
@@ -1020,12 +1024,13 @@ func cmdCert(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 		if fs.NArg() > 0 && cn == "localhost" {
 			cn = fs.Arg(0)
 		}
+		certChanged := false
 		if *force {
 			if err := cert.ForceSelfSigned(store.DefaultCert(), store.DefaultKey(), cn); err != nil {
 				fmt.Fprintf(stderr, "self-sign failed: %v\n", err)
 				return 1
 			}
-			reloadCertConsumers(context.Background(), exec, stdout)
+			certChanged = true
 		} else {
 			prevCert, _ := os.ReadFile(store.DefaultCert())
 			if err := cert.EnsureSelfSigned(store.DefaultCert(), store.DefaultKey(), cn); err != nil {
@@ -1033,9 +1038,31 @@ func cmdCert(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 				return 1
 			}
 			afterCert, _ := os.ReadFile(store.DefaultCert())
-			if !bytes.Equal(prevCert, afterCert) {
-				reloadCertConsumers(context.Background(), exec, stdout)
+			certChanged = !bytes.Equal(prevCert, afterCert)
+		}
+		hadCustomExternal := false
+		if st, err := store.Load(); err == nil && st != nil {
+			hadCustomExternal = st.Cert.Mode == "imported" &&
+				((st.Cert.CertFile != "" && st.Cert.CertFile != store.DefaultCert()) ||
+					(st.Cert.KeyFile != "" && st.Cert.KeyFile != store.DefaultKey()))
+			if _, uerr := store.Update(st.Role, func(cur *state.State) error {
+				cur.Cert.Mode = "self_signed"
+				cur.Cert.CertFile = ""
+				cur.Cert.KeyFile = ""
+				return nil
+			}); uerr != nil {
+				fmt.Fprintf(stderr, "update state after self-sign failed: %v\n", uerr)
+				return 1
 			}
+			if hadCustomExternal {
+				if _, rerr := reconcile.Reconcile(context.Background(), store, exec, applyOpts); rerr != nil {
+					fmt.Fprintf(stderr, "reconcile after self-sign failed: %v\n", rerr)
+					return 1
+				}
+			}
+		}
+		if certChanged || hadCustomExternal {
+			reloadCertConsumers(context.Background(), exec, stdout)
 		}
 		fmt.Fprintf(stdout, "Self-signed certificate ready at %s\n", store.DefaultCert())
 		return 0
@@ -1046,7 +1073,8 @@ func cmdCert(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 		}
 		allowSelf := len(rest) > 2 && rest[2] == "--allow-self-signed"
 		var checkDomains []string
-		if st, err := store.Load(); err == nil && st.Server.Domain != "" {
+		st, stErr := store.Load()
+		if stErr == nil && st != nil && st.Server.Domain != "" {
 			checkDomains = append(checkDomains, st.Server.Domain)
 		}
 		rep, changed, err := cert.ImportPair(rest[0], rest[1], store.DefaultCert(), store.DefaultKey(), allowSelf, checkDomains)
@@ -1054,7 +1082,27 @@ func cmdCert(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 			fmt.Fprintf(stderr, "import failed: %v\n", err)
 			return 1
 		}
-		if changed {
+		pathsChanged := false
+		if stErr == nil && st != nil {
+			pathsChanged = (st.Cert.CertFile != "" && st.Cert.CertFile != store.DefaultCert()) ||
+				(st.Cert.KeyFile != "" && st.Cert.KeyFile != store.DefaultKey())
+			if _, uerr := store.Update(st.Role, func(cur *state.State) error {
+				cur.Cert.Mode = "imported"
+				cur.Cert.CertFile = store.DefaultCert()
+				cur.Cert.KeyFile = store.DefaultKey()
+				return nil
+			}); uerr != nil {
+				fmt.Fprintf(stderr, "update state after import failed: %v\n", uerr)
+				return 1
+			}
+			if pathsChanged {
+				if _, rerr := reconcile.Reconcile(context.Background(), store, exec, applyOpts); rerr != nil {
+					fmt.Fprintf(stderr, "reconcile after cert import failed: %v\n", rerr)
+					return 1
+				}
+			}
+		}
+		if changed || pathsChanged {
 			reloadCertConsumers(context.Background(), exec, stdout)
 		}
 		fmt.Fprintf(stdout, "Certificate imported (changed=%v, expires=%s, SANs=%s)\n",

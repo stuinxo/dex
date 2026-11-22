@@ -365,3 +365,88 @@ func TestWave2ViaNginxConflictsAndDokodemoNetwork(t *testing.T) {
 		t.Fatalf("expected invalid dokodemo network=sctp rejected")
 	}
 }
+
+func TestCamouflageDirExtraDomainAndListenAddrValidation(t *testing.T) {
+	// 1. CamouflageDir validation
+	validSrv := func() *State {
+		s := NewDefaultState(RoleServer)
+		s.Server.Domain = "srv.example.com"
+		s.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+		return s
+	}
+
+	sOK := validSrv()
+	sOK.Server.CamouflageDir = "/var/www/camo-site"
+	if err := sOK.Validate(); err != nil {
+		t.Fatalf("expected valid CamouflageDir accepted, got %v", err)
+	}
+
+	badDirs := []string{
+		"/",
+		"relative/dir",
+		"/var/www/../etc",
+		"/var/www/html/",
+		"/var/www/my site",
+		"/var/www/html;return 200",
+		"/var/www/html{x}",
+		"/var/www/html\"x",
+		"/var/www/html'x",
+		"/var/www/$root",
+		"/var/www\\evil",
+		"/var/www/#comment",
+		"/var/www/bad\nline",
+		"/" + strings.Repeat("a", 256),
+	}
+	for _, bad := range badDirs {
+		sBad := validSrv()
+		sBad.Server.CamouflageDir = bad
+		if err := sBad.Validate(); err == nil {
+			t.Errorf("expected invalid CamouflageDir %q rejected", bad)
+		}
+	}
+
+	// 2. ExtraInbound.Domain checked regardless of ViaNginx
+	for _, viaNginx := range []bool{false, true} {
+		sBadDom := validSrv()
+		sBadDom.ExtraInbounds = []ExtraInbound{{
+			Tag:        "ex-inj",
+			Protocol:   "vless-xhttp",
+			ListenPort: 9443,
+			Domain:     "evil.com; return 200",
+			UUID:       "22222222-2222-4222-8222-222222222222",
+			ViaNginx:   viaNginx,
+		}}
+		if err := sBadDom.Validate(); err == nil {
+			t.Errorf("expected invalid ExtraInbound.Domain rejected (viaNginx=%v)", viaNginx)
+		}
+	}
+
+	// 3. Auth.ListenAddr IPv6 syntax & Server port conflict
+	for _, goodAddr := range []string{":8443", "127.0.0.1:8443", "localhost:8443", "[::1]:8443", "[::]:8443"} {
+		sAddr := validSrv()
+		sAddr.Auth.ListenAddr = goodAddr
+		if err := sAddr.Validate(); err != nil {
+			t.Errorf("expected valid ListenAddr %q accepted, got %v", goodAddr, err)
+		}
+	}
+	for _, badAddr := range []string{"8443", "::1:8443", "[::1]", "[fe80::1%eth0]:8443", "evil host:8443", "127.0.0.1:0", "127.0.0.1:70000"} {
+		sAddr := validSrv()
+		sAddr.Auth.ListenAddr = badAddr
+		if err := sAddr.Validate(); err == nil {
+			t.Errorf("expected invalid ListenAddr %q rejected", badAddr)
+		}
+	}
+
+	sConflict := validSrv()
+	sConflict.Auth.ListenAddr = "127.0.0.1:8443"
+	sConflict.ExtraInbounds = []ExtraInbound{{
+		Tag:        "ex-conflict",
+		Protocol:   "vless-xhttp",
+		ListenPort: 8443,
+		Domain:     "ex.example.com",
+		UUID:       "22222222-2222-4222-8222-222222222222",
+	}}
+	if err := sConflict.Validate(); err == nil || !strings.Contains(err.Error(), "port conflict") {
+		t.Fatalf("expected server web-ui port conflict error, got %v", err)
+	}
+}

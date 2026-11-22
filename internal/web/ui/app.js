@@ -7,6 +7,7 @@
   var statusInfo = null;
   var probeResultsMap = {};
   var logSource = null;
+  var lastLogSeq = 0;
   var logsPaused = false;
   var clientAutoProbed = false;
 
@@ -1369,6 +1370,7 @@
     try { await api("POST", "/api/v1/auth/logout", {}); } catch (_) {}
     csrfToken = "";
     clientAutoProbed = false;
+    lastLogSeq = 0;
     if (logSource) { logSource.close(); logSource = null; }
     $("app-view").classList.add("hidden");
     $("login-view").classList.remove("hidden");
@@ -1392,14 +1394,17 @@
 
   function connectLogs() {
     if (logSource) { logSource.close(); }
-    logSource = new EventSource("/api/v1/logs/stream");
+    var url = "/api/v1/logs/stream" + (lastLogSeq > 0 ? ("?since=" + encodeURIComponent(lastLogSeq)) : "");
+    logSource = new EventSource(url);
     logSource.onmessage = function (ev) {
-      if (logsPaused) { return; }
       try {
         var entry = JSON.parse(ev.data);
+        if (entry.seq && entry.seq <= lastLogSeq) { return; }
+        if (entry.seq && entry.seq > lastLogSeq) { lastLogSeq = entry.seq; }
         var box = $("log-box");
-        box.textContent += "[" + (entry.time || "").slice(11, 19) + "] " + entry.level + " [" + entry.source + "] " + entry.message + "\n";
-        box.scrollTop = box.scrollHeight;
+        var src = entry.subsystem || entry.source || "-";
+        box.textContent += "[" + (entry.time || "").slice(11, 19) + "] " + (entry.level || "INFO") + " [" + src + "] " + (entry.message || "") + "\n";
+        if (!logsPaused) { box.scrollTop = box.scrollHeight; }
       } catch (_) {}
     };
   }
@@ -1823,7 +1828,10 @@
     logsPaused = !logsPaused;
     $("btn-logs-toggle").textContent = logsPaused ? "恢复滚动" : "暂停滚动";
   });
-  $("btn-logs-clear").addEventListener("click", function () { $("log-box").textContent = ""; });
+  $("btn-logs-clear").addEventListener("click", function () {
+    $("log-box").textContent = "";
+    lastLogSeq = 0;
+  });
 
   initSession();
 })();

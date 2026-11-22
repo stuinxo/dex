@@ -75,7 +75,8 @@ func (r *Runner) runFailoverTick(ctx context.Context) {
 		return
 	}
 	if st.Role == state.RoleClient && r.Exec != nil {
-		if !r.Exec.ServiceIsActive(ctx, r.Exec.DetectInitSystem(), "dex-xray") {
+		initSys := r.Exec.DetectInitSystem()
+		if !r.Exec.ServiceIsActive(ctx, initSys, "dex-xray") || !r.Exec.ServiceIsActive(ctx, initSys, "dex-nft") {
 			return
 		}
 	}

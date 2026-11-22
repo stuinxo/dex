@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stuinxo/de_GWD/v3/internal/cert"
 	"github.com/stuinxo/de_GWD/v3/internal/cryptoext"
@@ -321,6 +323,10 @@ func TestWave2EndpointsAndSecurity(t *testing.T) {
 	if rec := doReq(http.MethodPost, "/api/v1/cert/self-sign", `{"cn":"web.example.com","force":true}`, true); rec.Code != 200 || !strings.Contains(rec.Body.String(), `"web.example.com"`) {
 		t.Fatalf("cert/self-sign failed: %d %s", rec.Code, rec.Body.String())
 	}
+	afterSelfSign, _ := store.Load()
+	if afterSelfSign.Cert.Mode != "self_signed" {
+		t.Fatalf("expected Cert.Mode=self_signed, got %q", afterSelfSign.Cert.Mode)
+	}
 	impDir := t.TempDir()
 	_ = cert.EnsureSelfSigned(impDir+"/c.pem", impDir+"/k.pem", "imp.example.com")
 	cBytes, _ := io.ReadAll(func() io.Reader { b, _ := state.NewStore(impDir).Load(); _ = b; return strings.NewReader("") }())
@@ -484,5 +490,110 @@ func TestWireGuardAutoKeygenOnPutAndPeerEndpointSync(t *testing.T) {
 	afterPeer, _ := store.Load()
 	if afterPeer.Client.WireGuard.EndpointHost != "home.ddns.example" || afterPeer.Client.WireGuard.ListenPort != 51822 {
 		t.Fatalf("expected persisted WG endpoint/port, got %+v", afterPeer.Client.WireGuard)
+	}
+}
+
+func TestLogsStreamSinceAndSystemAutoUpdateReconcileAndMemoryCaps(t *testing.T) {
+	srv, store, root := setupTestWeb(t, false)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	loginReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/auth/login", strings.NewReader(`{"password":"myPass123"}`))
+	loginReq.Header.Set("Content-Type", "application/json")
+	loginRec := httptest.NewRecorder()
+	srv.ServeHTTP(loginRec, loginReq)
+	if loginRec.Code != 200 {
+		t.Fatalf("login failed: %d", loginRec.Code)
+	}
+	var lData map[string]any
+	_ = json.Unmarshal(loginRec.Body.Bytes(), &lData)
+	csrf := lData["csrf_token"].(string)
+	cookies := loginRec.Result().Cookies()
+
+	doReq := func(method, path, body string) *httptest.ResponseRecorder {
+		var rBody io.Reader
+		if body != "" {
+			rBody = strings.NewReader(body)
+		}
+		req, _ := http.NewRequest(method, ts.URL+path, rBody)
+		req.Header.Set("X-CSRF-Token", csrf)
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. SSE log stream ?since=<seq> and id: <seq> framing
+	srv.Hub.Log("INFO", "probe", "entry-2")
+	snap := srv.Hub.Snapshot()
+	firstSeq := snap[0].Seq
+	sseRec := doReq(http.MethodGet, fmt.Sprintf("/api/v1/logs/stream?once=1&since=%d", firstSeq), "")
+	if sseRec.Code != 200 {
+		t.Fatalf("SSE ?since failed: %d", sseRec.Code)
+	}
+	sseBody := sseRec.Body.String()
+	if strings.Contains(sseBody, "test boot log") || !strings.Contains(sseBody, "entry-2") || !strings.Contains(sseBody, fmt.Sprintf("id: %d\n", snap[len(snap)-1].Seq)) {
+		t.Fatalf("unexpected SSE ?since output:\n%s", sseBody)
+	}
+
+	// 2. PUT /api/v1/system toggling auto_update_core triggers Reconcile (creates/removes dex-core-update.timer)
+	sysRec := doReq(http.MethodPut, "/api/v1/system", `{"auto_update_core":true}`)
+	if sysRec.Code != 200 || !strings.Contains(sysRec.Body.String(), `"reconciled":true`) {
+		t.Fatalf("expected reconciled=true on auto_update_core toggle: %d %s", sysRec.Code, sysRec.Body.String())
+	}
+	timerPath := filepath.Join(root, "etc", "systemd", "system", "dex-core-update.timer")
+	if _, err := os.Stat(timerPath); err != nil {
+		t.Fatalf("expected dex-core-update.timer written on auto_update_core=true, err=%v", err)
+	}
+	sysRec2 := doReq(http.MethodPut, "/api/v1/system", `{"hostname":"only-name-change"}`)
+	if sysRec2.Code != 200 || !strings.Contains(sysRec2.Body.String(), `"reconciled":false`) {
+		t.Fatalf("expected reconciled=false on hostname-only change: %d %s", sysRec2.Code, sysRec2.Body.String())
+	}
+	_ = store
+
+	// 3. Memory cap protection on sessions (<= 256) and failures (<= 4096)
+	srv.sessMu.Lock()
+	srv.sessions["expired-1"] = &sessionRecord{id: "expired-1", expiresAt: time.Now().Add(-time.Minute)}
+	for i := 0; i < maxActiveSessions+10; i++ {
+		id := fmt.Sprintf("s-%d", i)
+		srv.sessions[id] = &sessionRecord{id: id, expiresAt: time.Now().Add(time.Duration(i+1) * time.Minute)}
+	}
+	srv.sessMu.Unlock()
+
+	capLoginReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/auth/login", strings.NewReader(`{"password":"myPass123"}`))
+	capLoginReq.Header.Set("Content-Type", "application/json")
+	capLoginReq.RemoteAddr = "10.99.0.1:12345"
+	capLoginRec := httptest.NewRecorder()
+	srv.ServeHTTP(capLoginRec, capLoginReq)
+	if capLoginRec.Code != 200 {
+		t.Fatalf("login during session cap test failed: %d", capLoginRec.Code)
+	}
+	srv.sessMu.RLock()
+	sessCount := len(srv.sessions)
+	_, hasExpired := srv.sessions["expired-1"]
+	srv.sessMu.RUnlock()
+	if sessCount > maxActiveSessions || hasExpired {
+		t.Fatalf("session cap/cleanup failed: count=%d (max=%d) hasExpired=%v", sessCount, maxActiveSessions, hasExpired)
+	}
+
+	srv.rlMu.Lock()
+	srv.failures["old-expired-ip"] = []time.Time{time.Now().Add(-2 * rateLimitWindow)}
+	for i := 0; i < maxFailureBuckets+20; i++ {
+		ip := fmt.Sprintf("192.0.%d.%d", i/256, i%256)
+		srv.failures[ip] = []time.Time{time.Now().Add(-time.Duration(i%30) * time.Second)}
+	}
+	srv.rlMu.Unlock()
+	srv.recordLoginFailure("198.51.100.250")
+	srv.rlMu.Lock()
+	failCount := len(srv.failures)
+	_, hasOld := srv.failures["old-expired-ip"]
+	srv.rlMu.Unlock()
+	if failCount > maxFailureBuckets || hasOld {
+		t.Fatalf("failures cap/cleanup failed: count=%d (max=%d) hasOld=%v", failCount, maxFailureBuckets, hasOld)
 	}
 }

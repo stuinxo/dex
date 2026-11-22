@@ -765,3 +765,33 @@ func TestRenderNFTablesWireGuardSubnetAndBypass(t *testing.T) {
 		t.Errorf("expected fallback 172.16.66.0/24 in dex_nat")
 	}
 }
+
+func TestRenderSystemdDexNFTExecStopIPv6Cleanup(t *testing.T) {
+	s := state.NewDefaultState(state.RoleClient)
+	s.System.EnableIPv6 = true
+	b := &RenderBundle{NFTClientNeeded: true}
+	files := RenderUnits(s, RenderOptions{InitSystem: "systemd"}, b)
+	var nftUnit RenderedFile
+	found := false
+	for _, f := range files {
+		if f.RelName == "systemd/dex-nft.service" {
+			nftUnit = f
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("missing systemd/dex-nft.service")
+	}
+	content := string(nftUnit.Content)
+	for _, needle := range []string{
+		"ip rule del fwmark 0x9 table 220 priority 100",
+		"ip route del local default dev lo table 220",
+		"ip -6 rule del fwmark 0x9 table 220 priority 100",
+		"ip -6 route del local default dev lo table 220",
+	} {
+		if !strings.Contains(content, needle) {
+			t.Errorf("systemd/dex-nft.service ExecStop missing %q\n%s", needle, content)
+		}
+	}
+}

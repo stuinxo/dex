@@ -190,6 +190,7 @@ func TestUpdateComponentsAtomicAndCleanupV2(t *testing.T) {
 
 	dexSum := sha256.Sum256(dexELF)
 	xrayZipSum := sha256.Sum256(xrayZip)
+	mosZipSum := sha256.Sum256(mosZip)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -203,6 +204,8 @@ func TestUpdateComponentsAtomicAndCleanupV2(t *testing.T) {
 			fmt.Fprintf(w, "MD5= 0000\nSHA2-256= %s\n", hex.EncodeToString(xrayZipSum[:]))
 		case "/mosdns/mosdns-linux-amd64.zip":
 			_, _ = w.Write(mosZip)
+		case "/mosdns/release.json":
+			fmt.Fprintf(w, `{"assets":[{"name":"mosdns-linux-amd64.zip","digest":"sha256:%s"}]}`, hex.EncodeToString(mosZipSum[:]))
 		default:
 			http.NotFound(w, r)
 		}
@@ -216,14 +219,15 @@ func TestUpdateComponentsAtomicAndCleanupV2(t *testing.T) {
 
 	exec := &fakeOpsExec{}
 	cfg := OpsConfig{
-		Client:          srv.Client(),
-		DexReleaseBase:  srv.URL + "/dex",
-		XrayReleaseBase: srv.URL + "/xray",
-		MosDNSBase:      srv.URL + "/mosdns",
-		DexBinPath:      filepath.Join(binDir, "dex"),
-		XrayBinPath:     filepath.Join(binDir, "xray"),
-		MosDNSBinPath:   filepath.Join(binDir, "mosdns"),
-		GOARCH:          "amd64",
+		Client:              srv.Client(),
+		DexReleaseBase:      srv.URL + "/dex",
+		XrayReleaseBase:     srv.URL + "/xray",
+		MosDNSBase:          srv.URL + "/mosdns",
+		MosDNSReleaseAPIURL: srv.URL + "/mosdns/release.json",
+		DexBinPath:          filepath.Join(binDir, "dex"),
+		XrayBinPath:         filepath.Join(binDir, "xray"),
+		MosDNSBinPath:       filepath.Join(binDir, "mosdns"),
+		GOARCH:              "amd64",
 	}
 
 	var out bytes.Buffer
@@ -676,5 +680,84 @@ func TestMenuOption8RestartsDaemon(t *testing.T) {
 	}
 	if strings.Join(exec.restarted, ",") != "dex-daemon" {
 		t.Fatalf("expected dex-daemon restarted after option 8 port change, got %v", exec.restarted)
+	}
+}
+
+func TestUpdateMosDNSVerifySHA256AndRejectTamper(t *testing.T) {
+	goodELF := []byte("\x7fELF\x02\x01\x01\x00good-mosdns")
+	evilELF := []byte("\x7fELF\x02\x01\x01\x00evil-mosdns")
+	goodZip := makeTestZip(t, "mosdns", goodELF)
+	evilZip := makeTestZip(t, "mosdns", evilELF)
+	goodSum := sha256.Sum256(goodZip)
+	goodHex := hex.EncodeToString(goodSum[:])
+
+	serveZip := goodZip
+	serveShaSumFile := true
+	serveReleaseAPI := true
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/mosdns/mosdns-linux-amd64.zip":
+			_, _ = w.Write(serveZip)
+		case "/mosdns/mosdns-linux-amd64.zip.sha256sum":
+			if !serveShaSumFile {
+				http.NotFound(w, r)
+				return
+			}
+			fmt.Fprintf(w, "%s  mosdns-linux-amd64.zip\n", goodHex)
+		case "/mosdns/release.json":
+			if !serveReleaseAPI {
+				http.NotFound(w, r)
+				return
+			}
+			fmt.Fprintf(w, `{"assets":[{"name":"mosdns-linux-amd64.zip","digest":"sha256:%s"}]}`, goodHex)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	binPath := filepath.Join(dir, "mosdns")
+	store := state.NewStore(filepath.Join(dir, "state"))
+	_ = store.Save(state.NewDefaultState(state.RoleClient))
+
+	cfg := OpsConfig{
+		Client:              srv.Client(),
+		MosDNSBase:          srv.URL + "/mosdns",
+		MosDNSReleaseAPIURL: srv.URL + "/mosdns/release.json",
+		MosDNSBinPath:       binPath,
+		GOARCH:              "amd64",
+	}
+
+	var out bytes.Buffer
+	// 1. Succeeds via .sha256sum
+	if err := UpdateComponents(context.Background(), store, &fakeOpsExec{}, cfg, "mosdns", "latest", &out); err != nil {
+		t.Fatalf("mosdns update with .sha256sum failed: %v", err)
+	}
+	got, _ := os.ReadFile(binPath)
+	if !bytes.Equal(got, goodELF) {
+		t.Fatalf("unexpected binary after .sha256sum update")
+	}
+
+	// 2. Tampered zip rejected when verified via .sha256sum or Release API; existing binary preserved
+	serveZip = evilZip
+	if err := UpdateComponents(context.Background(), store, &fakeOpsExec{}, cfg, "mosdns", "latest", &out); err == nil || !strings.Contains(err.Error(), "sha256 mismatch") {
+		t.Fatalf("expected sha256 mismatch for tampered zip (.sha256sum), got %v", err)
+	}
+	serveShaSumFile = false
+	if err := UpdateComponents(context.Background(), store, &fakeOpsExec{}, cfg, "mosdns", "latest", &out); err == nil || !strings.Contains(err.Error(), "sha256 mismatch") {
+		t.Fatalf("expected sha256 mismatch for tampered zip (release API), got %v", err)
+	}
+	afterTamper, _ := os.ReadFile(binPath)
+	if !bytes.Equal(afterTamper, goodELF) {
+		t.Fatalf("tampered zip overwrote existing mosdns binary")
+	}
+
+	// 3. Missing both .sha256sum and Release API metadata is rejected
+	serveZip = goodZip
+	serveReleaseAPI = false
+	if err := UpdateComponents(context.Background(), store, &fakeOpsExec{}, cfg, "mosdns", "latest", &out); err == nil {
+		t.Fatalf("expected error when neither .sha256sum nor release API is available")
 	}
 }

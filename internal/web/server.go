@@ -44,6 +44,8 @@ const (
 	sessionTTL         = 12 * time.Hour
 	rateLimitWindow    = 60 * time.Second
 	rateLimitMaxFails  = 10
+	maxActiveSessions  = 256
+	maxFailureBuckets  = 4096
 	secretKeepSentinel = "********"
 )
 
@@ -225,15 +227,40 @@ func (s *Server) recordLoginFailure(ip string) {
 	now := time.Now()
 	s.rlMu.Lock()
 	defer s.rlMu.Unlock()
-	list := s.failures[ip]
-	var recent []time.Time
-	for _, t := range list {
-		if now.Sub(t) < rateLimitWindow {
-			recent = append(recent, t)
+	for k, tsList := range s.failures {
+		var recent []time.Time
+		for _, t := range tsList {
+			if now.Sub(t) < rateLimitWindow {
+				recent = append(recent, t)
+			}
+		}
+		if len(recent) == 0 {
+			delete(s.failures, k)
+		} else {
+			s.failures[k] = recent
 		}
 	}
-	recent = append(recent, now)
-	s.failures[ip] = recent
+	s.failures[ip] = append(s.failures[ip], now)
+	for len(s.failures) > maxFailureBuckets {
+		var oldestIP string
+		var oldestTime time.Time
+		first := true
+		for k, tsList := range s.failures {
+			if k == ip && len(s.failures) > 1 {
+				continue
+			}
+			latest := tsList[len(tsList)-1]
+			if first || latest.Before(oldestTime) {
+				first = false
+				oldestTime = latest
+				oldestIP = k
+			}
+		}
+		if oldestIP == "" {
+			break
+		}
+		delete(s.failures, oldestIP)
+	}
 }
 
 func (s *Server) clearLoginFailures(ip string) {
@@ -355,12 +382,34 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "session generation failed")
 		return
 	}
+	now := time.Now()
 	rec := &sessionRecord{
 		id:        sid,
 		csrfToken: csrf,
-		expiresAt: time.Now().Add(sessionTTL),
+		expiresAt: now.Add(sessionTTL),
 	}
 	s.sessMu.Lock()
+	for id, existing := range s.sessions {
+		if existing == nil || now.After(existing.expiresAt) {
+			delete(s.sessions, id)
+		}
+	}
+	for len(s.sessions) >= maxActiveSessions {
+		var oldestID string
+		var oldestExp time.Time
+		first := true
+		for id, existing := range s.sessions {
+			if first || existing.expiresAt.Before(oldestExp) {
+				first = false
+				oldestExp = existing.expiresAt
+				oldestID = id
+			}
+		}
+		if oldestID == "" {
+			break
+		}
+		delete(s.sessions, oldestID)
+	}
 	s.sessions[sid] = rec
 	s.sessMu.Unlock()
 
@@ -1753,7 +1802,7 @@ func (s *Server) handleCertSelfSign(w http.ResponseWriter, r *http.Request, _ *s
 		return
 	}
 	_, _ = s.Store.Update(st.Role, func(cur *state.State) error {
-		cur.Cert.Mode = "self-signed"
+		cur.Cert.Mode = "self_signed"
 		cur.Cert.CertFile = ""
 		cur.Cert.KeyFile = ""
 		return nil
@@ -1795,12 +1844,16 @@ func (s *Server) handlePutSystem(w http.ResponseWriter, r *http.Request, _ *sess
 		writeJSONError(w, http.StatusBadRequest, "invalid system JSON: "+err.Error())
 		return
 	}
+	if req.Hostname != nil && len(strings.TrimSpace(*req.Hostname)) > 128 {
+		writeJSONError(w, http.StatusBadRequest, "hostname too long (max 128)")
+		return
+	}
 	cur, err := s.Store.Load()
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	updated, err := s.Store.Update(cur.Role, func(dst *state.State) error {
+	mutate := func(dst *state.State) error {
 		if req.Hostname != nil {
 			h := strings.TrimSpace(*req.Hostname)
 			if len(h) > 128 {
@@ -1812,17 +1865,30 @@ func (s *Server) handlePutSystem(w http.ResponseWriter, r *http.Request, _ *sess
 			dst.System.AutoUpdateCore = *req.AutoUpdateCore
 		}
 		return nil
-	})
-	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
-		return
 	}
-	s.Hub.Log("INFO", "system", fmt.Sprintf("updated system settings (hostname=%q)", updated.System.Hostname))
+	needReconcile := req.AutoUpdateCore != nil && *req.AutoUpdateCore != cur.System.AutoUpdateCore
+	var updated *state.State
+	if needReconcile {
+		updated, _, err = reconcile.UpdateAndReconcile(r.Context(), s.Store, cur.Role, s.Exec, s.ApplyOpts, mutate)
+		if err != nil {
+			s.Hub.Log("ERROR", "system", err.Error())
+			writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+	} else {
+		updated, err = s.Store.Update(cur.Role, mutate)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	s.Hub.Log("INFO", "system", fmt.Sprintf("updated system settings (hostname=%q, auto_update_core=%v)", updated.System.Hostname, updated.System.AutoUpdateCore))
 	redacted, secrets := redactStateForAPI(updated)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"state":   redacted,
-		"secrets": secrets,
+		"ok":         true,
+		"reconciled": needReconcile,
+		"state":      redacted,
+		"secrets":    secrets,
 	})
 }
 
@@ -1851,12 +1917,23 @@ func (s *Server) handleLogsStream(w http.ResponseWriter, r *http.Request, _ *ses
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	ch, cancel := s.Hub.Subscribe()
+	var sinceSeq uint64
+	sinceStr := strings.TrimSpace(r.URL.Query().Get("since"))
+	if sinceStr == "" {
+		sinceStr = strings.TrimSpace(r.Header.Get("Last-Event-ID"))
+	}
+	if sinceStr != "" {
+		if parsed, err := strconv.ParseUint(sinceStr, 10, 64); err == nil {
+			sinceSeq = parsed
+		}
+	}
+
+	snap, ch, cancel := s.Hub.SubscribeWithSnapshot(sinceSeq)
 	defer cancel()
 
-	for _, entry := range s.Hub.Snapshot() {
+	for _, entry := range snap {
 		b, _ := json.Marshal(entry)
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+		_, _ = fmt.Fprintf(w, "id: %d\ndata: %s\n\n", entry.Seq, b)
 	}
 	flusher.Flush()
 
@@ -1876,7 +1953,7 @@ func (s *Server) handleLogsStream(w http.ResponseWriter, r *http.Request, _ *ses
 				return
 			}
 			b, _ := json.Marshal(entry)
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+			_, _ = fmt.Fprintf(w, "id: %d\ndata: %s\n\n", entry.Seq, b)
 			flusher.Flush()
 		case <-keepalive.C:
 			_, _ = fmt.Fprint(w, ": ping\n\n")

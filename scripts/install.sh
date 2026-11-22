@@ -167,6 +167,61 @@ parse_xray_dgst() {
   awk '/^(SHA2-256|SHA256)=/ {sub(/^(SHA2-256|SHA256)=[[:space:]]*/, ""); print tolower($1); exit}' "$1"
 }
 
+fetch_api_json() {
+  url="$1"
+  out="$2"
+  for prefix in DIRECT ${GH_PROXY:-} $GH_MIRRORS; do
+    [ "$prefix" = "DIRECT" ] && prefix=""
+    if curl -fsSL --connect-timeout 8 --max-time 30 -H "Accept: application/vnd.github+json" -o "$out" "${prefix}${url}" 2>/dev/null \
+      && [ -s "$out" ] \
+      && grep -q '"assets"' "$out"; then
+      return 0
+    fi
+    rm -f "$out"
+  done
+  return 1
+}
+
+parse_mosdns_api_digest() {
+  api_json="$1"
+  asset_name="$2"
+  tr -d '\r\n' < "$api_json" | awk -v asset="$asset_name" '
+    {
+      gsub(/"name"[[:space:]]*:/, "\n\"name\":")
+      n = split($0, parts, "\n")
+      for (i = 1; i <= n; i++) {
+        if (index(parts[i], "\"" asset "\"") > 0 && match(parts[i], /"digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-fA-F]+"/)) {
+          s = substr(parts[i], RSTART, RLENGTH)
+          sub(/^.*"sha256:/, "", s)
+          sub(/".*$/, "", s)
+          print tolower(s)
+          exit
+        }
+      }
+    }
+  '
+}
+
+fetch_verified_rule_dat() {
+  name="$1"
+  url="$2"
+  dst="$3"
+  [ -s "$dst" ] && return 0
+  tmp_dat=$(mktemp "${STATE_DIR}/rules/.${name}.XXXXXX")
+  tmp_sum=$(mktemp "${STATE_DIR}/rules/.${name}.sum.XXXXXX")
+  if gh_fetch "$url" "$tmp_dat" \
+    && gh_fetch "${url}.sha256sum" "$tmp_sum" \
+    && verify_sum_in_list "$tmp_dat" "$tmp_sum" "$name"; then
+    chmod 0644 "$tmp_dat"
+    mv -f "$tmp_dat" "$dst"
+    rm -f "$tmp_sum"
+    return 0
+  fi
+  rm -f "$tmp_dat" "$tmp_sum" "$dst"
+  warn "Failed to fetch or verify SHA256 for ${name}"
+  return 0
+}
+
 install_xray_core() {
   [ -x "$XRAY_BIN" ] && return 0
   zip_name="Xray-linux-${XRAY_ARCH}.zip"
@@ -190,16 +245,15 @@ install_xray_core() {
     cp -f "$local_zip" "$work_dir/${zip_name}"
     if [ -f "${local_zip}.dgst" ]; then
       expected=$(parse_xray_dgst "${local_zip}.dgst")
-      [ -n "$expected" ] && [ "$(sha256_of "$work_dir/${zip_name}")" = "$expected" ] || die "Xray offline SHA256 mismatch"
+      [ -n "$expected" ] && [ "$(sha256_of "$work_dir/${zip_name}")" = "$expected" ] || { rm -rf "$work_dir"; die "Xray offline SHA256 mismatch"; }
     fi
   else
     url="https://github.com/XTLS/Xray-core/releases/latest/download/${zip_name}"
     say "[*] Downloading Xray-core (${XRAY_ARCH})..."
-    gh_fetch "$url" "$work_dir/${zip_name}" || die "Failed to download Xray"
-    if gh_fetch "${url}.dgst" "$work_dir/${zip_name}.dgst"; then
-      expected=$(parse_xray_dgst "$work_dir/${zip_name}.dgst")
-      [ -n "$expected" ] && [ "$(sha256_of "$work_dir/${zip_name}")" = "$expected" ] || die "Xray SHA256 verification failed"
-    fi
+    gh_fetch "$url" "$work_dir/${zip_name}" || { rm -rf "$work_dir"; die "Failed to download Xray"; }
+    gh_fetch "${url}.dgst" "$work_dir/${zip_name}.dgst" || { rm -rf "$work_dir"; die "Failed to download Xray .dgst"; }
+    expected=$(parse_xray_dgst "$work_dir/${zip_name}.dgst")
+    [ -n "$expected" ] && [ "$(sha256_of "$work_dir/${zip_name}")" = "$expected" ] || { rm -rf "$work_dir"; die "Xray SHA256 verification failed"; }
   fi
 
   unzip -oqj "$work_dir/${zip_name}" xray -d "$work_dir" || die "Failed to extract xray binary"
@@ -229,10 +283,21 @@ install_mosdns_and_rules() {
     work_dir=$(mktemp -d /tmp/dex-mos.XXXXXX)
     if [ -n "$local_zip" ]; then
       cp -f "$local_zip" "$work_dir/${zip_name}"
+      if [ -f "${local_zip}.sha256sum" ]; then
+        verify_sum_in_list "$work_dir/${zip_name}" "${local_zip}.sha256sum" "$zip_name" \
+          || { rm -rf "$work_dir"; die "MosDNS offline SHA256 mismatch"; }
+      fi
     else
       say "[*] Downloading MosDNS (${MOS_ARCH})..."
       gh_fetch "https://github.com/IrineSistiana/mosdns/releases/latest/download/${zip_name}" "$work_dir/${zip_name}" \
         || { rm -rf "$work_dir"; die "Failed to download MosDNS"; }
+      fetch_api_json "https://api.github.com/repos/IrineSistiana/mosdns/releases/latest" "$work_dir/mosdns-release.json" \
+        || { rm -rf "$work_dir"; die "Failed to fetch MosDNS release metadata for SHA256 verification"; }
+      expected=$(parse_mosdns_api_digest "$work_dir/mosdns-release.json" "$zip_name")
+      printf '%s' "$expected" | grep -Eq '^[0-9a-f]{64}$' \
+        || { rm -rf "$work_dir"; die "Missing valid MosDNS SHA256 digest in release metadata"; }
+      [ "$(sha256_of "$work_dir/${zip_name}")" = "$expected" ] \
+        || { rm -rf "$work_dir"; die "MosDNS SHA256 verification failed"; }
     fi
     unzip -oqj "$work_dir/${zip_name}" mosdns -d "$work_dir" || { rm -rf "$work_dir"; die "Failed to extract mosdns"; }
     is_elf "$work_dir/mosdns" || { rm -rf "$work_dir"; die "Extracted mosdns is not ELF"; }
@@ -242,12 +307,8 @@ install_mosdns_and_rules() {
     say "[+] Installed MosDNS to $MOSDNS_BIN"
   fi
 
-  if [ ! -s "${STATE_DIR}/rules/geoip.dat" ]; then
-    gh_fetch "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" "${STATE_DIR}/rules/geoip.dat" || warn "Failed to fetch geoip.dat"
-  fi
-  if [ ! -s "${STATE_DIR}/rules/geosite.dat" ]; then
-    gh_fetch "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" "${STATE_DIR}/rules/geosite.dat" || warn "Failed to fetch geosite.dat"
-  fi
+  fetch_verified_rule_dat "geoip.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" "${STATE_DIR}/rules/geoip.dat"
+  fetch_verified_rule_dat "geosite.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" "${STATE_DIR}/rules/geosite.dat"
   if [ ! -s "${STATE_DIR}/rules/IPchnroute" ]; then
     gh_fetch "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text/cn.txt" "${STATE_DIR}/rules/IPchnroute" || warn "Failed to fetch IPchnroute"
   fi

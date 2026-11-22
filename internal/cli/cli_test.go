@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/stuinxo/de_GWD/v3/internal/cert"
+	"github.com/stuinxo/de_GWD/v3/internal/reconcile"
 	"github.com/stuinxo/de_GWD/v3/internal/state"
 )
 
@@ -217,7 +218,7 @@ func TestWave2ServerExtraNodeCertWGCommands(t *testing.T) {
 	}
 
 	// 2. Extra protocols + disable-all
-	if code, _, errOut := run("extra", "add-xhttp", "--port", "8443", "--domain", "x.example.com"); code != 0 {
+	if code, _, errOut := run("extra", "add-xhttp", "--port", "8446", "--domain", "x.example.com"); code != 0 {
 		t.Fatalf("extra add-xhttp failed: %s", errOut)
 	}
 	if code, _, errOut := run("extra", "add-vless-ws", "--port", "8444", "--domain", "v.example.com"); code != 0 {
@@ -362,5 +363,70 @@ func TestHTTPSRedirectHandler(t *testing.T) {
 				t.Fatalf("unsafe redirect target %q", loc)
 			}
 		})
+	}
+}
+
+func TestCmdCertSyncsStateAndReconcilesExternalPaths(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "root")
+	stateDir := filepath.Join(root, "etc", "dex")
+	store := state.NewStore(stateDir)
+
+	extCert := filepath.Join(dir, "ext.cer")
+	extKey := filepath.Join(dir, "ext.key")
+	if err := cert.EnsureSelfSigned(extCert, extKey, "srv.example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	s := state.NewDefaultState(state.RoleServer)
+	s.Server.Domain = "srv.example.com"
+	s.Server.TLSMode = "nginx"
+	s.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	s.Cert.Mode = "imported"
+	s.Cert.CertFile = extCert
+	s.Cert.KeyFile = extKey
+	if err := store.Save(s); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := &fakeOpsExec{
+		activeSvcs: map[string]bool{"nginx": true, "dex-xray": true, "dex-doh": true, "dex-daemon": true},
+	}
+	opts := reconcile.ApplyOptions{RootPrefix: root}
+	var out, errBuf bytes.Buffer
+
+	// 1. self-sign --force clears external paths, sets Mode="self_signed", and reconciles nginx config back to DefaultCert()
+	if code := cmdCertWithOpts(store, exec, opts, []string{"self-sign", "--force", "srv.example.com"}, &out, &errBuf); code != 0 {
+		t.Fatalf("cmdCert self-sign failed: code=%d err=%q", code, errBuf.String())
+	}
+	stAfterSelf, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stAfterSelf.Cert.Mode != "self_signed" || stAfterSelf.Cert.CertFile != "" || stAfterSelf.Cert.KeyFile != "" {
+		t.Fatalf("unexpected cert state after self-sign: %+v", stAfterSelf.Cert)
+	}
+	nginxConf, err := os.ReadFile(filepath.Join(root, "etc", "nginx", "conf.d", "dex-server.conf"))
+	if err != nil || !strings.Contains(string(nginxConf), store.DefaultCert()) {
+		t.Fatalf("expected nginx config reconciled to default cert path %q, err=%v", store.DefaultCert(), err)
+	}
+
+	// 2. import updates Mode="imported", CertFile=DefaultCert, KeyFile=DefaultKey, and reconciles when previous paths were external
+	_, _ = store.Update(state.RoleServer, func(cur *state.State) error {
+		cur.Cert.CertFile = extCert
+		cur.Cert.KeyFile = extKey
+		return nil
+	})
+	out.Reset()
+	errBuf.Reset()
+	if code := cmdCertWithOpts(store, exec, opts, []string{"import", extCert, extKey, "--allow-self-signed"}, &out, &errBuf); code != 0 {
+		t.Fatalf("cmdCert import failed: code=%d err=%q", code, errBuf.String())
+	}
+	stAfterImp, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stAfterImp.Cert.Mode != "imported" || stAfterImp.Cert.CertFile != store.DefaultCert() || stAfterImp.Cert.KeyFile != store.DefaultKey() {
+		t.Fatalf("unexpected cert state after import: %+v", stAfterImp.Cert)
 	}
 }

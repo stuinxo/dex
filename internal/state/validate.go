@@ -3,10 +3,13 @@ package state
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/stuinxo/de_GWD/v3/internal/socks5out"
 )
@@ -53,19 +56,28 @@ func (s *State) Validate() error {
 	}
 
 	if s.Auth.ListenAddr != "" {
-		if _, portStr, ok := strings.Cut(s.Auth.ListenAddr, ":"); ok && portStr != "" {
-			p, err := strconv.Atoi(portStr)
-			if err != nil || p < 1 || p > 65535 {
-				return fmt.Errorf("invalid auth.listen_addr %q", s.Auth.ListenAddr)
-			}
-			if s.Role == RoleClient {
-				if err := claimPort("tcp", p, "web-ui"); err != nil {
-					return err
-				}
-			}
-		} else {
+		host, portStr, err := net.SplitHostPort(s.Auth.ListenAddr)
+		if err != nil || portStr == "" {
 			return fmt.Errorf("invalid auth.listen_addr %q", s.Auth.ListenAddr)
 		}
+		p, err := strconv.Atoi(portStr)
+		if err != nil || p < 1 || p > 65535 {
+			return fmt.Errorf("invalid auth.listen_addr %q", s.Auth.ListenAddr)
+		}
+		if host != "" && host != "localhost" {
+			if ip, perr := netip.ParseAddr(host); perr != nil || ip.Zone() != "" {
+				return fmt.Errorf("invalid auth.listen_addr %q", s.Auth.ListenAddr)
+			}
+		}
+		if s.Role == RoleClient || s.Role == RoleServer {
+			if err := claimPort("tcp", p, "web-ui"); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := validateCamouflageDir(s.Server.CamouflageDir); err != nil {
+		return err
 	}
 
 	// Client-specific checks
@@ -439,6 +451,11 @@ func (s *State) Validate() error {
 			return fmt.Errorf("extra_inbounds: duplicate tag %q", ex.Tag)
 		}
 		extraTags[ex.Tag] = struct{}{}
+		if domTrim := strings.TrimSpace(ex.Domain); domTrim != "" {
+			if !socks5out.IsValidAddress(domTrim) {
+				return fmt.Errorf("extra %q: invalid domain %q", ex.Tag, ex.Domain)
+			}
+		}
 		protoNet := "tcp"
 		if ex.Protocol == "dokodemo" {
 			if ex.Network != "" && !isValidNetProto(ex.Network) {
@@ -630,4 +647,25 @@ func hasControlChar(s string) bool {
 		}
 	}
 	return false
+}
+
+func validateCamouflageDir(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	if len(dir) > 256 {
+		return fmt.Errorf("server.camouflage_dir: too long (%d > 256)", len(dir))
+	}
+	if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir || dir == "/" {
+		return fmt.Errorf("server.camouflage_dir: must be a clean absolute path other than / (got %q)", dir)
+	}
+	if hasControlChar(dir) || strings.ContainsAny(dir, " \t\r\n;{}\"'$\\#") {
+		return fmt.Errorf("server.camouflage_dir: contains disallowed whitespace or nginx characters (%q)", dir)
+	}
+	for _, r := range dir {
+		if unicode.IsSpace(r) {
+			return fmt.Errorf("server.camouflage_dir: contains whitespace (%q)", dir)
+		}
+	}
+	return nil
 }

@@ -296,7 +296,7 @@ func TestWave2FailoverSkipsWhenProxyPaused(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	exec := &stubDaemonExec{active: map[string]bool{"dex-xray": false}}
+	exec := &stubDaemonExec{active: map[string]bool{"dex-xray": false, "dex-nft": true}}
 	runner := NewRunner(store, exec, NewTaskHub(10))
 	probed := 0
 	runner.Failover.ProbeEgress = func(context.Context) bool {
@@ -310,10 +310,141 @@ func TestWave2FailoverSkipsWhenProxyPaused(t *testing.T) {
 		t.Fatalf("expected failover skipped while dex-xray inactive, got probed=%d", probed)
 	}
 
-	// Once dex-xray is active, failover tick runs normally.
+	// While dex-xray is active but dex-nft is inactive, failover tick must also skip probing.
 	exec.active["dex-xray"] = true
+	exec.active["dex-nft"] = false
+	runner.runFailoverTick(context.Background())
+	if probed != 0 {
+		t.Fatalf("expected failover skipped while dex-nft inactive, got probed=%d", probed)
+	}
+
+	// Once both dex-xray and dex-nft are active, failover tick runs normally.
+	exec.active["dex-nft"] = true
 	runner.runFailoverTick(context.Background())
 	if probed != 1 {
-		t.Fatalf("expected failover to probe when dex-xray active, got probed=%d", probed)
+		t.Fatalf("expected failover to probe when dex-xray and dex-nft active, got probed=%d", probed)
+	}
+}
+
+func TestCloudflareDDNSZoneLookupMoreThan50AndCacheSelfHeal(t *testing.T) {
+	var mu sync.Mutex
+	var zoneQueries []string
+	recordContent := "198.51.100.1"
+	currentRecID := "r-old"
+	putCount := 0
+
+	cfSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/zones":
+			name := r.URL.Query().Get("name")
+			zoneQueries = append(zoneQueries, r.URL.RawQuery)
+			if name == "example.com" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"success": true,
+					"result":  []map[string]string{{"id": "z-exact", "name": "example.com"}},
+				})
+				return
+			}
+			// Simulate >50-domain account where /zones?per_page=50 omits example.com
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"result":  []map[string]string{},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/zones/z-exact/dns_records":
+			var list []map[string]string
+			if currentRecID != "" {
+				list = append(list, map[string]string{"id": currentRecID, "name": "a.b.example.com", "content": recordContent})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "result": list})
+		case r.Method == http.MethodPut && r.URL.Path == "/zones/z-exact/dns_records/r-old":
+			// First time succeeds; once deleted externally, returns 404
+			if currentRecID != "r-old" {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "errors": []string{"not found"}})
+				return
+			}
+			putCount++
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			recordContent = body["content"].(string)
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "result": map[string]string{"id": "r-old"}})
+		case r.Method == http.MethodPut && r.URL.Path == "/zones/z-exact/dns_records/r-new":
+			if currentRecID != "r-new" {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "errors": []string{"not found"}})
+				return
+			}
+			putCount++
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			recordContent = body["content"].(string)
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "result": map[string]string{"id": "r-new"}})
+		case r.Method == http.MethodPost && r.URL.Path == "/zones/z-exact/dns_records":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			recordContent = body["content"].(string)
+			currentRecID = "r-created"
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "result": map[string]string{"id": "r-created"}})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer cfSrv.Close()
+
+	ddns := NewCloudflareDDNS(NewTaskHub(10))
+	ddns.BaseURL = cfSrv.URL
+	curIP := "203.0.113.10"
+	ddns.FetchPublic4 = func(context.Context) (string, error) { return curIP, nil }
+
+	// 1. Multi-level subdomain queries name=a.b.example.com -> b.example.com -> example.com
+	res1, err := ddns.SyncOnce(context.Background(), "a.b.example.com", "tok", false, false)
+	if err != nil || !res1.Updated4 || recordContent != "203.0.113.10" {
+		t.Fatalf("multi-level zone lookup failed: res=%+v err=%v", res1, err)
+	}
+	if len(zoneQueries) < 3 || zoneQueries[0] != "name=a.b.example.com" || zoneQueries[1] != "name=b.example.com" || zoneQueries[2] != "name=example.com" {
+		t.Fatalf("unexpected zone query sequence: %v", zoneQueries)
+	}
+
+	// 2. Simulate external replacement of r-old -> r-new; cached PUT fails and self-heals
+	mu.Lock()
+	currentRecID = "r-new"
+	mu.Unlock()
+	curIP = "203.0.113.20"
+	res2, err := ddns.SyncOnce(context.Background(), "a.b.example.com", "tok", false, false)
+	if err != nil || !res2.Updated4 || recordContent != "203.0.113.20" {
+		t.Fatalf("stale recCache self-heal to new record failed: res=%+v err=%v", res2, err)
+	}
+
+	// 3. Simulate external deletion of r-new; cached PUT fails and falls back to POST
+	mu.Lock()
+	currentRecID = ""
+	mu.Unlock()
+	curIP = "203.0.113.30"
+	res3, err := ddns.SyncOnce(context.Background(), "a.b.example.com", "tok", false, false)
+	if err != nil || !res3.Updated4 || recordContent != "203.0.113.30" || currentRecID != "r-created" {
+		t.Fatalf("stale recCache self-heal to POST failed: res=%+v err=%v recID=%q", res3, err, currentRecID)
+	}
+}
+
+func TestTaskHubSeqAndSubscribeWithSnapshot(t *testing.T) {
+	hub := NewTaskHub(10)
+	hub.Log("INFO", "boot", "m1")
+	hub.Log("INFO", "boot", "m2")
+
+	snap, ch, cancel := hub.SubscribeWithSnapshot(1)
+	defer cancel()
+	if len(snap) != 1 || snap[0].Seq != 2 || snap[0].Message != "m2" {
+		t.Fatalf("unexpected snapshot since seq 1: %+v", snap)
+	}
+	hub.Log("WARN", "daemon", "m3")
+	select {
+	case got := <-ch:
+		if got.Seq != 3 || got.Message != "m3" {
+			t.Fatalf("unexpected live entry: %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for live entry")
 	}
 }
