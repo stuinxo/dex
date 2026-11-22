@@ -38,6 +38,10 @@ func RenderSysctl(s *state.State, opts RenderOptions) (RenderedFile, bool) {
 	b.WriteString("net.ipv4.tcp_slow_start_after_idle = 0\n")
 	if s.System.EnableIPv6 {
 		b.WriteString("net.ipv6.conf.all.forwarding = 1\n")
+		b.WriteString("net.ipv6.conf.default.forwarding = 1\n")
+	} else {
+		b.WriteString("net.ipv6.conf.all.forwarding = 0\n")
+		b.WriteString("net.ipv6.conf.default.forwarding = 0\n")
 	}
 
 	return RenderedFile{

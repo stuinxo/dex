@@ -29,11 +29,33 @@ func freedomFinalRules() map[string]any {
 	}
 }
 
-func buildFreedomOutbound(tag string, mark int, redirect string) map[string]any {
-	settings := freedomFinalRules()
-	if redirect != "" {
-		settings["redirect"] = redirect
+func serverDirectFreedomOutbound(tag string, mark int) map[string]any {
+	settings := map[string]any{
+		"finalRules": []map[string]any{
+			{
+				"action": "block",
+				"ip": []string{
+					"0.0.0.0/8",
+					"127.0.0.0/8",
+					"10.0.0.0/8",
+					"100.64.0.0/10",
+					"169.254.0.0/16",
+					"172.16.0.0/12",
+					"192.168.0.0/16",
+					"224.0.0.0/4",
+					"::1/128",
+					"fc00::/7",
+					"fe80::/10",
+					"ff00::/8",
+				},
+			},
+			{"action": "allow", "ip": []string{"0.0.0.0/0", "::/0"}},
+		},
 	}
+	return buildFreedomOutboundWithSettings(tag, mark, settings)
+}
+
+func buildFreedomOutboundWithSettings(tag string, mark int, settings map[string]any) map[string]any {
 	sockopt := map[string]any{
 		"tcpFastOpen": true,
 		"tcpNoDelay":  true,
@@ -49,6 +71,14 @@ func buildFreedomOutbound(tag string, mark int, redirect string) map[string]any 
 			"sockopt": sockopt,
 		},
 	}
+}
+
+func buildFreedomOutbound(tag string, mark int, redirect string) map[string]any {
+	settings := freedomFinalRules()
+	if redirect != "" {
+		settings["redirect"] = redirect
+	}
+	return buildFreedomOutboundWithSettings(tag, mark, settings)
 }
 
 func buildClientOutbound(tag string, n state.OutboundNode, mark int) map[string]any {
@@ -248,6 +278,11 @@ func buildVMessTCPInbound(tag string, port int, uuids []string) map[string]any {
 		"streamSettings": map[string]any{
 			"network": "tcp",
 		},
+		"sniffing": map[string]any{
+			"enabled":      true,
+			"destOverride": []string{"http", "tls", "quic"},
+			"routeOnly":    true,
+		},
 	}
 }
 
@@ -435,7 +470,7 @@ func buildXHTTPDirectTLSInbound(tag string, port int, uuids []string, path, cert
 	}
 }
 
-func buildExtraInbound(ex state.ExtraInbound, certFile, keyFile string) map[string]any {
+func buildExtraInbound(ex state.ExtraInbound, viaNginxPort int, certFile, keyFile string) map[string]any {
 	sniff := map[string]any{
 		"enabled":      true,
 		"destOverride": []string{"http", "tls", "quic"},
@@ -445,7 +480,11 @@ func buildExtraInbound(ex state.ExtraInbound, certFile, keyFile string) map[stri
 	bindPort := ex.ListenPort
 	if ex.ViaNginx {
 		listen = "127.0.0.1"
-		bindPort = ExtraInternalPort(ex.ListenPort)
+		if viaNginxPort > 0 {
+			bindPort = viaNginxPort
+		} else {
+			bindPort = ExtraInternalPort(ex.ListenPort)
+		}
 	}
 
 	switch ex.Protocol {
@@ -578,13 +617,18 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 		"servers":       dnsServers,
 	}
 
+	viaNginxPorts := AllocateViaNginxInternalPorts(s)
+
 	addCommonRelayAndExtra := func(mark int) {
+		var fwdTags []string
 		for _, fwd := range s.Relay.Forwards {
 			if fwd.Engine != "xray" {
 				continue
 			}
+			tag := fmt.Sprintf("fwd-%d", fwd.ListenPort)
+			fwdTags = append(fwdTags, tag)
 			inbounds = append(inbounds, map[string]any{
-				"tag":      fmt.Sprintf("fwd-%d", fwd.ListenPort),
+				"tag":      tag,
 				"listen":   "0.0.0.0",
 				"port":     fwd.ListenPort,
 				"protocol": "dokodemo-door",
@@ -674,22 +718,21 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 			}
 		}
 
-		hasDokodemo := false
 		var dokoTags []string
 		for _, ex := range s.ExtraInbounds {
-			if inb := buildExtraInbound(ex, opts.CertFile, opts.KeyFile); inb != nil {
+			if inb := buildExtraInbound(ex, viaNginxPorts[ex.Tag], opts.CertFile, opts.KeyFile); inb != nil {
 				inbounds = append(inbounds, inb)
 				if ex.Protocol == "dokodemo" {
-					hasDokodemo = true
 					dokoTags = append(dokoTags, ex.Tag)
 				}
 			}
 		}
-		if hasDokodemo {
+		allDokoTags := append(append([]string(nil), dokoTags...), fwdTags...)
+		if len(allDokoTags) > 0 {
 			outbounds = append(outbounds, buildFreedomOutbound("outbound-dokodemo", mark, ""))
 			rules = append([]map[string]any{{
 				"type":        "field",
-				"inboundTag":  dokoTags,
+				"inboundTag":  allDokoTags,
 				"outboundTag": "outbound-dokodemo",
 			}}, rules...)
 		}
@@ -998,7 +1041,7 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 		inbounds = append(inbounds, buildMainServerInbound(s, opts))
 
 		// Outbounds: handle Option 35 SOCKS5 outbound global default vs direct
-		directOb := buildFreedomOutbound("direct", 0, "")
+		directOb := serverDirectFreedomOutbound("direct", 0)
 		blockedOb := map[string]any{
 			"tag":      "blocked",
 			"protocol": "blackhole",
@@ -1006,7 +1049,6 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 		}
 
 		var globalDefaultOb map[string]any
-		var globalPrivateBypass bool
 		var socksRuleList []map[string]any
 		var extraSocksObs []map[string]any
 		hasIPRules := false
@@ -1044,7 +1086,6 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 			}
 			if prof.Name == "default" && len(prof.Domains) == 0 && len(prof.IPs) == 0 {
 				globalDefaultOb = ob
-				globalPrivateBypass = prof.PrivateBypass
 			} else {
 				extraSocksObs = append(extraSocksObs, ob)
 			}
@@ -1074,23 +1115,30 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 		}
 		outbounds = append(outbounds, extraSocksObs...)
 		rules = append(rules, socksRuleList...)
-		if globalDefaultOb != nil && globalPrivateBypass {
-			rules = append(rules, map[string]any{
-				"type":        "field",
-				"ruleTag":     "socks5-exit-private-direct",
-				"ip":          xrayPrivateCIDRs,
-				"outboundTag": "direct",
-			})
-		}
 		if hasIPRules {
 			domainStrategy = "IPIfNonMatch"
 		}
 
 		addCommonRelayAndExtra(0)
 
+		rules = append(rules,
+			map[string]any{
+				"type":        "field",
+				"ruleTag":     "ssrf-block-private",
+				"ip":          xrayPrivateCIDRs,
+				"outboundTag": "blocked",
+			},
+			map[string]any{
+				"type":        "field",
+				"ruleTag":     "ssrf-block-localhost",
+				"domain":      []string{"localhost"},
+				"outboundTag": "blocked",
+			},
+		)
+
 	case state.RoleRelay:
 		outbounds = append(outbounds,
-			buildFreedomOutbound("direct", 0, ""),
+			serverDirectFreedomOutbound("direct", 0),
 			map[string]any{
 				"tag":      "blocked",
 				"protocol": "blackhole",

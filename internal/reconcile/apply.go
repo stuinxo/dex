@@ -300,6 +300,8 @@ func populateRenderOptions(ctx context.Context, st *state.State, store *state.St
 		ropts.ResolvedHostIPs = make(map[string][]netip.Addr)
 	}
 
+	cachedHosts := loadHostsFileCache(mapTargetPath(opts.RootPrefix, filepath.Join(ropts.GeneratedDir, "mosdns", "hosts.txt")))
+
 	var warnings []string
 	resolveHost := func(h string) {
 		h = strings.Trim(strings.TrimSpace(h), "[]")
@@ -314,13 +316,22 @@ func populateRenderOptions(ctx context.Context, st *state.State, store *state.St
 			return
 		}
 		ips, err := exec.ResolveHostIPs(ctx, h)
-		if err != nil {
-			warnings = append(warnings, fmt.Sprintf("resolve %s: %v", h, err))
+		if err != nil || len(ips) == 0 {
+			if cached := cachedHosts[h]; len(cached) > 0 {
+				ropts.ResolvedHostIPs[h] = cached
+				if err != nil {
+					warnings = append(warnings, fmt.Sprintf("resolve %s: %v (using cached IP from hosts.txt)", h, err))
+				} else {
+					warnings = append(warnings, fmt.Sprintf("resolve %s: empty result (using cached IP from hosts.txt)", h))
+				}
+				return
+			}
+			if err != nil {
+				warnings = append(warnings, fmt.Sprintf("resolve %s: %v", h, err))
+			}
 			return
 		}
-		if len(ips) > 0 {
-			ropts.ResolvedHostIPs[h] = ips
-		}
+		ropts.ResolvedHostIPs[h] = ips
 	}
 
 	if st.Role == state.RoleClient {
@@ -925,6 +936,12 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 				}
 				return fmt.Errorf("update /etc/resolv.conf: %w", werr)
 			}
+		} else if isOS && !bundle.MosDNSNeeded {
+			resolvPath := mapTargetPath(opts.RootPrefix, "/etc/resolv.conf")
+			origPath := filepath.Join(store.Dir, "resolv.conf.orig")
+			if rerr := restoreResolvConfIfNeeded(resolvPath, origPath); rerr != nil {
+				res.Warnings = append(res.Warnings, fmt.Sprintf("restore /etc/resolv.conf: %v", rerr))
+			}
 		}
 		return nil
 	}
@@ -968,17 +985,80 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		return nil, fmt.Errorf("apply services failed (rolled back): %w", err)
 	}
 
-	// Clean up backups and commit manifest + state transaction
+	// Clean up backups (including any stale .prev files left by prior crashes) and commit manifest + state transaction
 	for _, b := range backups {
 		_ = os.Remove(b.prevPath)
 	}
+	cleanupStalePrevFiles(opts.RootPrefix, ropts.GeneratedDir)
 	if err := SaveManifest(store.ManifestPath(), BuildManifest(bundle.Files)); err != nil {
-		warnings = append(warnings, fmt.Sprintf("save manifest: %v", err))
-		res.Warnings = warnings
+		res.Warnings = append(res.Warnings, fmt.Sprintf("save manifest: %v", err))
 	}
 	if err := store.CommitTxn(); err != nil {
-		warnings = append(warnings, fmt.Sprintf("commit txn: %v", err))
-		res.Warnings = warnings
+		res.Warnings = append(res.Warnings, fmt.Sprintf("commit txn: %v", err))
 	}
 	return res, nil
+}
+
+func loadHostsFileCache(path string) map[string][]netip.Addr {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	out := make(map[string][]netip.Addr)
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		host := strings.TrimSpace(fields[0])
+		if host == "" || host == "localhost" || strings.HasPrefix(host, "domain:") || strings.HasPrefix(host, "full:") {
+			continue
+		}
+		if ip, perr := netip.ParseAddr(strings.TrimSpace(fields[1])); perr == nil {
+			out[host] = append(out[host], ip)
+		}
+	}
+	return out
+}
+
+func restoreResolvConfIfNeeded(resolvPath, origPath string) error {
+	origBytes, err := os.ReadFile(origPath)
+	if err != nil || len(bytes.TrimSpace(origBytes)) == 0 {
+		return nil
+	}
+	curBytes, err := os.ReadFile(resolvPath)
+	if err != nil {
+		return nil
+	}
+	if strings.TrimSpace(string(curBytes)) != "nameserver 127.0.0.1" {
+		return nil
+	}
+	return writeBytesExact(resolvPath, origBytes, 0o644)
+}
+
+func cleanupStalePrevFiles(rootPrefix, generatedDir string) {
+	genDisk := mapTargetPath(rootPrefix, generatedDir)
+	dirs := []string{
+		genDisk,
+		filepath.Join(genDisk, "mosdns"),
+		filepath.Join(genDisk, "wg-peers"),
+	}
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".prev") {
+				_ = os.Remove(filepath.Join(dir, e.Name()))
+			}
+		}
+	}
+	_ = os.Remove(mapTargetPath(rootPrefix, "/etc/wireguard/wg0.conf.prev"))
 }

@@ -91,12 +91,15 @@ func SaveManifest(path string, m *Manifest) error {
 }
 
 // CheckUnmanagedEdits verifies that previously managed files still match their last recorded SHA256
-// (unless the file was removed or matches the newly rendered content).
+// (unless the file was removed or matches the newly rendered content), including obsolete files
+// no longer present in the new render bundle.
 func CheckUnmanagedEdits(prev *Manifest, files []render.RenderedFile, mapPath func(string) string) error {
 	if prev == nil || len(prev.Files) == 0 {
 		return nil
 	}
+	newTargets := make(map[string]struct{}, len(files))
 	for _, f := range files {
+		newTargets[f.TargetPath] = struct{}{}
 		entry, managedBefore := prev.Files[f.TargetPath]
 		if !managedBefore {
 			continue
@@ -113,6 +116,22 @@ func CheckUnmanagedEdits(prev *Manifest, files []render.RenderedFile, mapPath fu
 		newHash := sha256Hex(f.Content)
 		if diskHash != entry.SHA256 && diskHash != newHash {
 			return fmt.Errorf("%w: %s (use --force to overwrite)", ErrManualModificationDetected, f.TargetPath)
+		}
+	}
+	for oldTarget, entry := range prev.Files {
+		if _, kept := newTargets[oldTarget]; kept {
+			continue
+		}
+		diskPath := mapPath(oldTarget)
+		diskBytes, err := os.ReadFile(diskPath)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("read %s: %w", diskPath, err)
+		}
+		if sha256Hex(diskBytes) != entry.SHA256 {
+			return fmt.Errorf("%w: %s (use --force to overwrite)", ErrManualModificationDetected, oldTarget)
 		}
 	}
 	return nil

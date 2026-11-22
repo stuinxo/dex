@@ -78,3 +78,49 @@ func TestDownloadMirrorFallbackAndVerification(t *testing.T) {
 		t.Fatalf("downloaded mirror binary missing ELF magic")
 	}
 }
+
+func TestDownloadTrustAnchorNeverUsesDefaultMirrors(t *testing.T) {
+	t.Setenv("GH_PROXY", "")
+
+	// 1. Direct failure must NOT fall back to defaultMirrors (returns error immediately)
+	directFail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer directFail.Close()
+
+	dst := filepath.Join(t.TempDir(), "SHA256SUMS")
+	if err := DownloadTrustAnchor(context.Background(), directFail.Client(), directFail.URL+"/SHA256SUMS", dst); err == nil {
+		t.Fatalf("expected DownloadTrustAnchor to fail when direct returns 502 and GH_PROXY is empty")
+	}
+
+	// 2. When GH_PROXY is explicitly set, direct is tried FIRST; only on direct failure does it fall back to GH_PROXY
+	var order []string
+	directOK := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		order = append(order, "direct")
+		_, _ = w.Write([]byte(strings.Repeat("a", 64) + "  dex-linux-amd64\n"))
+	}))
+	defer directOK.Close()
+
+	proxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		order = append(order, "gh_proxy")
+		_, _ = w.Write([]byte(strings.Repeat("b", 64) + "  dex-linux-amd64\n"))
+	}))
+	defer proxySrv.Close()
+
+	t.Setenv("GH_PROXY", proxySrv.URL)
+	if err := DownloadTrustAnchor(context.Background(), directOK.Client(), directOK.URL+"/SHA256SUMS", dst); err != nil {
+		t.Fatalf("DownloadTrustAnchor direct+GH_PROXY failed: %v", err)
+	}
+	if len(order) != 1 || order[0] != "direct" {
+		t.Fatalf("expected direct tried first without touching GH_PROXY on success, got order=%v", order)
+	}
+
+	// Now direct fails -> falls back to explicit GH_PROXY
+	order = nil
+	if err := DownloadTrustAnchor(context.Background(), directFail.Client(), directFail.URL+"/SHA256SUMS", dst); err != nil {
+		t.Fatalf("DownloadTrustAnchor GH_PROXY fallback failed: %v", err)
+	}
+	if len(order) != 1 || order[0] != "gh_proxy" {
+		t.Fatalf("expected explicit GH_PROXY fallback after direct failure, got order=%v", order)
+	}
+}

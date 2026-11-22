@@ -22,27 +22,39 @@ func RenderMosDNS(s *state.State, opts RenderOptions) ([]RenderedFile, bool, err
 
 	mosDir := filepath.Join(opts.GeneratedDir, "mosdns")
 	hostsPath := filepath.Join(mosDir, "hosts.txt")
+	dohPath := filepath.Join(mosDir, "domains_doh.txt")
 	blackPath := filepath.Join(mosDir, "domains_black.txt")
 	whitePath := filepath.Join(mosDir, "domains_white.txt")
 	nodesPath := filepath.Join(mosDir, "domains_nodes.txt")
 
-	// Build hosts entries (localhost + DoH domain bootstrap IPs + user hosts)
+	chinaServers := s.Client.DNS.ChinaServers
+	if len(chinaServers) == 0 {
+		chinaServers = state.DefaultChinaDNS
+	}
+	dohServers := s.Client.DNS.DoHServers
+	if len(dohServers) == 0 {
+		dohServers = state.DefaultDoHServers
+	}
+
+	// Build hosts entries (localhost + DoH domain bootstrap IPs + user hosts) and domains_doh.txt
 	var hostLines []string
 	hostLines = append(hostLines, "localhost 127.0.0.1")
 
 	seenDoHDomain := make(map[string]struct{})
-	for _, rawURL := range s.Client.DNS.DoHServers {
+	var dohDomains []string
+	for _, rawURL := range dohServers {
 		dom := ExtractDoHHost(rawURL)
 		if dom == "" {
 			continue
 		}
-		if _, err := netip.ParseAddr(dom); err == nil {
+		if _, err := netip.ParseAddr(strings.Trim(dom, "[]")); err == nil {
 			continue
 		}
 		if _, ok := seenDoHDomain[dom]; ok {
 			continue
 		}
 		seenDoHDomain[dom] = struct{}{}
+		dohDomains = append(dohDomains, dom)
 		if ips := opts.ResolvedHostIPs[dom]; len(ips) > 0 {
 			for _, ip := range ips {
 				if ip.Is4() {
@@ -90,6 +102,10 @@ func RenderMosDNS(s *state.State, opts RenderOptions) ([]RenderedFile, bool, err
 		addNodeDomain(s.Client.RproxyC.TunnelAddress)
 	}
 
+	dohContent := strings.Join(dohDomains, "\n")
+	if dohContent != "" {
+		dohContent += "\n"
+	}
 	blackContent := strings.Join(s.Client.DNS.BlacklistDomains, "\n")
 	if blackContent != "" {
 		blackContent += "\n"
@@ -101,15 +117,6 @@ func RenderMosDNS(s *state.State, opts RenderOptions) ([]RenderedFile, bool, err
 	nodesContent := strings.Join(nodeLines, "\n")
 	if nodesContent != "" {
 		nodesContent += "\n"
-	}
-
-	chinaServers := s.Client.DNS.ChinaServers
-	if len(chinaServers) == 0 {
-		chinaServers = state.DefaultChinaDNS
-	}
-	dohServers := s.Client.DNS.DoHServers
-	if len(dohServers) == 0 {
-		dohServers = state.DefaultDoHServers
 	}
 
 	var yaml strings.Builder
@@ -169,6 +176,12 @@ func RenderMosDNS(s *state.State, opts RenderOptions) ([]RenderedFile, bool, err
 	yaml.WriteString("      threshold: 100\n")
 	yaml.WriteString("      always_standby: true\n\n")
 
+	yaml.WriteString("  - tag: node_fallback\n    type: fallback\n    args:\n")
+	yaml.WriteString("      primary: global_sequence\n")
+	yaml.WriteString("      secondary: forward_chn\n")
+	yaml.WriteString("      threshold: 1500\n")
+	yaml.WriteString("      always_standby: false\n\n")
+
 	yaml.WriteString("  - tag: has_resp_sequence\n    type: sequence\n    args:\n")
 	yaml.WriteString("      - matches: has_resp\n")
 	yaml.WriteString("        exec: accept\n\n")
@@ -180,12 +193,13 @@ func RenderMosDNS(s *state.State, opts RenderOptions) ([]RenderedFile, bool, err
 	yaml.WriteString("      - exec: $hosts\n      - exec: jump has_resp_sequence\n")
 	yaml.WriteString("      - exec: $cache\n      - exec: jump has_resp_sequence\n")
 	fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: $forward_chn\n      - exec: jump has_resp_sequence\n", whitePath)
+	fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: $forward_chn\n      - exec: jump has_resp_sequence\n", dohPath)
 	if s.Client.DNS.BlockAds {
 		adsPath := filepath.Join(opts.StateDir, "rules", "Domains.ads.txt")
 		fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: reject 3\n", adsPath)
 	}
 	fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: goto global_sequence\n", blackPath)
-	fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: goto global_sequence\n", nodesPath)
+	fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: $node_fallback\n      - exec: jump has_resp_sequence\n", nodesPath)
 	if opts.DomainsAppleExists {
 		if s.Client.Routing.AppleNodeID != "" {
 			fmt.Fprintf(&yaml, "      - matches: qname &%s\n        exec: goto global_sequence\n", opts.DomainsApplePath)
@@ -215,6 +229,12 @@ func RenderMosDNS(s *state.State, opts RenderOptions) ([]RenderedFile, bool, err
 			RelName:    "mosdns/hosts.txt",
 			TargetPath: hostsPath,
 			Content:    []byte(strings.Join(hostLines, "\n") + "\n"),
+			Mode:       0o644,
+		},
+		{
+			RelName:    "mosdns/domains_doh.txt",
+			TargetPath: dohPath,
+			Content:    []byte(dohContent),
 			Mode:       0o644,
 		},
 		{

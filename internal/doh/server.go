@@ -14,21 +14,27 @@ import (
 	"time"
 )
 
-const maxDNSWireBytes = 4096
+const (
+	maxDNSWireBytes      = 4096
+	defaultMaxConcurrent = 128
+)
 
 // Config configures the built-in RFC 8484 DoH forwarding server.
 type Config struct {
-	ListenAddr string
-	Path       string
-	Upstreams  []string
-	Timeout    time.Duration
+	ListenAddr    string
+	Path          string
+	Upstreams     []string
+	Timeout       time.Duration
+	MaxConcurrent int
 }
 
 // Handler implements RFC 8484 DNS-over-HTTPS (GET ?dns= and POST application/dns-message).
 type Handler struct {
-	Path      string
-	Upstreams []string
-	Timeout   time.Duration
+	Path          string
+	Upstreams     []string
+	Timeout       time.Duration
+	MaxConcurrent int
+	sem           chan struct{}
 }
 
 // NewHandler creates a DoH HTTP handler with sane defaults.
@@ -48,10 +54,16 @@ func NewHandler(cfg Config) *Handler {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
+	maxConc := cfg.MaxConcurrent
+	if maxConc <= 0 {
+		maxConc = defaultMaxConcurrent
+	}
 	return &Handler{
-		Path:      path,
-		Upstreams: ups,
-		Timeout:   timeout,
+		Path:          path,
+		Upstreams:     ups,
+		Timeout:       timeout,
+		MaxConcurrent: maxConc,
+		sem:           make(chan struct{}, maxConc),
 	}
 }
 
@@ -59,6 +71,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != h.Path {
 		http.NotFound(w, r)
 		return
+	}
+	if h.sem != nil {
+		select {
+		case h.sem <- struct{}{}:
+			defer func() { <-h.sem }()
+		default:
+			http.Error(w, "too many concurrent requests", http.StatusServiceUnavailable)
+			return
+		}
 	}
 
 	var wireReq []byte

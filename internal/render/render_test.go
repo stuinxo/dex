@@ -795,3 +795,293 @@ func TestRenderSystemdDexNFTExecStopIPv6Cleanup(t *testing.T) {
 		}
 	}
 }
+
+func TestHardeningServerSSRFRelayAndClientFreedom(t *testing.T) {
+	// 1. RoleServer (with Socks5 PrivateBypass=true, dokodemo, rproxys, and relay fwd):
+	//    - direct outbound uses block-then-allow finalRules
+	//    - routing has ssrf-block-private & ssrf-block-localhost -> blocked after dokodemo/rps rules
+	//    - no rule routes xrayPrivateCIDRs to "direct"
+	//    - fwd-* and dokodemo route to outbound-dokodemo (which keeps allow-all freedomFinalRules)
+	srv := state.NewDefaultState(state.RoleServer)
+	srv.Server.TLSMode = "nginx"
+	srv.Server.Domain = "srv.example.com"
+	srv.Server.ListenPort = 443
+	srv.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	srv.Server.Socks5Outbounds = []state.Socks5Profile{{
+		Name:          "default",
+		Enabled:       true,
+		Address:       "socks.example.net",
+		Port:          1080,
+		PrivateBypass: true,
+	}}
+	srv.RproxyS = state.RproxySConfig{
+		Enabled:    true,
+		ListenPort: 20000,
+		UUIDs:      []string{"22222222-2222-4222-8222-222222222222"},
+		InUUIDs:    []string{"33333333-3333-4333-8333-333333333333"},
+	}
+	srv.ExtraInbounds = []state.ExtraInbound{{
+		Tag:        "doko-1",
+		Protocol:   "dokodemo",
+		ListenPort: 10053,
+		TargetAddr: "1.1.1.1",
+		TargetPort: 53,
+		Network:    "udp",
+	}}
+	srv.Relay.Forwards = []state.ForwardRule{{
+		ID:         "fwd-1",
+		ListenPort: 10080,
+		TargetHost: "10.0.0.5",
+		TargetPort: 80,
+		Proto:      "tcp",
+		Engine:     "xray",
+	}}
+
+	xb, needed, err := RenderXray(srv, RenderOptions{})
+	if err != nil || !needed {
+		t.Fatalf("RenderXray server: err=%v needed=%v", err, needed)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(xb, &cfg); err != nil {
+		t.Fatalf("unmarshal xray: %v", err)
+	}
+	obs := cfg["outbounds"].([]any)
+	var directFR, dokoFR []any
+	for _, raw := range obs {
+		m := raw.(map[string]any)
+		switch m["tag"] {
+		case "direct":
+			directFR = m["settings"].(map[string]any)["finalRules"].([]any)
+		case "outbound-dokodemo":
+			dokoFR = m["settings"].(map[string]any)["finalRules"].([]any)
+		}
+	}
+	if len(directFR) != 2 || directFR[0].(map[string]any)["action"] != "block" || directFR[1].(map[string]any)["action"] != "allow" {
+		t.Fatalf("server direct outbound must block private CIDRs before allow, got %+v", directFR)
+	}
+	blockIPs := directFR[0].(map[string]any)["ip"].([]any)
+	for _, wantCIDR := range []string{"0.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "::1/128", "ff00::/8"} {
+		found := false
+		for _, got := range blockIPs {
+			if got == wantCIDR {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("server direct finalRules block missing %q", wantCIDR)
+		}
+	}
+	if len(dokoFR) != 1 || dokoFR[0].(map[string]any)["action"] != "allow" {
+		t.Fatalf("outbound-dokodemo must preserve allow-all finalRules, got %+v", dokoFR)
+	}
+
+	rules := cfg["routing"].(map[string]any)["rules"].([]any)
+	dokoIdx, rpsIdx, privIdx, localhostIdx := -1, -1, -1, -1
+	for i, raw := range rules {
+		r := raw.(map[string]any)
+		if r["outboundTag"] == "outbound-dokodemo" {
+			dokoIdx = i
+			inbs := r["inboundTag"].([]any)
+			if len(inbs) != 2 {
+				t.Fatalf("expected doko-1 and fwd-10080 routed to outbound-dokodemo, got %+v", inbs)
+			}
+		}
+		if r["outboundTag"] == "portal" {
+			rpsIdx = i
+		}
+		if r["ruleTag"] == "socks5-exit-private-direct" {
+			t.Fatalf("unexpected PrivateBypass rule routing private CIDRs to direct")
+		}
+		if r["ruleTag"] == "ssrf-block-private" && r["outboundTag"] == "blocked" {
+			privIdx = i
+		}
+		if r["ruleTag"] == "ssrf-block-localhost" && r["outboundTag"] == "blocked" {
+			localhostIdx = i
+		}
+	}
+	if dokoIdx < 0 || rpsIdx < 0 || privIdx < 0 || localhostIdx < 0 || dokoIdx > privIdx || rpsIdx > privIdx {
+		t.Fatalf("unexpected server SSRF rule indices: doko=%d rps=%d priv=%d localhost=%d", dokoIdx, rpsIdx, privIdx, localhostIdx)
+	}
+
+	// 2. RoleRelay direct outbound also blocks SSRF while fwd-* uses outbound-dokodemo
+	rel := state.NewDefaultState(state.RoleRelay)
+	rel.Relay.Forwards = []state.ForwardRule{{
+		ID: "f1", ListenPort: 10001, TargetHost: "198.51.100.2", TargetPort: 443, Proto: "tcp", Engine: "xray",
+	}}
+	rxb, rNeeded, err := RenderXray(rel, RenderOptions{})
+	if err != nil || !rNeeded {
+		t.Fatalf("RenderXray relay: err=%v needed=%v", err, rNeeded)
+	}
+	var rcfg map[string]any
+	_ = json.Unmarshal(rxb, &rcfg)
+	for _, raw := range rcfg["outbounds"].([]any) {
+		m := raw.(map[string]any)
+		if m["tag"] == "direct" {
+			fr := m["settings"].(map[string]any)["finalRules"].([]any)
+			if fr[0].(map[string]any)["action"] != "block" {
+				t.Fatalf("relay direct outbound must use serverDirectFreedomOutbound, got %+v", fr)
+			}
+		}
+	}
+}
+
+func TestHardeningMosDNSDoHLoopNodeFallbackIPv6AndMultiViaNginx(t *testing.T) {
+	// 1. Client with EnableIPv6=false, custom DoH domain + IP DoH, vmess-tcp FWD0, malicious resolved node IPs
+	c := state.NewDefaultState(state.RoleClient)
+	c.System.EnableIPv6 = false
+	c.System.AutoTuneSysctl = true
+	c.Client.WireGuard = state.WireGuardConfig{
+		Enabled:          true,
+		EndpointHost:     "vpn.example.com",
+		ListenPort:       51820,
+		SubnetCIDR:       "172.16.66.1/24",
+		ServerPrivateKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		ServerPublicKey:  "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+	}
+	c.Client.Nodes = []state.OutboundNode{{
+		ID: "n1", Protocol: "vless-xhttp", Address: "evil-node.example.com", Port: 443,
+		UUID: "11111111-1111-4111-8111-111111111111",
+	}}
+	c.Client.ActiveNodeID = "n1"
+	c.Client.FWD0 = state.FWD0Config{
+		Enabled:  true,
+		Protocol: "vmess-tcp",
+		Port:     1443,
+		UUIDs:    []string{"22222222-2222-4222-8222-222222222222"},
+	}
+	c.Client.DNS.DoHServers = []string{
+		"https://doh.custom.example/dq",
+		"https://1.1.1.1/dns-query",
+	}
+
+	bundle, err := RenderAll(c, RenderOptions{
+		StateDir: "/tmp/dex-h",
+		ResolvedHostIPs: map[string][]netip.Addr{
+			"evil-node.example.com": {
+				netip.MustParseAddr("127.0.0.1"),
+				netip.MustParseAddr("169.254.169.254"),
+				netip.MustParseAddr("::1"),
+				netip.MustParseAddr("fe80::1"),
+				netip.MustParseAddr("224.0.0.1"),
+				netip.MustParseAddr("203.0.113.88"),
+			},
+			"doh.custom.example": {netip.MustParseAddr("203.0.113.99")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("RenderAll client: %v", err)
+	}
+
+	// MosDNS: domains_doh.txt + forward_chn before domains_black/global_sequence + node_fallback
+	dohFile, ok := findFile(bundle, "mosdns/domains_doh.txt")
+	if !ok {
+		t.Fatalf("missing mosdns/domains_doh.txt")
+	}
+	if strings.TrimSpace(string(dohFile.Content)) != "doh.custom.example" {
+		t.Fatalf("expected only non-IP DoH domain in domains_doh.txt, got %q", string(dohFile.Content))
+	}
+	mf, _ := findFile(bundle, "mosdns/mosdns.yaml")
+	mStr := string(mf.Content)
+	for _, needle := range []string{
+		"tag: node_fallback",
+		"primary: global_sequence",
+		"secondary: forward_chn",
+		"threshold: 1500",
+		"always_standby: false",
+		"domains_doh.txt\n        exec: $forward_chn",
+		"domains_nodes.txt\n        exec: $node_fallback",
+	} {
+		if !strings.Contains(mStr, needle) {
+			t.Errorf("mosdns.yaml missing %q\n%s", needle, mStr)
+		}
+	}
+	dohPos := strings.Index(mStr, "domains_doh.txt")
+	blackPos := strings.Index(mStr, "domains_black.txt")
+	if dohPos < 0 || blackPos < 0 || dohPos > blackPos {
+		t.Fatalf("expected domains_doh.txt before domains_black.txt (doh=%d black=%d)", dohPos, blackPos)
+	}
+
+	// Sysctl: explicit IPv6 forwarding = 0 when disabled
+	sf, _ := findFile(bundle, "sysctl-99-dex.conf")
+	sStr := string(sf.Content)
+	if !strings.Contains(sStr, "net.ipv6.conf.all.forwarding = 0") || !strings.Contains(sStr, "net.ipv6.conf.default.forwarding = 0") {
+		t.Fatalf("expected IPv6 forwarding disabled in sysctl:\n%s", sStr)
+	}
+
+	// NFTables: IPv6 reject before wg0 accept in chain forward; restricted resolved node IPs filtered from v2node sets
+	nf, _ := findFile(bundle, "nftables.conf")
+	nStr := string(nf.Content)
+	fwdStart := strings.Index(nStr, "chain forward {")
+	if fwdStart < 0 {
+		t.Fatalf("missing chain forward in nftables.conf")
+	}
+	fwdSection := nStr[fwdStart:]
+	rejNeedle := "meta nfproto ipv6 ip6 daddr != { ::1/128, fc00::/7, fe80::/10, ff00::/8 } counter reject"
+	rejPos := strings.Index(fwdSection, rejNeedle)
+	wgPos := strings.Index(fwdSection, `iifname "wg0" accept`)
+	if rejPos < 0 || wgPos < 0 || rejPos > wgPos {
+		t.Fatalf("expected IPv6 reject rule before wg0 accept in chain forward: rej=%d wg=%d\n%s", rejPos, wgPos, fwdSection)
+	}
+	v2nodeIdx := strings.Index(nStr, "set v2node_v4 {")
+	v2nodeEnd := v2nodeIdx + strings.Index(nStr[v2nodeIdx:], "set chnroute_v4 {")
+	v2Section := nStr[v2nodeIdx:v2nodeEnd]
+	for _, badIP := range []string{"127.0.0.1", "169.254.169.254", "::1", "fe80::1", "224.0.0.1"} {
+		if strings.Contains(v2Section, badIP) {
+			t.Errorf("restricted IP %q leaked into v2node sets:\n%s", badIP, v2Section)
+		}
+	}
+	if !strings.Contains(v2Section, "203.0.113.88") {
+		t.Errorf("expected valid node IP 203.0.113.88 in v2node_v4:\n%s", v2Section)
+	}
+
+	// Xray FWD0 vmess-tcp has sniffing enabled
+	xf, _ := findFile(bundle, "xray.json")
+	var xcfg map[string]any
+	_ = json.Unmarshal(xf.Content, &xcfg)
+	foundFWD0 := false
+	for _, raw := range xcfg["inbounds"].([]any) {
+		m := raw.(map[string]any)
+		if m["tag"] == "forward0" {
+			foundFWD0 = true
+			sniff, ok := m["sniffing"].(map[string]any)
+			if !ok || sniff["enabled"] != true || sniff["routeOnly"] != true {
+				t.Fatalf("expected sniffing enabled on forward0 vmess-tcp, got %+v", m["sniffing"])
+			}
+		}
+	}
+	if !foundFWD0 {
+		t.Fatalf("missing forward0 inbound")
+	}
+
+	// 2. Multi via_nginx on :443 renders matching internal ports in xray.json and nginx-dex.conf
+	srv := state.NewDefaultState(state.RoleServer)
+	srv.Server.TLSMode = "nginx"
+	srv.Server.Domain = "main.example.com"
+	srv.Server.ListenPort = 443
+	srv.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	srv.ExtraInbounds = []state.ExtraInbound{
+		{Tag: "vn-a", Protocol: "vless-xhttp", ListenPort: 443, Domain: "a.example.com", UUID: "22222222-2222-4222-8222-222222222222", ViaNginx: true},
+		{Tag: "vn-b", Protocol: "vless-ws", ListenPort: 443, Domain: "b.example.com", UUID: "33333333-3333-4333-8333-333333333333", ViaNginx: true},
+	}
+	sBundle, err := RenderAll(srv, RenderOptions{})
+	if err != nil {
+		t.Fatalf("RenderAll multi via_nginx: %v", err)
+	}
+	ngf, _ := findFile(sBundle, "nginx-dex.conf")
+	ngStr := string(ngf.Content)
+	if !strings.Contains(ngStr, "proxy_pass http://127.0.0.1:10443;") || !strings.Contains(ngStr, "proxy_pass http://127.0.0.1:10444;") {
+		t.Fatalf("expected 10443 and 10444 in nginx-dex.conf:\n%s", ngStr)
+	}
+	sxf, _ := findFile(sBundle, "xray.json")
+	var sxcfg map[string]any
+	_ = json.Unmarshal(sxf.Content, &sxcfg)
+	portsByTag := map[string]float64{}
+	for _, raw := range sxcfg["inbounds"].([]any) {
+		m := raw.(map[string]any)
+		portsByTag[m["tag"].(string)] = m["port"].(float64)
+	}
+	if portsByTag["vn-a"] != 10443 || portsByTag["vn-b"] != 10444 {
+		t.Fatalf("expected vn-a=10443 and vn-b=10444 in xray.json, got %+v", portsByTag)
+	}
+}

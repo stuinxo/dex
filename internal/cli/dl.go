@@ -106,9 +106,6 @@ func FindLocalPackage(envKey string, filenames []string) string {
 
 // DownloadWithMirrors downloads rawURL to dstPath atomically, falling back across GitHub mirrors.
 func DownloadWithMirrors(ctx context.Context, client *http.Client, rawURL, dstPath string, mirrors []string) error {
-	if client == nil {
-		client = &http.Client{Timeout: 90 * time.Second}
-	}
 	if mirrors == nil {
 		if strings.HasPrefix(rawURL, "https://github.com/") ||
 			strings.HasPrefix(rawURL, "https://raw.githubusercontent.com/") {
@@ -132,6 +129,24 @@ func DownloadWithMirrors(ctx context.Context, client *http.Client, rawURL, dstPa
 		attempts = append(attempts, strings.TrimRight(m, "/")+"/"+strings.TrimLeft(rawURL, "/"))
 	}
 
+	return downloadAttempts(ctx, client, attempts, dstPath)
+}
+
+// DownloadTrustAnchor downloads cryptographic trust anchors (checksums, .dgst, release API digests)
+// directly from rawURL, never falling back to third-party defaultMirrors. If the user explicitly
+// configured GH_PROXY, it is tried only after a direct fetch fails.
+func DownloadTrustAnchor(ctx context.Context, client *http.Client, rawURL, dstPath string) error {
+	attempts := []string{rawURL}
+	if proxy := strings.TrimSpace(os.Getenv("GH_PROXY")); proxy != "" {
+		attempts = append(attempts, strings.TrimRight(proxy, "/")+"/"+strings.TrimLeft(rawURL, "/"))
+	}
+	return downloadAttempts(ctx, client, attempts, dstPath)
+}
+
+func downloadAttempts(ctx context.Context, client *http.Client, attempts []string, dstPath string) error {
+	if client == nil {
+		client = &http.Client{Timeout: 90 * time.Second}
+	}
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
 		return err
 	}
@@ -193,7 +208,7 @@ func DownloadVerifiedFile(ctx context.Context, client *http.Client, rawURL, expe
 	if strings.HasPrefix(expectedSumOrURL, "http://") || strings.HasPrefix(expectedSumOrURL, "https://") {
 		sumFile := stagePath + ".sha256"
 		defer os.Remove(sumFile)
-		if err := DownloadWithMirrors(ctx, client, expectedSumOrURL, sumFile, nil); err != nil {
+		if err := DownloadTrustAnchor(ctx, client, expectedSumOrURL, sumFile); err != nil {
 			return fmt.Errorf("fetch checksum: %w", err)
 		}
 		b, err := os.ReadFile(sumFile)

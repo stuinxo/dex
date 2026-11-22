@@ -9,6 +9,12 @@ DEX_BIN="${DEX_BIN:-}"
 XRAY_ZIP="${XRAY_ZIP:-}"
 MOSDNS_ZIP="${MOSDNS_ZIP:-}"
 GH_PROXY="${GH_PROXY:-}"
+USER_GH_PROXY="${GH_PROXY:-}"
+case "$USER_GH_PROXY" in
+  ""|*/) ;;
+  *) USER_GH_PROXY="${USER_GH_PROXY}/" ;;
+esac
+STICKY_MIRROR=""
 GH_MIRRORS="${GH_MIRRORS:-https://gh-proxy.com/ https://ghproxy.net/ https://ghfast.top/}"
 STATE_DIR="${DEX_STATE_DIR:-/etc/dex}"
 INSTALL_BIN="/usr/local/bin/dex"
@@ -99,10 +105,24 @@ sha256_of() {
 gh_fetch() {
   url="$1"
   out="$2"
-  for prefix in ${GH_PROXY:-DIRECT} $GH_MIRRORS; do
+  first="${STICKY_MIRROR:-${USER_GH_PROXY:-DIRECT}}"
+  for prefix in "$first" $GH_MIRRORS; do
     [ "$prefix" = "DIRECT" ] && prefix=""
     if curl -fsSL --connect-timeout 8 --speed-limit 10240 --speed-time 15 --max-time 600 -o "$out" "${prefix}${url}" 2>/dev/null && [ -s "$out" ]; then
-      GH_PROXY="$prefix"
+      STICKY_MIRROR="$prefix"
+      return 0
+    fi
+  done
+  rm -f "$out"
+  return 1
+}
+
+gh_fetch_trust() {
+  url="$1"
+  out="$2"
+  for prefix in DIRECT ${USER_GH_PROXY:-}; do
+    [ "$prefix" = "DIRECT" ] && prefix=""
+    if curl -fsSL --connect-timeout 8 --speed-limit 10240 --speed-time 15 --max-time 600 -o "$out" "${prefix}${url}" 2>/dev/null && [ -s "$out" ]; then
       return 0
     fi
   done
@@ -150,7 +170,7 @@ install_dex_binary() {
     sum_tmp=$(mktemp /tmp/dex-sum.XXXXXX)
     say "[*] Downloading ${asset} from ${DEX_REPO} (${DEX_VERSION})..."
     gh_fetch "${base_url}/${asset}" "$tmp_bin" || { rm -f "$sum_tmp"; die "Failed to download ${asset}"; }
-    gh_fetch "${base_url}/SHA256SUMS" "$sum_tmp" || { rm -f "$sum_tmp"; die "Failed to download SHA256SUMS"; }
+    gh_fetch_trust "${base_url}/SHA256SUMS" "$sum_tmp" || { rm -f "$sum_tmp"; die "Failed to download SHA256SUMS"; }
     verify_sum_in_list "$tmp_bin" "$sum_tmp" "$asset" || { rm -f "$sum_tmp"; die "SHA256 verification failed for ${asset}"; }
     rm -f "$sum_tmp"
   fi
@@ -170,7 +190,7 @@ parse_xray_dgst() {
 fetch_api_json() {
   url="$1"
   out="$2"
-  for prefix in DIRECT ${GH_PROXY:-} $GH_MIRRORS; do
+  for prefix in DIRECT ${USER_GH_PROXY:-}; do
     [ "$prefix" = "DIRECT" ] && prefix=""
     if curl -fsSL --connect-timeout 8 --max-time 30 -H "Accept: application/vnd.github+json" -o "$out" "${prefix}${url}" 2>/dev/null \
       && [ -s "$out" ] \
@@ -210,7 +230,7 @@ fetch_verified_rule_dat() {
   tmp_dat=$(mktemp "${STATE_DIR}/rules/.${name}.XXXXXX")
   tmp_sum=$(mktemp "${STATE_DIR}/rules/.${name}.sum.XXXXXX")
   if gh_fetch "$url" "$tmp_dat" \
-    && gh_fetch "${url}.sha256sum" "$tmp_sum" \
+    && gh_fetch_trust "${url}.sha256sum" "$tmp_sum" \
     && verify_sum_in_list "$tmp_dat" "$tmp_sum" "$name"; then
     chmod 0644 "$tmp_dat"
     mv -f "$tmp_dat" "$dst"
@@ -251,7 +271,7 @@ install_xray_core() {
     url="https://github.com/XTLS/Xray-core/releases/latest/download/${zip_name}"
     say "[*] Downloading Xray-core (${XRAY_ARCH})..."
     gh_fetch "$url" "$work_dir/${zip_name}" || { rm -rf "$work_dir"; die "Failed to download Xray"; }
-    gh_fetch "${url}.dgst" "$work_dir/${zip_name}.dgst" || { rm -rf "$work_dir"; die "Failed to download Xray .dgst"; }
+    gh_fetch_trust "${url}.dgst" "$work_dir/${zip_name}.dgst" || { rm -rf "$work_dir"; die "Failed to download Xray .dgst"; }
     expected=$(parse_xray_dgst "$work_dir/${zip_name}.dgst")
     [ -n "$expected" ] && [ "$(sha256_of "$work_dir/${zip_name}")" = "$expected" ] || { rm -rf "$work_dir"; die "Xray SHA256 verification failed"; }
   fi

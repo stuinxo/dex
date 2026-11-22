@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func buildTestDNSQuery(id uint16, qname string) []byte {
@@ -155,4 +156,60 @@ func TestDoHGetPostAndTCPFallback(t *testing.T) {
 	if respBad.StatusCode != http.StatusUnsupportedMediaType {
 		t.Fatalf("expected 415, got %d", respBad.StatusCode)
 	}
+}
+
+func TestDoHConcurrencyLimitReturns503(t *testing.T) {
+	// Upstream UDP socket that intentionally never replies so requests block until timeout/cancel
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	defer pc.Close()
+	tcpLn, err := net.Listen("tcp", pc.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	defer tcpLn.Close()
+
+	h := NewHandler(Config{
+		Path:          "/dq",
+		Upstreams:     []string{pc.LocalAddr().String()},
+		Timeout:       300 * time.Millisecond,
+		MaxConcurrent: 2,
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	q := buildTestDNSQuery(0x2222, "slow.example")
+	inFlightDone := make(chan struct{}, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			r, err := http.Post(srv.URL+"/dq", "application/dns-message", bytes.NewReader(q))
+			if err == nil {
+				_ = r.Body.Close()
+			}
+			inFlightDone <- struct{}{}
+		}()
+	}
+
+	// Wait until both semaphore slots are occupied
+	deadline := time.Now().Add(time.Second)
+	for len(h.sem) < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(h.sem) != 2 {
+		t.Fatalf("expected 2 occupied concurrency slots, got %d", len(h.sem))
+	}
+
+	resp503, err := http.Post(srv.URL+"/dq", "application/dns-message", bytes.NewReader(q))
+	if err != nil {
+		t.Fatalf("3rd concurrent request error: %v", err)
+	}
+	_ = resp503.Body.Close()
+	if resp503.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable when MaxConcurrent reached, got %d", resp503.StatusCode)
+	}
+
+	<-inFlightDone
+	<-inFlightDone
 }

@@ -76,7 +76,13 @@ func (s *State) Validate() error {
 		}
 	}
 
-	if err := validateCamouflageDir(s.Server.CamouflageDir); err != nil {
+	if err := validateCleanAbsPath("server.camouflage_dir", s.Server.CamouflageDir); err != nil {
+		return err
+	}
+	if err := validateCleanAbsPath("cert.cert_file", s.Cert.CertFile); err != nil {
+		return err
+	}
+	if err := validateCleanAbsPath("cert.key_file", s.Cert.KeyFile); err != nil {
 		return err
 	}
 
@@ -100,6 +106,9 @@ func (s *State) Validate() error {
 			nodeIDs[n.ID] = struct{}{}
 			if !socks5out.IsValidAddress(n.Address) {
 				return fmt.Errorf("client node %q: invalid address %q", n.ID, n.Address)
+			}
+			if ip, err := netip.ParseAddr(strings.Trim(strings.TrimSpace(n.Address), "[]")); err == nil && isRestrictedNodeIP(ip) {
+				return fmt.Errorf("client node %q: restricted IP address %q", n.ID, n.Address)
 			}
 			if n.Port < 1 || n.Port > 65535 {
 				return fmt.Errorf("client node %q: invalid port %d", n.ID, n.Port)
@@ -265,6 +274,9 @@ func (s *State) Validate() error {
 		if s.Client.RproxyC.Enabled {
 			if !socks5out.IsValidAddress(s.Client.RproxyC.TunnelAddress) {
 				return fmt.Errorf("client.rproxyc.tunnel_address: invalid %q", s.Client.RproxyC.TunnelAddress)
+			}
+			if ip, err := netip.ParseAddr(strings.Trim(strings.TrimSpace(s.Client.RproxyC.TunnelAddress), "[]")); err == nil && isRestrictedNodeIP(ip) {
+				return fmt.Errorf("client.rproxyc.tunnel_address: restricted IP address %q", s.Client.RproxyC.TunnelAddress)
 			}
 			if s.Client.RproxyC.TunnelPort < 1 || s.Client.RproxyC.TunnelPort > 65535 {
 				return fmt.Errorf("client.rproxyc.tunnel_port: invalid %d", s.Client.RproxyC.TunnelPort)
@@ -521,6 +533,16 @@ func (s *State) Validate() error {
 		}
 	}
 
+	viaNginxPorts := AllocateViaNginxInternalPorts(s)
+	for _, ex := range s.ExtraInbounds {
+		if !ex.ViaNginx {
+			continue
+		}
+		if err := claimPort("tcp", viaNginxPorts[ex.Tag], "extra-internal:"+ex.Tag); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -649,22 +671,127 @@ func hasControlChar(s string) bool {
 	return false
 }
 
-func validateCamouflageDir(dir string) error {
-	if dir == "" {
+func isRestrictedNodeIP(ip netip.Addr) bool {
+	return ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsMulticast()
+}
+
+// ExtraInternalPort returns the preferred loopback port Xray binds to when an ExtraInbound is fronted by Nginx.
+func ExtraInternalPort(listenPort int) int {
+	if listenPort+10000 <= 65535 {
+		return listenPort + 10000
+	}
+	return listenPort - 10000
+}
+
+// AllocateViaNginxInternalPorts deterministically assigns collision-free loopback ports
+// (1024..65535) for all ViaNginx ExtraInbounds keyed by ex.Tag.
+func AllocateViaNginxInternalPorts(s *State) map[string]int {
+	out := make(map[string]int)
+	if s == nil {
+		return out
+	}
+
+	used := make(map[int]bool)
+	if s.Auth.ListenAddr != "" {
+		if _, portStr, err := net.SplitHostPort(s.Auth.ListenAddr); err == nil {
+			if p, perr := strconv.Atoi(portStr); perr == nil && p >= 1 && p <= 65535 {
+				used[p] = true
+			}
+		}
+	}
+	switch s.Role {
+	case RoleClient:
+		used[53] = true
+		used[9896] = true
+		if s.Client.FWD0.Enabled && s.Client.FWD0.Port > 0 {
+			used[s.Client.FWD0.Port] = true
+		}
+		if s.Client.FWD1.Enabled && s.Client.FWD1.Port > 0 {
+			used[s.Client.FWD1.Port] = true
+		}
+	case RoleServer, RoleLanding:
+		if s.Server.ListenPort > 0 {
+			used[s.Server.ListenPort] = true
+		}
+		if s.Server.TLSMode == "nginx" {
+			used[9890] = true
+			if s.Server.EnableDoH {
+				used[9853] = true
+			}
+		}
+	}
+	for _, fwd := range s.Relay.Forwards {
+		if fwd.ListenPort > 0 && strings.Contains(fwd.Proto, "tcp") {
+			used[fwd.ListenPort] = true
+		}
+	}
+	if s.RproxyS.Enabled {
+		if s.RproxyS.ListenPort > 0 {
+			used[s.RproxyS.ListenPort] = true
+		}
+		for _, m := range s.RproxyS.Mappings {
+			if m.Port > 0 && strings.Contains(m.Proto, "tcp") {
+				used[m.Port] = true
+			}
+		}
+	}
+	for _, ex := range s.ExtraInbounds {
+		if ex.ViaNginx || ex.ListenPort <= 0 {
+			continue
+		}
+		if ex.Protocol != "dokodemo" || ex.Network == "" || strings.Contains(ex.Network, "tcp") {
+			used[ex.ListenPort] = true
+		}
+	}
+
+	for _, ex := range s.ExtraInbounds {
+		if !ex.ViaNginx {
+			continue
+		}
+		start := ExtraInternalPort(ex.ListenPort)
+		if start < 1024 || start > 65535 {
+			start = 1024
+		}
+		chosen := 0
+		for p := start; p <= 65535; p++ {
+			if !used[p] {
+				chosen = p
+				break
+			}
+		}
+		if chosen == 0 {
+			for p := 1024; p < start; p++ {
+				if !used[p] {
+					chosen = p
+					break
+				}
+			}
+		}
+		if chosen == 0 {
+			chosen = start
+		}
+		used[chosen] = true
+		out[ex.Tag] = chosen
+	}
+	return out
+}
+
+func validateCleanAbsPath(field, p string) error {
+	if p == "" {
 		return nil
 	}
-	if len(dir) > 256 {
-		return fmt.Errorf("server.camouflage_dir: too long (%d > 256)", len(dir))
+	if len(p) > 256 {
+		return fmt.Errorf("%s: too long (%d > 256)", field, len(p))
 	}
-	if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir || dir == "/" {
-		return fmt.Errorf("server.camouflage_dir: must be a clean absolute path other than / (got %q)", dir)
+	if !filepath.IsAbs(p) || filepath.Clean(p) != p || p == "/" {
+		return fmt.Errorf("%s: must be a clean absolute path other than / (got %q)", field, p)
 	}
-	if hasControlChar(dir) || strings.ContainsAny(dir, " \t\r\n;{}\"'$\\#") {
-		return fmt.Errorf("server.camouflage_dir: contains disallowed whitespace or nginx characters (%q)", dir)
+	if hasControlChar(p) || strings.ContainsAny(p, " \t\r\n;{}\"'$\\#") {
+		return fmt.Errorf("%s: contains disallowed whitespace or nginx characters (%q)", field, p)
 	}
-	for _, r := range dir {
+	for _, r := range p {
 		if unicode.IsSpace(r) {
-			return fmt.Errorf("server.camouflage_dir: contains whitespace (%q)", dir)
+			return fmt.Errorf("%s: contains whitespace (%q)", field, p)
 		}
 	}
 	return nil

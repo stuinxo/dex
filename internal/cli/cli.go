@@ -2321,20 +2321,31 @@ func cmdExtra(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 		doApply := len(rest) > 1 && rest[1] == "--apply"
 		portNum, _ := strconv.Atoi(key)
 		if err := applyOrSave(store, exec, defRole, doApply, func(cur *state.State) error {
-			var next []state.ExtraInbound
-			found := false
-			for _, ex := range cur.ExtraInbounds {
-				if ex.Tag == key || (portNum > 0 && ex.ListenPort == portNum) {
-					found = true
-					continue
+			for i, ex := range cur.ExtraInbounds {
+				if ex.Tag == key {
+					cur.ExtraInbounds = append(cur.ExtraInbounds[:i], cur.ExtraInbounds[i+1:]...)
+					return nil
 				}
-				next = append(next, ex)
 			}
-			if !found {
-				return fmt.Errorf("extra inbound %q not found", key)
+			if portNum > 0 {
+				var matchedIdx []int
+				var matchedTags []string
+				for i, ex := range cur.ExtraInbounds {
+					if ex.ListenPort == portNum {
+						matchedIdx = append(matchedIdx, i)
+						matchedTags = append(matchedTags, ex.Tag)
+					}
+				}
+				if len(matchedIdx) == 1 {
+					idx := matchedIdx[0]
+					cur.ExtraInbounds = append(cur.ExtraInbounds[:idx], cur.ExtraInbounds[idx+1:]...)
+					return nil
+				}
+				if len(matchedIdx) > 1 {
+					return fmt.Errorf("multiple extra inbounds listen on port %d (%s); specify exact tag to delete", portNum, strings.Join(matchedTags, ", "))
+				}
 			}
-			cur.ExtraInbounds = next
-			return nil
+			return fmt.Errorf("extra inbound %q not found", key)
 		}); err != nil {
 			fmt.Fprintf(stderr, "extra del failed: %v\n", err)
 			return 1

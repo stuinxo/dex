@@ -171,24 +171,35 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 		}
 		globalDNS4, globalDNS6 := splitIPsByFamily(globalDNSRaw)
 
-		// Collect all proxy node endpoint IPs into V2NODE bypass sets
+		// Collect all proxy node endpoint IPs into V2NODE bypass sets (filtering restricted special IPs)
+		isRestrictedBypassIP := func(ip netip.Addr) bool {
+			return ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsMulticast()
+		}
 		var v2nodeRaw []string
 		for _, n := range s.Client.Nodes {
-			if _, ipErr := netip.ParseAddr(n.Address); ipErr == nil {
-				v2nodeRaw = append(v2nodeRaw, n.Address)
+			if ip, ipErr := netip.ParseAddr(strings.Trim(n.Address, "[]")); ipErr == nil {
+				if !isRestrictedBypassIP(ip) {
+					v2nodeRaw = append(v2nodeRaw, ip.String())
+				}
 			} else if ips := opts.ResolvedHostIPs[n.Address]; len(ips) > 0 {
 				for _, ip := range ips {
-					v2nodeRaw = append(v2nodeRaw, ip.String())
+					if !isRestrictedBypassIP(ip) {
+						v2nodeRaw = append(v2nodeRaw, ip.String())
+					}
 				}
 			}
 		}
 		if s.Client.RproxyC.Enabled && s.Client.RproxyC.TunnelAddress != "" {
 			addr := s.Client.RproxyC.TunnelAddress
-			if _, ipErr := netip.ParseAddr(addr); ipErr == nil {
-				v2nodeRaw = append(v2nodeRaw, addr)
+			if ip, ipErr := netip.ParseAddr(strings.Trim(addr, "[]")); ipErr == nil {
+				if !isRestrictedBypassIP(ip) {
+					v2nodeRaw = append(v2nodeRaw, ip.String())
+				}
 			} else if ips := opts.ResolvedHostIPs[addr]; len(ips) > 0 {
 				for _, ip := range ips {
-					v2nodeRaw = append(v2nodeRaw, ip.String())
+					if !isRestrictedBypassIP(ip) {
+						v2nodeRaw = append(v2nodeRaw, ip.String())
+					}
 				}
 			}
 		}
@@ -262,6 +273,9 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 		b.WriteString("        # Reject proxied QUIC (UDP 443) immediately so clients fall back to TCP without blackhole delay\n")
 		b.WriteString("        meta mark 0x8 meta l4proto udp th dport 443 counter reject\n")
 		b.WriteString("        tcp flags & (syn|rst) == syn tcp option maxseg size set rt mtu\n")
+		if !s.System.EnableIPv6 {
+			b.WriteString("        meta nfproto ipv6 ip6 daddr != { ::1/128, fc00::/7, fe80::/10, ff00::/8 } counter reject\n")
+		}
 		if s.Client.WireGuard.Enabled {
 			b.WriteString("        iifname \"wg0\" accept\n")
 			b.WriteString("        oifname \"wg0\" accept\n")

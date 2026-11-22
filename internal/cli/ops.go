@@ -683,7 +683,7 @@ func updateDexBinary(ctx context.Context, exec reconcile.SystemExecutor, cfg Ops
 	if err := DownloadWithMirrors(ctx, cfg.Client, strings.TrimRight(cfg.DexReleaseBase, "/")+"/"+asset, binStage, nil); err != nil {
 		return err
 	}
-	if err := DownloadWithMirrors(ctx, cfg.Client, strings.TrimRight(cfg.DexReleaseBase, "/")+"/SHA256SUMS", sumStage, nil); err != nil {
+	if err := DownloadTrustAnchor(ctx, cfg.Client, strings.TrimRight(cfg.DexReleaseBase, "/")+"/SHA256SUMS", sumStage); err != nil {
 		return err
 	}
 	sumsData, err := os.ReadFile(sumStage)
@@ -735,7 +735,7 @@ func updateXrayBinary(ctx context.Context, exec reconcile.SystemExecutor, cfg Op
 	if err := DownloadWithMirrors(ctx, cfg.Client, base+"/"+zipName, zipPath, nil); err != nil {
 		return err
 	}
-	if err := DownloadWithMirrors(ctx, cfg.Client, base+"/"+zipName+".dgst", dgstPath, nil); err != nil {
+	if err := DownloadTrustAnchor(ctx, cfg.Client, base+"/"+zipName+".dgst", dgstPath); err != nil {
 		return err
 	}
 	dgstBytes, err := os.ReadFile(dgstPath)
@@ -788,7 +788,7 @@ func parseMosDNSReleaseDigest(apiJSON []byte, assetName string) (string, error) 
 func resolveMosDNSSHA256(ctx context.Context, cfg OpsConfig, tmpDir, base, zipName string) (string, error) {
 	sumPath := filepath.Join(tmpDir, zipName+".sha256sum")
 	var sumErr error
-	if err := DownloadWithMirrors(ctx, cfg.Client, base+"/"+zipName+".sha256sum", sumPath, nil); err == nil {
+	if err := DownloadTrustAnchor(ctx, cfg.Client, base+"/"+zipName+".sha256sum", sumPath); err == nil {
 		if sumsData, rerr := os.ReadFile(sumPath); rerr == nil {
 			if expected, perr := findSHA256Entry(sumsData, zipName); perr == nil {
 				return expected, nil
@@ -807,7 +807,7 @@ func resolveMosDNSSHA256(ctx context.Context, cfg OpsConfig, tmpDir, base, zipNa
 	}
 
 	apiPath := filepath.Join(tmpDir, "mosdns-release.json")
-	if err := DownloadWithMirrors(ctx, cfg.Client, cfg.MosDNSReleaseAPIURL, apiPath, nil); err != nil {
+	if err := DownloadTrustAnchor(ctx, cfg.Client, cfg.MosDNSReleaseAPIURL, apiPath); err != nil {
 		return "", fmt.Errorf("fetch mosdns checksum (.sha256sum: %v; release API: %w)", sumErr, err)
 	}
 	apiData, err := os.ReadFile(apiPath)

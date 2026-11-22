@@ -828,3 +828,112 @@ func TestReconcileWave1ImportedCertBlockAdsAndNginxLegacy(t *testing.T) {
 		t.Fatalf("expected BlacklistDomains resolved IP in nftables.conf")
 	}
 }
+
+type failingResolveExec struct {
+	mockExecutor
+}
+
+func (*failingResolveExec) ResolveHostIPs(context.Context, string) ([]netip.Addr, error) {
+	return nil, errors.New("dns offline")
+}
+
+func TestReconcileHostsCacheObsoleteGuardResolvRestoreAndStalePrevCleanup(t *testing.T) {
+	// 1. Offline DNS fallback reuses cached IPs from existing mosdns/hosts.txt + cleans stale .prev files
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "etc", "dex")
+	store := state.NewStore(stateDir)
+	cli := state.NewDefaultState(state.RoleClient)
+	cli.Client.DNS.DoHServers = []string{"https://doh.cached.example/dq"}
+	cli.Client.Nodes = []state.OutboundNode{{
+		ID: "n1", Protocol: "vless-xhttp", Address: "node.cached.example", Port: 443,
+		UUID: "11111111-1111-4111-8111-111111111111",
+	}}
+	cli.Client.ActiveNodeID = "n1"
+	if err := store.Save(cli); err != nil {
+		t.Fatal(err)
+	}
+
+	genDir := filepath.Join(root, "etc", "dex", "generated")
+	hostsPath := filepath.Join(genDir, "mosdns", "hosts.txt")
+	_ = os.MkdirAll(filepath.Dir(hostsPath), 0o755)
+	_ = os.WriteFile(hostsPath, []byte("localhost 127.0.0.1\ndoh.cached.example 203.0.113.55\nnode.cached.example 203.0.113.66\n"), 0o644)
+
+	// Plant stale .prev files
+	staleFiles := []string{
+		filepath.Join(genDir, "xray.json.prev"),
+		filepath.Join(genDir, "mosdns", "hosts.txt.prev"),
+		filepath.Join(genDir, "wg-peers", "peer-a.conf.prev"),
+		filepath.Join(root, "etc", "wireguard", "wg0.conf.prev"),
+	}
+	for _, sf := range staleFiles {
+		_ = os.MkdirAll(filepath.Dir(sf), 0o755)
+		_ = os.WriteFile(sf, []byte("stale"), 0o644)
+	}
+
+	opts := ApplyOptions{
+		RootPrefix: root,
+		RenderOpts: render.RenderOptions{
+			StateDir:     "/etc/dex",
+			GeneratedDir: "/etc/dex/generated",
+			CertFile:     filepath.Join(stateDir, "ssl", "dex.cer"),
+			KeyFile:      filepath.Join(stateDir, "ssl", "dex.key"),
+		},
+	}
+	res, err := Reconcile(context.Background(), store, &failingResolveExec{}, opts)
+	if err != nil {
+		t.Fatalf("Reconcile with failingResolveExec: %v", err)
+	}
+	hostsAfter, _ := os.ReadFile(hostsPath)
+	if !strings.Contains(string(hostsAfter), "doh.cached.example 203.0.113.55") {
+		t.Fatalf("expected cached DoH IP preserved in hosts.txt on DNS failure, got:\n%s", string(hostsAfter))
+	}
+	nftAfter, _ := os.ReadFile(filepath.Join(genDir, "nftables.conf"))
+	if !strings.Contains(string(nftAfter), "203.0.113.55") || !strings.Contains(string(nftAfter), "203.0.113.66") {
+		t.Fatalf("expected cached DoH and node IPs preserved in nftables.conf, got:\n%s", string(nftAfter))
+	}
+	warnText := strings.Join(res.Warnings, "\n")
+	if !strings.Contains(warnText, "using cached IP from hosts.txt") {
+		t.Fatalf("expected cache reuse warning, got %v", res.Warnings)
+	}
+	for _, sf := range staleFiles {
+		if _, err := os.Stat(sf); !os.IsNotExist(err) {
+			t.Errorf("expected stale prev file %s cleaned up", sf)
+		}
+	}
+
+	// 2. CheckUnmanagedEdits rejects manually edited obsolete file (omitted from new render bundle) unless Force=true
+	obsoletePath := filepath.Join(genDir, "mosdns", "mosdns.yaml")
+	if err := os.WriteFile(obsoletePath, []byte("# user edited before role switch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := UpdateAndReconcile(context.Background(), store, state.RoleServer, &mockExecutor{}, opts, func(cur *state.State) error {
+		*cur = *state.NewDefaultState(state.RoleServer)
+		cur.Server.Domain = "srv.example.com"
+		cur.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+		return nil
+	}); !errors.Is(err, ErrManualModificationDetected) {
+		t.Fatalf("expected ErrManualModificationDetected for edited obsolete mosdns.yaml, got %v", err)
+	}
+
+	// 3. restoreResolvConfIfNeeded restores original /etc/resolv.conf when content is 127.0.0.1
+	resolvPath := filepath.Join(root, "etc", "resolv.conf")
+	origPath := filepath.Join(stateDir, "resolv.conf.orig")
+	_ = os.WriteFile(origPath, []byte("nameserver 223.5.5.5\n"), 0o644)
+	_ = os.WriteFile(resolvPath, []byte("nameserver 127.0.0.1\n"), 0o644)
+	if err := restoreResolvConfIfNeeded(resolvPath, origPath); err != nil {
+		t.Fatalf("restoreResolvConfIfNeeded: %v", err)
+	}
+	gotResolv, _ := os.ReadFile(resolvPath)
+	if string(gotResolv) != "nameserver 223.5.5.5\n" {
+		t.Fatalf("expected /etc/resolv.conf restored, got %q", string(gotResolv))
+	}
+	// Does not overwrite custom /etc/resolv.conf
+	_ = os.WriteFile(resolvPath, []byte("nameserver 9.9.9.9\n"), 0o644)
+	if err := restoreResolvConfIfNeeded(resolvPath, origPath); err != nil {
+		t.Fatalf("restoreResolvConfIfNeeded custom: %v", err)
+	}
+	gotResolv2, _ := os.ReadFile(resolvPath)
+	if string(gotResolv2) != "nameserver 9.9.9.9\n" {
+		t.Fatalf("expected custom /etc/resolv.conf untouched, got %q", string(gotResolv2))
+	}
+}

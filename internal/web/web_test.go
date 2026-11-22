@@ -327,7 +327,8 @@ func TestWave2EndpointsAndSecurity(t *testing.T) {
 	if afterSelfSign.Cert.Mode != "self_signed" {
 		t.Fatalf("expected Cert.Mode=self_signed, got %q", afterSelfSign.Cert.Mode)
 	}
-	impDir := t.TempDir()
+	impDir := filepath.Join(store.Dir, "imp")
+	_ = os.MkdirAll(impDir, 0o755)
 	_ = cert.EnsureSelfSigned(impDir+"/c.pem", impDir+"/k.pem", "imp.example.com")
 	cBytes, _ := io.ReadAll(func() io.Reader { b, _ := state.NewStore(impDir).Load(); _ = b; return strings.NewReader("") }())
 	_ = cBytes
@@ -360,7 +361,7 @@ func TestWave2EndpointsAndSecurity(t *testing.T) {
 	if bakRec.Code != 200 || !strings.Contains(bakRec.Body.String(), "secret-cf-token") || bakRec.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("backup failed, missing no-store, or redacted secrets: code=%d cc=%q", bakRec.Code, bakRec.Header().Get("Cache-Control"))
 	}
-	bakFile := filepath.Join(t.TempDir(), "backup.json")
+	bakFile := filepath.Join(store.Dir, "backup.json")
 	if err := os.WriteFile(bakFile, bakRec.Body.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -595,5 +596,120 @@ func TestLogsStreamSinceAndSystemAutoUpdateReconcileAndMemoryCaps(t *testing.T) 
 	srv.rlMu.Unlock()
 	if failCount > maxFailureBuckets || hasOld {
 		t.Fatalf("failures cap/cleanup failed: count=%d (max=%d) hasOld=%v", failCount, maxFailureBuckets, hasOld)
+	}
+}
+
+func TestHardeningWebPathWhitelistProxyRateLimitAndBodyLimits(t *testing.T) {
+	srv, store, _ := setupTestWeb(t, false)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	// 1. isHTTPSRequest & clientIPKey trust X-Forwarded-* / X-Real-IP ONLY from loopback RemoteAddr
+	nonLoopReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/", nil)
+	nonLoopReq.RemoteAddr = "192.0.2.50:12345"
+	nonLoopReq.Header.Set("X-Forwarded-Proto", "https")
+	nonLoopReq.Header.Set("X-Real-IP", "203.0.113.99")
+	if isHTTPSRequest(nonLoopReq) {
+		t.Fatalf("non-loopback RemoteAddr must not trust X-Forwarded-Proto")
+	}
+	if got := clientIPKey(nonLoopReq); got != "192.0.2.50" {
+		t.Fatalf("non-loopback RemoteAddr must ignore X-Real-IP, got %q", got)
+	}
+
+	loopReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/", nil)
+	loopReq.RemoteAddr = "127.0.0.1:54321"
+	loopReq.Header.Set("X-Forwarded-Proto", "https")
+	loopReq.Header.Set("X-Real-IP", "203.0.113.10")
+	if !isHTTPSRequest(loopReq) {
+		t.Fatalf("loopback RemoteAddr with X-Forwarded-Proto=https should be HTTPS")
+	}
+	if got := clientIPKey(loopReq); got != "203.0.113.10" {
+		t.Fatalf("loopback RemoteAddr should extract X-Real-IP, got %q", got)
+	}
+
+	// 2. Reverse proxy rate-limit isolates per X-Real-IP behind loopback Nginx
+	for i := 0; i < rateLimitMaxFails; i++ {
+		r, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/auth/login", strings.NewReader(`{"password":"wrong"}`))
+		r.RemoteAddr = "127.0.0.1:40000"
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("X-Real-IP", "203.0.113.10")
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, r)
+	}
+	// 203.0.113.10 is blocked, while 203.0.113.20 behind same loopback proxy logs in cleanly
+	blockedReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/auth/login", strings.NewReader(`{"password":"myPass123"}`))
+	blockedReq.RemoteAddr = "127.0.0.1:40001"
+	blockedReq.Header.Set("Content-Type", "application/json")
+	blockedReq.Header.Set("X-Real-IP", "203.0.113.10")
+	blockedRec := httptest.NewRecorder()
+	srv.ServeHTTP(blockedRec, blockedReq)
+	if blockedRec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 for rate-limited X-Real-IP 203.0.113.10, got %d", blockedRec.Code)
+	}
+
+	okReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/auth/login", strings.NewReader(`{"password":"myPass123"}`))
+	okReq.RemoteAddr = "127.0.0.1:40002"
+	okReq.Header.Set("Content-Type", "application/json")
+	okReq.Header.Set("X-Real-IP", "203.0.113.20")
+	okRec := httptest.NewRecorder()
+	srv.ServeHTTP(okRec, okReq)
+	if okRec.Code != http.StatusOK {
+		t.Fatalf("expected distinct X-Real-IP 203.0.113.20 login 200, got %d (%s)", okRec.Code, okRec.Body.String())
+	}
+	var lData map[string]any
+	_ = json.Unmarshal(okRec.Body.Bytes(), &lData)
+	csrf := lData["csrf_token"].(string)
+	cookies := okRec.Result().Cookies()
+
+	doReq := func(method, path, body string) *httptest.ResponseRecorder {
+		req, _ := http.NewRequest(method, ts.URL+path, strings.NewReader(body))
+		req.Header.Set("X-CSRF-Token", csrf)
+		req.Header.Set("Content-Type", "application/json")
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 3. /api/v1/migrate & /api/v1/cert/import reject non-whitelisted paths and symlinks escaping whitelist
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, "secret.json")
+	_ = os.WriteFile(outsideFile, []byte("{}"), 0o600)
+
+	for _, badMig := range []string{
+		fmt.Sprintf(`{"kind":"v3_state","path":%q}`, outsideFile),
+		`{"kind":"v3_state","path":"/etc/passwd"}`,
+		`{"kind":"v3_state","path":"/etc/dex/../passwd"}`,
+		`{"kind":"v3_state","path":"/"}`,
+	} {
+		if rec := doReq(http.MethodPost, "/api/v1/migrate", badMig); rec.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 for non-whitelisted migrate path %s, got %d (%s)", badMig, rec.Code, rec.Body.String())
+		}
+	}
+
+	symCert := filepath.Join(store.Dir, "evil-sym.pem")
+	_ = os.Symlink(outsideFile, symCert)
+	for _, badCert := range []string{
+		fmt.Sprintf(`{"cert_path":%q,"key_path":%q}`, outsideFile, outsideFile),
+		fmt.Sprintf(`{"cert_path":%q,"key_path":%q}`, symCert, filepath.Join(store.Dir, "ssl", "dex.key")),
+		`{"cert_path":"/etc/shadow","key_path":"/etc/dex/ssl/dex.key"}`,
+	} {
+		if rec := doReq(http.MethodPost, "/api/v1/cert/import", badCert); rec.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 for non-whitelisted cert/import %s, got %d (%s)", badCert, rec.Code, rec.Body.String())
+		}
+	}
+
+	// 4. decodeJSONBody rejects oversized body & trailing non-whitespace tokens
+	bigBody := `{"password":"` + strings.Repeat("a", 5000) + `"}`
+	bigReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/auth/login", strings.NewReader(bigBody))
+	var dst map[string]any
+	if err := decodeJSONBody(bigReq, &dst, 4096); err == nil || !strings.Contains(err.Error(), "request body too large") {
+		t.Fatalf("expected 'request body too large', got %v", err)
+	}
+	trailReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/auth/login", strings.NewReader(`{"password":"x"}{"extra":1}`))
+	if err := decodeJSONBody(trailReq, &dst, 4096); err == nil {
+		t.Fatalf("expected trailing JSON token rejected")
 	}
 }

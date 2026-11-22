@@ -189,10 +189,13 @@ func NormalizePath(path, uuid string) string {
 
 // ExtraInternalPort returns the loopback port Xray binds to when an ExtraInbound is fronted by Nginx.
 func ExtraInternalPort(listenPort int) int {
-	if listenPort+10000 <= 65535 {
-		return listenPort + 10000
-	}
-	return listenPort - 10000
+	return state.ExtraInternalPort(listenPort)
+}
+
+// AllocateViaNginxInternalPorts deterministically assigns collision-free loopback ports
+// for all ViaNginx ExtraInbounds keyed by ex.Tag.
+func AllocateViaNginxInternalPorts(s *state.State) map[string]int {
+	return state.AllocateViaNginxInternalPorts(s)
 }
 
 // BuildNodeURI formats a standard client share URI for an OutboundNode.

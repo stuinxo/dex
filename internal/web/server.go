@@ -186,14 +186,42 @@ func withSecurityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+func isLoopbackRemote(remoteAddr string) bool {
+	raw := strings.TrimSpace(remoteAddr)
+	if raw == "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(raw)
+	if err != nil {
+		host = raw
+	}
+	host = strings.Trim(host, "[]")
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.IsLoopback()
+}
+
 func isHTTPSRequest(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
 	}
-	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+	return isLoopbackRemote(r.RemoteAddr) && strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
 }
 
 func clientIPKey(r *http.Request) string {
+	if isLoopbackRemote(r.RemoteAddr) {
+		if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+			if ip, err := netip.ParseAddr(strings.Trim(xri, "[]")); err == nil {
+				return ip.String()
+			}
+		}
+		if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
+			first, _, _ := strings.Cut(xff, ",")
+			first = strings.TrimSpace(first)
+			if ip, err := netip.ParseAddr(strings.Trim(first, "[]")); err == nil {
+				return ip.String()
+			}
+		}
+	}
 	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
 	if err == nil && host != "" {
 		return host
@@ -329,8 +357,76 @@ func decodeJSONBody(r *http.Request, dst any, maxBytes int64) error {
 	if maxBytes <= 0 {
 		maxBytes = 1 << 20
 	}
-	dec := json.NewDecoder(io.LimitReader(r.Body, maxBytes))
-	return dec.Decode(dst)
+	if r.Body == nil {
+		return io.EOF
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxBytes+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(raw)) > maxBytes {
+		return errors.New("request body too large")
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("request body must contain a single JSON object")
+		}
+		return err
+	}
+	return nil
+}
+
+func validateAllowedPath(rawPath string, allowedPrefixes []string, allowRoot bool) (string, error) {
+	p := strings.TrimSpace(rawPath)
+	if p == "" {
+		return "", nil
+	}
+	if !filepath.IsAbs(p) {
+		return "", fmt.Errorf("path must be absolute: %q", rawPath)
+	}
+	clean := filepath.Clean(p)
+	if clean == "/" {
+		if allowRoot {
+			return "/", nil
+		}
+		return "", errors.New("root path is not allowed")
+	}
+
+	resolved := clean
+	if eval, err := filepath.EvalSymlinks(clean); err == nil {
+		resolved = eval
+	} else if evalDir, derr := filepath.EvalSymlinks(filepath.Dir(clean)); derr == nil {
+		resolved = filepath.Join(evalDir, filepath.Base(clean))
+	}
+
+	matchesAny := func(candidate string, resolvePrefix bool) bool {
+		for _, pref := range allowedPrefixes {
+			pref = strings.TrimSpace(pref)
+			if pref == "" {
+				continue
+			}
+			cp := filepath.Clean(pref)
+			if resolvePrefix {
+				if evalP, err := filepath.EvalSymlinks(cp); err == nil && evalP != "" {
+					cp = evalP
+				}
+			}
+			if candidate == cp || strings.HasPrefix(candidate, cp+string(filepath.Separator)) {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !matchesAny(clean, false) || !matchesAny(resolved, true) {
+		return "", fmt.Errorf("path %q is outside allowed directories", clean)
+	}
+	return clean, nil
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -1260,6 +1356,18 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request, _ *sessio
 		}
 	} else {
 		p := strings.TrimSpace(req.Path)
+		if p != "" {
+			allowed := []string{"/opt/de_GWD", "/etc/des", "/etc/vless-lite", "/etc/dex"}
+			if s.Store != nil && s.Store.Dir != "" {
+				allowed = append(allowed, s.Store.Dir)
+			}
+			cleaned, perr := validateAllowedPath(p, allowed, req.Kind == "v2_server")
+			if perr != nil {
+				writeJSONError(w, http.StatusBadRequest, perr.Error())
+				return
+			}
+			p = cleaned
+		}
 		switch req.Kind {
 		case "", "v2_client":
 			if p == "" {
@@ -1744,6 +1852,20 @@ func (s *Server) handleCertImport(w http.ResponseWriter, r *http.Request, _ *ses
 		}
 		if werr := os.WriteFile(srcKey, []byte(req.KeyPEM), 0o600); werr != nil {
 			writeJSONError(w, http.StatusInternalServerError, werr.Error())
+			return
+		}
+	} else {
+		allowed := []string{"/etc/dex", "/var/www/ssl", "/opt/de_GWD", "/etc/ssl", "/etc/letsencrypt", "/root/.acme.sh"}
+		if s.Store != nil && s.Store.Dir != "" {
+			allowed = append(allowed, s.Store.Dir)
+		}
+		var perr error
+		if srcCert, perr = validateAllowedPath(srcCert, allowed, false); perr != nil {
+			writeJSONError(w, http.StatusBadRequest, "cert_path: "+perr.Error())
+			return
+		}
+		if srcKey, perr = validateAllowedPath(srcKey, allowed, false); perr != nil {
+			writeJSONError(w, http.StatusBadRequest, "key_path: "+perr.Error())
 			return
 		}
 	}

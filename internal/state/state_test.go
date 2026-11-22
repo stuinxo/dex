@@ -450,3 +450,95 @@ func TestCamouflageDirExtraDomainAndListenAddrValidation(t *testing.T) {
 		t.Fatalf("expected server web-ui port conflict error, got %v", err)
 	}
 }
+
+func TestHardeningValidationRules(t *testing.T) {
+	// 1. Cert.CertFile and Cert.KeyFile reject nginx-unsafe / non-clean paths
+	validSrv := func() *State {
+		s := NewDefaultState(RoleServer)
+		s.Server.Domain = "srv.example.com"
+		s.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+		return s
+	}
+	sCertOK := validSrv()
+	sCertOK.Cert.CertFile = "/etc/dex/ssl/dex.cer"
+	sCertOK.Cert.KeyFile = "/etc/dex/ssl/dex.key"
+	if err := sCertOK.Validate(); err != nil {
+		t.Fatalf("expected clean cert/key paths accepted, got %v", err)
+	}
+	badPaths := []string{
+		"/",
+		"relative/cert.pem",
+		"/etc/dex/../ssl/dex.cer",
+		"/etc/dex/ssl/a b.cer",
+		"/etc/dex/ssl/a;return 200",
+		"/etc/dex/ssl/a{b}",
+		"/etc/dex/ssl/a\"b",
+		"/etc/dex/ssl/a'b",
+		"/etc/dex/ssl/$cert",
+		"/etc/dex/ssl/a\\b",
+		"/etc/dex/ssl/#comment",
+		"/etc/dex/ssl/a\nb",
+		"/" + strings.Repeat("c", 256),
+	}
+	for _, bp := range badPaths {
+		sc := validSrv()
+		sc.Cert.CertFile = bp
+		if err := sc.Validate(); err == nil {
+			t.Errorf("expected bad cert.cert_file %q rejected", bp)
+		}
+		sk := validSrv()
+		sk.Cert.KeyFile = bp
+		if err := sk.Validate(); err == nil {
+			t.Errorf("expected bad cert.key_file %q rejected", bp)
+		}
+	}
+
+	// 2. Client.Nodes and RproxyC.TunnelAddress reject restricted IP literals
+	restrictedIPs := []string{
+		"127.0.0.1",
+		"::1",
+		"0.0.0.0",
+		"::",
+		"169.254.169.254",
+		"fe80::1",
+		"224.0.0.1",
+		"ff02::1",
+	}
+	for _, rip := range restrictedIPs {
+		c := NewDefaultState(RoleClient)
+		c.Client.Nodes = []OutboundNode{{
+			ID: "bad", Protocol: "socks5", Address: rip, Port: 1080,
+		}}
+		if err := c.Validate(); err == nil {
+			t.Errorf("expected restricted node IP %q rejected", rip)
+		}
+
+		cr := NewDefaultState(RoleClient)
+		cr.Client.RproxyC = RproxyCConfig{
+			Enabled:       true,
+			TunnelAddress: rip,
+			TunnelPort:    20000,
+			TunnelUUID:    "11111111-1111-4111-8111-111111111111",
+		}
+		if err := cr.Validate(); err == nil {
+			t.Errorf("expected restricted rproxyc.tunnel_address %q rejected", rip)
+		}
+	}
+
+	// 3. Multiple ViaNginx extra inbounds on same port get distinct internal ports avoiding occupied ports
+	sMulti := validSrv()
+	sMulti.Server.TLSMode = "nginx"
+	sMulti.ExtraInbounds = []ExtraInbound{
+		{Tag: "vn-1", Protocol: "vless-xhttp", ListenPort: 443, Domain: "a.example.com", UUID: "22222222-2222-4222-8222-222222222222", ViaNginx: true},
+		{Tag: "occupy-10444", Protocol: "socks5", ListenPort: 10444},
+		{Tag: "vn-2", Protocol: "vless-ws", ListenPort: 443, Domain: "b.example.com", UUID: "33333333-3333-4333-8333-333333333333", ViaNginx: true},
+		{Tag: "vn-3", Protocol: "vmess-ws", ListenPort: 443, Domain: "c.example.com", UUID: "44444444-4444-4444-8444-444444444444", ViaNginx: true},
+	}
+	if err := sMulti.Validate(); err != nil {
+		t.Fatalf("expected multi via_nginx with different domains valid, got %v", err)
+	}
+	ports := AllocateViaNginxInternalPorts(sMulti)
+	if ports["vn-1"] != 10443 || ports["vn-2"] != 10445 || ports["vn-3"] != 10446 {
+		t.Fatalf("unexpected allocated via_nginx internal ports: %+v", ports)
+	}
+}

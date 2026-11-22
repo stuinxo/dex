@@ -137,6 +137,8 @@ func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, 
 `, xhttpPath, mainConnHeaders)
 	}
 
+	viaNginxPorts := AllocateViaNginxInternalPorts(s)
+
 	for _, ex := range extraViaNginx {
 		dom := ex.Domain
 		if dom == "" {
@@ -147,6 +149,10 @@ func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, 
 		if ex.Protocol == "vless-ws" || ex.Protocol == "vmess-ws" {
 			wsHeaders = `    proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";`
+		}
+		internalPort := viaNginxPorts[ex.Tag]
+		if internalPort <= 0 {
+			internalPort = ExtraInternalPort(ex.ListenPort)
 		}
 		fmt.Fprintf(&b, `
 server {
@@ -169,7 +175,7 @@ server {
     proxy_read_timeout 600s;
   }
 }
-`, listenSSLDirective(ex.ListenPort, opts.NginxLegacyHTTP2), dom, opts.CertFile, opts.KeyFile, path, ExtraInternalPort(ex.ListenPort), wsHeaders)
+`, listenSSLDirective(ex.ListenPort, opts.NginxLegacyHTTP2), dom, opts.CertFile, opts.KeyFile, path, internalPort, wsHeaders)
 	}
 
 	return []byte(b.String()), true, nil

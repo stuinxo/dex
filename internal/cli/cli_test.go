@@ -260,7 +260,7 @@ func TestWave2ServerExtraNodeCertWGCommands(t *testing.T) {
 	if code, _, errOut := runC("node", "add", "--id", "n1", "--from-uri", "vless://11111111-1111-4111-8111-111111111111@hk1.example.com:443?type=xhttp&security=tls&sni=hk1.example.com&path=%2Fhk#HK1"); code != 0 {
 		t.Fatalf("node add --from-uri failed: %s", errOut)
 	}
-	if code, _, errOut := runC("node", "add", "--id", "n2", "--proto", "socks5", "--address", "127.0.0.1", "--port", "1080", "--username", "u", "--password", "p"); code != 0 {
+	if code, _, errOut := runC("node", "add", "--id", "n2", "--proto", "socks5", "--address", "198.51.100.10", "--port", "1080", "--username", "u", "--password", "p"); code != 0 {
 		t.Fatalf("node add socks5 failed: %s", errOut)
 	}
 	if code, _, errOut := runC("node", "edit", "n1", "--name", "HK-Renamed"); code != 0 {
@@ -285,6 +285,32 @@ func TestWave2ServerExtraNodeCertWGCommands(t *testing.T) {
 	code, stOut, _ := runC("status")
 	if code != 0 || !strings.Contains(stOut, "Services:") || !strings.Contains(stOut, "Certificate:") {
 		t.Fatalf("expected Services and Certificate summary in dex status, got:\n%s", stOut)
+	}
+
+	// 5. dex extra del rejects ambiguous shared port and deletes by exact tag only
+	ambDir := filepath.Join(dir, "extra-amb-state")
+	runA := func(args ...string) (int, string, string) {
+		var o, e bytes.Buffer
+		full := append([]string{"--state-dir", ambDir}, args...)
+		return Run(full, strings.NewReader(""), &o, &e), o.String(), e.String()
+	}
+	if code, _, errOut := runA("init", "--role", "server", "--domain", "main.example.com"); code != 0 {
+		t.Fatalf("server init failed: %s", errOut)
+	}
+	if code, _, errOut := runA("extra", "add-xhttp", "--tag", "vn-a", "--port", "443", "--domain", "a.example.com", "--via-nginx"); code != 0 {
+		t.Fatalf("extra add-xhttp vn-a failed: %s", errOut)
+	}
+	if code, _, errOut := runA("extra", "add-vless-ws", "--tag", "vn-b", "--port", "443", "--domain", "b.example.com", "--via-nginx"); code != 0 {
+		t.Fatalf("extra add-vless-ws vn-b failed: %s", errOut)
+	}
+	if code, _, errOut := runA("extra", "del", "443"); code == 0 || !strings.Contains(errOut, "vn-a") || !strings.Contains(errOut, "vn-b") {
+		t.Fatalf("expected ambiguous port 443 delete rejected listing vn-a and vn-b, got code=%d err=%q", code, errOut)
+	}
+	if code, _, errOut := runA("extra", "del", "vn-a"); code != 0 {
+		t.Fatalf("expected exact tag delete vn-a to succeed, got code=%d err=%q", code, errOut)
+	}
+	if code, listOut, _ := runA("extra", "list"); code != 0 || strings.Contains(listOut, "vn-a") || !strings.Contains(listOut, "vn-b") {
+		t.Fatalf("expected only vn-b remaining after deleting vn-a, got:\n%s", listOut)
 	}
 }
 
