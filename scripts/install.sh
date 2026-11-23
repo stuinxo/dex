@@ -386,6 +386,9 @@ main() {
   install_base_pkgs
   install_dex_binary
 
+  if [ "${1:-}" = "--" ]; then
+    shift
+  fi
   role="${1:-}"
   case "$role" in
     client)
@@ -448,10 +451,15 @@ main() {
       say "[+] Ready. Run 'dex init --role relay --apply' or 'dex' for interactive menu."
       ;;
     "")
-      say "[+] DEX installed. Run 'dex' to open menu, or re-run with: install.sh [client|server|landing|relay]"
+      if [ "${DEX_NO_MENU:-0}" != "1" ] && [ -t 1 ] && ( : </dev/tty ) 2>/dev/null; then
+        say "[+] DEX installed. Opening interactive menu..."
+        exec "$INSTALL_BIN" </dev/tty
+      else
+        say "[+] DEX installed. Run 'dex' to open menu, or pass a role: curl -Lso- github.com/${DEX_REPO}/raw/main/i | sh -s [client|server|landing|relay]"
+      fi
       ;;
     *)
-      die "Usage: $0 [client|server|landing|relay]"
+      die "Usage: curl -Lso- github.com/${DEX_REPO}/raw/main/i | sh -s [client|server|landing|relay]"
       ;;
   esac
 }

@@ -16,10 +16,17 @@
 支持 **Debian 12/13 / Ubuntu**（`apt + systemd`）与 **Alpine 3.x**（`apk + OpenRC`），`amd64` / `arm64`：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/stuinxo/dex/main/scripts/install.sh -o install.sh && sh install.sh
+# 安装后自动进入交互菜单
+curl -Lso- github.com/stuinxo/dex/raw/main/i | sh
+# 或使用 wget
+wget -qO- github.com/stuinxo/dex/raw/main/i | sh
+
+# 指定角色直装（client / server / landing / relay）
+curl -Lso- github.com/stuinxo/dex/raw/main/i | sh -s client
+curl -Lso- github.com/stuinxo/dex/raw/main/i | sh -s server
 ```
 
-离线部署需显式指定本地二进制或压缩包路径环境变量（不隐式扫描 `.` 或 `/tmp`）：`DEX_BIN=/root/dex-linux-amd64 XRAY_ZIP=/root/Xray-linux-64.zip MOSDNS_ZIP=/root/mosdns-linux-amd64.zip sh install.sh [client|server|landing|relay]`。
+离线部署需显式指定本地二进制或压缩包路径环境变量（不隐式扫描 `.` 或 `/tmp`）：`DEX_BIN=/root/dex-linux-amd64 XRAY_ZIP=/root/Xray-linux-64.zip MOSDNS_ZIP=/root/mosdns-linux-amd64.zip sh i [client|server|landing|relay]`。
 
 ## 四种运行角色
 

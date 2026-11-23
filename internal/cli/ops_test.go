@@ -908,3 +908,271 @@ func TestUpdateComponentsRollsBackOnRestartFailure(t *testing.T) {
 		t.Fatalf("expected explicit missing DEX_BIN error, got %v", err)
 	}
 }
+
+func TestShortInstallerSyncAndRegularFile(t *testing.T) {
+	shortPath := filepath.Join("..", "..", "i")
+	installPath := filepath.Join("..", "..", "scripts", "install.sh")
+
+	shortInfo, err := os.Lstat(shortPath)
+	if err != nil {
+		t.Fatalf("lstat %s: %v", shortPath, err)
+	}
+	if shortInfo.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("%s must be a regular file, not a symlink", shortPath)
+	}
+	if !shortInfo.Mode().IsRegular() {
+		t.Fatalf("%s must be a regular file, mode=%v", shortPath, shortInfo.Mode())
+	}
+	if shortInfo.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("%s must be executable, mode=%v", shortPath, shortInfo.Mode().Perm())
+	}
+
+	installInfo, err := os.Lstat(installPath)
+	if err != nil {
+		t.Fatalf("lstat %s: %v", installPath, err)
+	}
+	if installInfo.Mode()&os.ModeSymlink != 0 || !installInfo.Mode().IsRegular() {
+		t.Fatalf("%s must be a regular non-symlink file", installPath)
+	}
+
+	shortBytes, err := os.ReadFile(shortPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", shortPath, err)
+	}
+	installBytes, err := os.ReadFile(installPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", installPath, err)
+	}
+	if !bytes.Equal(shortBytes, installBytes) {
+		t.Fatalf("%s and %s must be byte-for-byte identical", shortPath, installPath)
+	}
+}
+
+type bootstrapMockExec struct {
+	*fakeOpsExec
+	hasCmd func(string) bool
+}
+
+func (b *bootstrapMockExec) HasCommand(name string) bool {
+	if b.hasCmd != nil {
+		return b.hasCmd(name)
+	}
+	return b.fakeOpsExec.HasCommand(name)
+}
+
+func TestBootstrapRoleRuntimeDeps(t *testing.T) {
+	xrayELF := []byte("\x7fELF\x02\x01\x01\x00xray-boot")
+	mosELF := []byte("\x7fELF\x02\x01\x01\x00mos-boot")
+	xrayZip := makeTestZip(t, "xray", xrayELF)
+	mosZip := makeTestZip(t, "mosdns", mosELF)
+	xraySum := sha256.Sum256(xrayZip)
+	mosSum := sha256.Sum256(mosZip)
+
+	geoip := []byte("geoip-boot")
+	geosite := []byte("geosite-boot")
+	geoipSum := sha256.Sum256(geoip)
+	geositeSum := sha256.Sum256(geosite)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/xray/Xray-linux-64.zip":
+			_, _ = w.Write(xrayZip)
+		case "/xray/Xray-linux-64.zip.dgst":
+			fmt.Fprintf(w, "SHA2-256=%s\n", hex.EncodeToString(xraySum[:]))
+		case "/mosdns/mosdns-linux-amd64.zip":
+			_, _ = w.Write(mosZip)
+		case "/mosdns/mosdns-linux-amd64.zip.sha256sum":
+			fmt.Fprintf(w, "%s  mosdns-linux-amd64.zip\n", hex.EncodeToString(mosSum[:]))
+		case "/geoip.dat":
+			_, _ = w.Write(geoip)
+		case "/geoip.dat.sha256sum":
+			fmt.Fprintf(w, "%s  geoip.dat\n", hex.EncodeToString(geoipSum[:]))
+		case "/geosite.dat":
+			_, _ = w.Write(geosite)
+		case "/geosite.dat.sha256sum":
+			fmt.Fprintf(w, "%s  geosite.dat\n", hex.EncodeToString(geositeSum[:]))
+		case "/cn.txt":
+			_, _ = w.Write([]byte("1.0.1.0/24\n223.5.5.0/24\n"))
+		case "/direct.txt":
+			_, _ = w.Write([]byte("qq.com\nbaidu.com\n"))
+		case "/apple.txt":
+			_, _ = w.Write([]byte("apple.com\nicloud.com\n"))
+		case "/games.txt":
+			_, _ = w.Write([]byte("steampowered.com\nsteamcontent.com\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	newCfg := func(dir string) OpsConfig {
+		return OpsConfig{
+			Client:          srv.Client(),
+			XrayReleaseBase: srv.URL + "/xray",
+			MosDNSBase:      srv.URL + "/mosdns",
+			GeoIPURL:        srv.URL + "/geoip.dat",
+			GeoSiteURL:      srv.URL + "/geosite.dat",
+			ChnRouteURL:     srv.URL + "/cn.txt",
+			DomainsChnURL:   srv.URL + "/direct.txt",
+			DomainsAppleURL: srv.URL + "/apple.txt",
+			DomainsGamesURL: srv.URL + "/games.txt",
+			XrayBinPath:     filepath.Join(dir, "xray"),
+			MosDNSBinPath:   filepath.Join(dir, "mosdns"),
+			GOARCH:          "amd64",
+			MinChnRouteCIDR: 2,
+			MinChnDomains:   2,
+			MinAppleDomains: 2,
+			MinGamesDomains: 2,
+		}
+	}
+
+	t.Run("client_apt", func(t *testing.T) {
+		dir := t.TempDir()
+		store := state.NewStore(filepath.Join(dir, "dex"))
+		if err := store.Save(state.NewDefaultState(state.RoleClient)); err != nil {
+			t.Fatal(err)
+		}
+		cfg := newCfg(dir)
+		base := &fakeOpsExec{activeSvcs: map[string]bool{}}
+		exec := &bootstrapMockExec{
+			fakeOpsExec: base,
+			hasCmd: func(name string) bool {
+				return name == "apt-get"
+			},
+		}
+		var out bytes.Buffer
+		if err := bootstrapRoleRuntimeDeps(context.Background(), store, exec, state.RoleClient, cfg, &out); err != nil {
+			t.Fatalf("bootstrap client failed: %v", err)
+		}
+		joined := strings.Join(base.cmds, "\n")
+		if !strings.Contains(joined, "apt-get install -y -qq --no-install-recommends wireguard-tools") {
+			t.Fatalf("expected wireguard-tools installed via apt-get, cmds=%v", base.cmds)
+		}
+		if got, _ := os.ReadFile(cfg.XrayBinPath); !bytes.Equal(got, xrayELF) {
+			t.Fatalf("expected xray binary installed")
+		}
+		if got, _ := os.ReadFile(cfg.MosDNSBinPath); !bytes.Equal(got, mosELF) {
+			t.Fatalf("expected mosdns binary installed")
+		}
+		for _, f := range []string{"geoip.dat", "geosite.dat", "IPchnroute", "Domains.chn.txt", "Domains.apple.txt", "Domains.games.txt"} {
+			if _, err := os.Stat(filepath.Join(store.Dir, "rules", f)); err != nil {
+				t.Fatalf("expected client rule %s created: %v", f, err)
+			}
+		}
+	})
+
+	t.Run("server_apk", func(t *testing.T) {
+		dir := t.TempDir()
+		store := state.NewStore(filepath.Join(dir, "dex"))
+		st := state.NewDefaultState(state.RoleServer)
+		st.Server.Domain = "srv.example.com"
+		st.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+		st.Server.Path = "/dex"
+		if err := store.Save(st); err != nil {
+			t.Fatal(err)
+		}
+		cfg := newCfg(dir)
+		base := &fakeOpsExec{activeSvcs: map[string]bool{}}
+		exec := &bootstrapMockExec{
+			fakeOpsExec: base,
+			hasCmd: func(name string) bool {
+				return name == "apk"
+			},
+		}
+		var out bytes.Buffer
+		if err := bootstrapRoleRuntimeDeps(context.Background(), store, exec, state.RoleServer, cfg, &out); err != nil {
+			t.Fatalf("bootstrap server failed: %v", err)
+		}
+		joined := strings.Join(base.cmds, "\n")
+		if !strings.Contains(joined, "apk add --no-cache nginx socat wireguard-tools") {
+			t.Fatalf("expected server packages installed via apk, cmds=%v", base.cmds)
+		}
+		if got, _ := os.ReadFile(cfg.XrayBinPath); !bytes.Equal(got, xrayELF) {
+			t.Fatalf("expected xray binary installed")
+		}
+		if _, err := os.Stat(cfg.MosDNSBinPath); !os.IsNotExist(err) {
+			t.Fatalf("server role must not install mosdns")
+		}
+		if got, _ := os.ReadFile(filepath.Join(store.Dir, "rules", "geoip.dat")); !bytes.Equal(got, geoip) {
+			t.Fatalf("expected verified geoip.dat for server")
+		}
+		if got, _ := os.ReadFile(filepath.Join(store.Dir, "rules", "geosite.dat")); !bytes.Equal(got, geosite) {
+			t.Fatalf("expected verified geosite.dat for server")
+		}
+	})
+
+	t.Run("relay_partial_present", func(t *testing.T) {
+		dir := t.TempDir()
+		store := state.NewStore(filepath.Join(dir, "dex"))
+		if err := store.Save(state.NewDefaultState(state.RoleRelay)); err != nil {
+			t.Fatal(err)
+		}
+		rulesDir := filepath.Join(store.Dir, "rules")
+		if err := os.MkdirAll(rulesDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		existingGeoip := []byte("existing-geoip")
+		if err := os.WriteFile(filepath.Join(rulesDir, "geoip.dat"), existingGeoip, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg := newCfg(dir)
+		base := &fakeOpsExec{activeSvcs: map[string]bool{}}
+		exec := &bootstrapMockExec{
+			fakeOpsExec: base,
+			hasCmd: func(name string) bool {
+				return name == "apt-get" || name == cfg.XrayBinPath
+			},
+		}
+		var out bytes.Buffer
+		if err := bootstrapRoleRuntimeDeps(context.Background(), store, exec, state.RoleRelay, cfg, &out); err != nil {
+			t.Fatalf("bootstrap relay failed: %v", err)
+		}
+		joined := strings.Join(base.cmds, "\n")
+		if !strings.Contains(joined, "apt-get install -y -qq --no-install-recommends haproxy") {
+			t.Fatalf("expected haproxy installed via apt-get, cmds=%v", base.cmds)
+		}
+		if _, err := os.Stat(cfg.XrayBinPath); !os.IsNotExist(err) {
+			t.Fatalf("expected xray download skipped when HasCommand reports present")
+		}
+		if got, _ := os.ReadFile(filepath.Join(rulesDir, "geoip.dat")); !bytes.Equal(got, existingGeoip) {
+			t.Fatalf("expected existing geoip.dat preserved, got %q", got)
+		}
+		if got, _ := os.ReadFile(filepath.Join(rulesDir, "geosite.dat")); !bytes.Equal(got, geosite) {
+			t.Fatalf("expected missing geosite.dat downloaded")
+		}
+	})
+
+	t.Run("landing_minimal", func(t *testing.T) {
+		dir := t.TempDir()
+		store := state.NewStore(filepath.Join(dir, "dex"))
+		st := state.NewDefaultState(state.RoleLanding)
+		st.Server.Domain = "land.example.com"
+		st.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+		st.Server.Path = "/dex"
+		if err := store.Save(st); err != nil {
+			t.Fatal(err)
+		}
+		cfg := newCfg(dir)
+		base := &fakeOpsExec{activeSvcs: map[string]bool{}}
+		exec := &bootstrapMockExec{
+			fakeOpsExec: base,
+			hasCmd:      func(string) bool { return false },
+		}
+		var out bytes.Buffer
+		if err := bootstrapRoleRuntimeDeps(context.Background(), store, exec, state.RoleLanding, cfg, &out); err != nil {
+			t.Fatalf("bootstrap landing failed: %v", err)
+		}
+		if len(base.cmds) != 0 {
+			t.Fatalf("expected no OS packages installed for landing, cmds=%v", base.cmds)
+		}
+		if got, _ := os.ReadFile(cfg.XrayBinPath); !bytes.Equal(got, xrayELF) {
+			t.Fatalf("expected xray binary installed for landing")
+		}
+		if got, _ := os.ReadFile(filepath.Join(store.Dir, "rules", "geoip.dat")); !bytes.Equal(got, geoip) {
+			t.Fatalf("expected geoip.dat installed for landing")
+		}
+		if got, _ := os.ReadFile(filepath.Join(store.Dir, "rules", "geosite.dat")); !bytes.Equal(got, geosite) {
+			t.Fatalf("expected geosite.dat installed for landing")
+		}
+	})
+}
