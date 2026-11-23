@@ -290,6 +290,7 @@
     clearEl(sysKV);
     addKV(sysKV, "备注 / 主机名", (statusInfo.device_alias || "-") + " / " + (statusInfo.hostname || "-"));
     addKV(sysKV, "架构 / Init / 内核", (statusInfo.arch || "-") + " · " + (statusInfo.init_system || "-") + (statusInfo.kernel ? (" · " + statusInfo.kernel) : ""));
+    addKV(sysKV, "拥塞控制 / 队列", statusInfo.net_opt || "-");
     addKV(sysKV, "内存 / 运行时长", (statusInfo.mem_mb || 0) + " MiB / " + formatDuration(statusInfo.uptime_sec));
     if (paused) {
       addKV(sysKV, "代理状态", "已暂停 (国内 MosDNS 保持运行)");
@@ -569,6 +570,8 @@
 
     var defListen = defaultListenAddrForRole(currentState.role);
     $("sys-hostname").value = (currentState.system && currentState.system.hostname) || "";
+    $("sys-auto-sysctl").checked = !!(currentState.system && currentState.system.auto_tune_sysctl);
+    $("sys-flowtable").checked = !!(currentState.system && currentState.system.enable_flowtable);
     $("sys-auto-update-core").checked = !!(currentState.system && currentState.system.auto_update_core);
     $("auth-listen").placeholder = defListen;
     $("auth-listen").value = (currentState.auth && currentState.auth.listen_addr) || defListen;
@@ -1884,6 +1887,8 @@
 
   $("btn-save-system").addEventListener("click", function () {
     currentState.system.hostname = $("sys-hostname").value.trim();
+    currentState.system.auto_tune_sysctl = $("sys-auto-sysctl").checked;
+    currentState.system.enable_flowtable = $("sys-flowtable").checked;
     currentState.system.auto_update_core = $("sys-auto-update-core").checked;
     currentState.auth.listen_addr = $("auth-listen").value.trim() || defaultListenAddrForRole(currentState.role);
     saveAndApplyState("系统设置已保存并应用");

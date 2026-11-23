@@ -30,6 +30,7 @@ command="%s"
 command_args="run -c %s"
 command_background=true
 pidfile="/run/dex-xray.pid"
+rc_ulimit="-n 1000000"
 output_log="/var/log/dex-xray.log"
 error_log="/var/log/dex-xray.log"
 
@@ -58,6 +59,7 @@ command="%s"
 command_args="start -c %s"
 command_background=true
 pidfile="/run/dex-mosdns.pid"
+rc_ulimit="-n 65535"
 output_log="/var/log/dex-mosdns.log"
 error_log="/var/log/dex-mosdns.log"
 
@@ -131,6 +133,7 @@ command="%s"
 command_args="serve-doh --listen 127.0.0.1:9853 --upstream 1.1.1.1:53,8.8.8.8:53,127.0.0.53:53,127.0.0.1:53 --path /dq"
 command_background=true
 pidfile="/run/dex-doh.pid"
+rc_ulimit="-n 65535"
 depend() { need net; }
 `, opts.DexBin)
 			out = append(out, RenderedFile{
@@ -148,6 +151,7 @@ command="%s"
 command_args="--state-dir %s daemon"
 command_background=true
 pidfile="/run/dex-daemon.pid"
+rc_ulimit="-n 65535"
 output_log="/var/log/dex-daemon.log"
 error_log="/var/log/dex-daemon.log"
 depend() { need net; }
@@ -274,6 +278,7 @@ Type=simple
 ExecStart=%s serve-doh --listen 127.0.0.1:9853 --upstream 1.1.1.1:53,8.8.8.8:53,127.0.0.53:53,127.0.0.1:53 --path /dq
 Restart=always
 RestartSec=2
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -297,6 +302,7 @@ Type=simple
 ExecStart=%s --state-dir %s daemon
 Restart=always
 RestartSec=2
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -305,6 +311,24 @@ WantedBy=multi-user.target
 			RelName:    "systemd/dex-daemon.service",
 			TargetPath: "/etc/systemd/system/dex-daemon.service",
 			Content:    []byte(unit),
+			Mode:       0o644,
+		})
+	}
+
+	if b.NginxNeeded {
+		out = append(out, RenderedFile{
+			RelName:    "systemd/nginx-limits.conf",
+			TargetPath: "/etc/systemd/system/nginx.service.d/dex-limits.conf",
+			Content:    []byte("[Service]\nLimitNOFILE=1000000\n"),
+			Mode:       0o644,
+		})
+	}
+
+	if b.HAProxyNeeded {
+		out = append(out, RenderedFile{
+			RelName:    "systemd/haproxy-limits.conf",
+			TargetPath: "/etc/systemd/system/haproxy.service.d/dex-limits.conf",
+			Content:    []byte("[Service]\nLimitNOFILE=1000000\n"),
 			Mode:       0o644,
 		})
 	}

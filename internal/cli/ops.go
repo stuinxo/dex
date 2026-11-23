@@ -477,7 +477,7 @@ func cmdUpdate(store *state.Store, exec reconcile.SystemExecutor, args []string,
 	fs := flag.NewFlagSet("update", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	component := fs.String("component", "all", "all|dex|xray|mosdns|rules")
-	ver := fs.String("version", "latest", "target dex version tag (e.g. latest or v0.0.3)")
+	ver := fs.String("version", "latest", "target dex version tag (e.g. latest or v0.0.4)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}

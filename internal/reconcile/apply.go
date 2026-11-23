@@ -96,9 +96,9 @@ func servicesForFile(relName, targetPath, wgUnit string) ([]string, bool) {
 		return []string{"dex-nft"}, true
 	case strings.HasPrefix(relName, "mosdns/") || relName == "systemd/dex-mosdns.service" || relName == "openrc/dex-mosdns":
 		return []string{"dex-mosdns"}, true
-	case relName == "haproxy.cfg":
+	case relName == "haproxy.cfg" || relName == "systemd/haproxy-limits.conf":
 		return []string{"haproxy"}, true
-	case relName == "nginx-dex.conf":
+	case relName == "nginx-dex.conf" || relName == "systemd/nginx-limits.conf":
 		return []string{"nginx"}, true
 	case relName == "wg0.conf":
 		return []string{wgUnit}, true
@@ -115,7 +115,7 @@ func servicesForFile(relName, targetPath, wgUnit string) ([]string, bool) {
 		return []string{"dex-rules-update.timer"}, true
 	case relName == "systemd/dex-core-update.timer" || relName == "systemd/dex-core-update.service":
 		return []string{"dex-core-update.timer"}, true
-	case relName == "sysctl-99-dex.conf":
+	case relName == "sysctl-99-dex.conf" || relName == "modules-99-dex.conf":
 		return nil, true
 	}
 
@@ -129,9 +129,9 @@ func servicesForFile(relName, targetPath, wgUnit string) ([]string, bool) {
 		return []string{"dex-nft"}, true
 	case strings.Contains(slash, "/mosdns/") || base == "dex-mosdns.service" || targetPath == "/etc/init.d/dex-mosdns":
 		return []string{"dex-mosdns"}, true
-	case targetPath == "/etc/haproxy/haproxy.cfg":
+	case targetPath == "/etc/haproxy/haproxy.cfg" || targetPath == "/etc/systemd/system/haproxy.service.d/dex-limits.conf":
 		return []string{"haproxy"}, true
-	case targetPath == "/etc/nginx/conf.d/dex-server.conf":
+	case targetPath == "/etc/nginx/conf.d/dex-server.conf" || targetPath == "/etc/systemd/system/nginx.service.d/dex-limits.conf":
 		return []string{"nginx"}, true
 	case targetPath == "/etc/wireguard/wg0.conf":
 		return []string{wgUnit}, true
@@ -147,7 +147,7 @@ func servicesForFile(relName, targetPath, wgUnit string) ([]string, bool) {
 		return []string{"dex-rules-update.timer"}, true
 	case base == "dex-core-update.timer" || base == "dex-core-update.service":
 		return []string{"dex-core-update.timer"}, true
-	case targetPath == "/etc/sysctl.d/99-dex.conf":
+	case targetPath == "/etc/sysctl.d/99-dex.conf" || targetPath == "/etc/modules-load.d/99-dex.conf":
 		return nil, true
 	default:
 		// Unknown file ownership: conservatively restart active managed services.
@@ -848,9 +848,20 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 	}
 	applyServices := func() error {
 		if st.System.AutoTuneSysctl && !ropts.IsContainer {
+			if exec.HasCommand("modprobe") {
+				for _, mod := range []string{"tcp_bbr", "nf_conntrack", "sch_cake"} {
+					_, _ = exec.RunCommand(ctx, nil, "modprobe", mod)
+				}
+			}
 			sysctlDisk := mapTargetPath(opts.RootPrefix, "/etc/sysctl.d/99-dex.conf")
 			if _, err := os.Stat(sysctlDisk); err == nil && exec.HasCommand("sysctl") {
-				_, _ = exec.RunCommand(ctx, nil, "sysctl", "-p", sysctlDisk)
+				_, _ = exec.RunCommand(ctx, nil, "sysctl", "-e", "-p", sysctlDisk)
+				if qdiscOut, qerr := exec.RunCommand(ctx, nil, "sysctl", "-n", "net.core.default_qdisc"); qerr == nil {
+					curQdisc := strings.TrimSpace(qdiscOut)
+					if curQdisc != "" && curQdisc != "cake" && curQdisc != "fq" {
+						_, _ = exec.RunCommand(ctx, nil, "sysctl", "-w", "net.core.default_qdisc=fq")
+					}
+				}
 			}
 		}
 
@@ -885,7 +896,11 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 
 		changedServices := make(map[string]bool)
 		restartAllFallback := false
+		nginxDropinChanged := false
 		for _, cf := range changedFiles {
+			if cf.relName == "systemd/nginx-limits.conf" || cf.targetPath == "/etc/systemd/system/nginx.service.d/dex-limits.conf" {
+				nginxDropinChanged = true
+			}
 			svcs, known := servicesForFile(cf.relName, cf.targetPath, wgUnit)
 			if !known {
 				restartAllFallback = true
@@ -933,6 +948,9 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		for _, oldUnit := range obsoleteUnitPaths {
 			diskPath := mapTargetPath(opts.RootPrefix, oldUnit)
 			_ = os.Remove(diskPath)
+			if dir := filepath.Dir(diskPath); strings.HasSuffix(dir, ".service.d") {
+				_ = os.Remove(dir)
+			}
 			res.FilesRemoved = append(res.FilesRemoved, oldUnit)
 		}
 
@@ -947,7 +965,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 			wasActive := exec.ServiceIsActive(ctx, ropts.InitSystem, sp.name)
 			if opts.RestartAll || restartAllFallback || changedServices[sp.name] || !wasActive {
 				touchedSvcs = append(touchedSvcs, touchedService{name: sp.name, wasActive: wasActive})
-				if sp.name == "nginx" && wasActive && !opts.RestartAll {
+				if sp.name == "nginx" && wasActive && !opts.RestartAll && !nginxDropinChanged {
 					if rerr := exec.ServiceReload(ctx, ropts.InitSystem, sp.name); rerr != nil {
 						if err := exec.ServiceEnableStart(ctx, ropts.InitSystem, sp.name); err != nil {
 							return err
@@ -1148,6 +1166,9 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 	// Clean up backups (including any stale .prev files left by prior crashes) and commit manifest + state transaction
 	for _, b := range backups {
 		_ = os.Remove(b.prevPath)
+		if dir := filepath.Dir(b.diskPath); strings.HasSuffix(dir, ".service.d") {
+			_ = os.Remove(dir)
+		}
 	}
 	cleanupStalePrevFiles(opts.RootPrefix, ropts.GeneratedDir)
 	if err := SaveManifest(store.ManifestPath(), BuildManifest(bundle.Files)); err != nil {

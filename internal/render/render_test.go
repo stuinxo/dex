@@ -291,7 +291,7 @@ func TestRenderServerSocks5AndNginx(t *testing.T) {
 
 	ng, _ := findFile(bundle, "nginx-dex.conf")
 	ngStr := string(ng.Content)
-	if !strings.Contains(ngStr, "listen 80;") || !strings.Contains(ngStr, "listen 443 ssl;") || !strings.Contains(ngStr, "location /dq") || !strings.Contains(ngStr, "location /11111111") {
+	if !strings.Contains(ngStr, "listen 80;") || !strings.Contains(ngStr, "listen 443 ssl reuseport fastopen=256;") || !strings.Contains(ngStr, "location /dq") || !strings.Contains(ngStr, "location /11111111") {
 		t.Fatalf("unexpected nginx-dex.conf:\n%s", ngStr)
 	}
 }
@@ -562,7 +562,7 @@ func TestRenderWave1ProtocolsAndDataPlane(t *testing.T) {
 	}
 	ngf, _ := findFile(sBundle, "nginx-dex.conf")
 	ngStr := string(ngf.Content)
-	if !strings.Contains(ngStr, "listen 443 ssl http2;") || !strings.Contains(ngStr, "Upgrade $http_upgrade;") || !strings.Contains(ngStr, `Connection "upgrade";`) {
+	if !strings.Contains(ngStr, "listen 443 ssl http2 reuseport fastopen=256;") || !strings.Contains(ngStr, "Upgrade $http_upgrade;") || !strings.Contains(ngStr, `Connection "upgrade";`) {
 		t.Fatalf("expected legacy http2 + WS upgrade headers in nginx-dex.conf:\n%s", ngStr)
 	}
 	sxf, _ := findFile(sBundle, "xray.json")
@@ -722,8 +722,7 @@ func TestRenderNFTablesWireGuardSubnetAndBypass(t *testing.T) {
 	nftStr := string(data)
 
 	for _, needle := range []string{
-		"ct state established ip daddr 10.66.66.0/24 flow offload @acceleration",
-		"ct state established ip saddr 10.66.66.0/24 flow offload @acceleration",
+		"meta l4proto { tcp, udp } ct state established flow offload @acceleration",
 		`oifname "eth0" ip saddr 10.66.66.0/24 masquerade`,
 		"meta l4proto udp th dport 51821 accept",
 		"meta l4proto udp th sport 51821 accept",
@@ -1070,8 +1069,11 @@ func TestHardeningMosDNSDoHLoopNodeFallbackIPv6AndMultiViaNginx(t *testing.T) {
 	}
 	ngf, _ := findFile(sBundle, "nginx-dex.conf")
 	ngStr := string(ngf.Content)
-	if !strings.Contains(ngStr, "proxy_pass http://127.0.0.1:10443;") || !strings.Contains(ngStr, "proxy_pass http://127.0.0.1:10444;") {
-		t.Fatalf("expected 10443 and 10444 in nginx-dex.conf:\n%s", ngStr)
+	if !strings.Contains(ngStr, "upstream dex_extra_10443") || !strings.Contains(ngStr, "proxy_pass http://dex_extra_10443;") || !strings.Contains(ngStr, "upstream dex_extra_10444") || !strings.Contains(ngStr, "proxy_pass http://dex_extra_10444;") {
+		t.Fatalf("expected dex_extra_10443 and dex_extra_10444 upstreams in nginx-dex.conf:\n%s", ngStr)
+	}
+	if strings.Count(ngStr, "listen 443 ssl reuseport fastopen=256;") != 1 {
+		t.Fatalf("expected reuseport fastopen=256 only on first :443 server block:\n%s", ngStr)
 	}
 	sxf, _ := findFile(sBundle, "xray.json")
 	var sxcfg map[string]any
@@ -1200,7 +1202,7 @@ func TestHardeningWGPeerCollisionRelayTagsIPv6RproxyAndNginxDualStack(t *testing
 		t.Fatalf("RenderNginx dual-stack: %v", err)
 	}
 	ngDualStr := string(ngDual)
-	for _, want := range []string{"listen [::]:80;", "listen [::]:443 ssl;", "listen [::]:8444 ssl;"} {
+	for _, want := range []string{"listen [::]:80;", "listen [::]:443 ssl reuseport fastopen=256;", "listen [::]:8444 ssl reuseport fastopen=256;"} {
 		if !strings.Contains(ngDualStr, want) {
 			t.Fatalf("expected %q in dual-stack nginx config:\n%s", want, ngDualStr)
 		}
@@ -1209,7 +1211,7 @@ func TestHardeningWGPeerCollisionRelayTagsIPv6RproxyAndNginxDualStack(t *testing
 	if err != nil {
 		t.Fatalf("RenderNginx legacy dual-stack: %v", err)
 	}
-	if !strings.Contains(string(ngLegacyDual), "listen [::]:443 ssl http2;") {
+	if !strings.Contains(string(ngLegacyDual), "listen [::]:443 ssl http2 reuseport fastopen=256;") {
 		t.Fatalf("expected legacy IPv6 http2 directive:\n%s", string(ngLegacyDual))
 	}
 }
@@ -1285,5 +1287,174 @@ func TestRenderClientRproxySRuleOrderAndMosDNSNon443DialAddr(t *testing.T) {
 	}
 	if !strings.Contains(myStr, `dial_addr: "198.51.100.11"`) {
 		t.Fatalf("expected default-port DoH dial_addr without port, got:\n%s", myStr)
+	}
+}
+
+func TestV004SysctlMemoryTiersFlowtableNginxPoolHAProxyXrayPolicyAndUnits(t *testing.T) {
+	// 1. Sysctl 3 memory tiers (<256, 256..1023, >=1024) + modules-load + container exclusion
+	c := state.NewDefaultState(state.RoleClient)
+	c.System.AutoTuneSysctl = true
+	c.System.EnableIPv6 = true
+
+	tiers := []struct {
+		memMB   int
+		wantBuf string
+		wantCT  string
+	}{
+		{128, "4194304", "65536"},
+		{512, "16777216", "262144"},
+		{2048, "33554432", "1048576"},
+	}
+	for _, tc := range tiers {
+		sf, ok := RenderSysctl(c, RenderOptions{MemMB: tc.memMB})
+		if !ok {
+			t.Fatalf("RenderSysctl(mem=%d) returned ok=false", tc.memMB)
+		}
+		sStr := string(sf.Content)
+		for _, want := range []string{
+			"net.core.default_qdisc = fq\nnet.core.default_qdisc = cake",
+			"net.core.rmem_max = " + tc.wantBuf,
+			"net.core.wmem_max = " + tc.wantBuf,
+			"net.ipv4.tcp_rmem = 4096 131072 " + tc.wantBuf,
+			"net.ipv4.tcp_wmem = 4096 65536 " + tc.wantBuf,
+			"net.netfilter.nf_conntrack_max = " + tc.wantCT,
+			"net.netfilter.nf_conntrack_tcp_be_liberal = 1",
+			"net.ipv4.tcp_syncookies = 1",
+			"net.ipv4.tcp_notsent_lowat = 131072",
+			"net.ipv4.tcp_mtu_probing = 1",
+			"net.ipv4.ip_local_port_range = 10240 65535",
+			"net.mptcp.enabled = 1",
+			"net.ipv4.conf.all.rp_filter = 0",
+			"net.ipv4.conf.default.secure_redirects = 0",
+		} {
+			if !strings.Contains(sStr, want) {
+				t.Errorf("mem=%d sysctl missing %q\n%s", tc.memMB, want, sStr)
+			}
+		}
+		mf, mok := RenderModulesLoad(c, RenderOptions{MemMB: tc.memMB})
+		if !mok || string(mf.Content) != "tcp_bbr\nsch_cake\nnf_conntrack\n" {
+			t.Fatalf("mem=%d unexpected RenderModulesLoad: ok=%v content=%q", tc.memMB, mok, string(mf.Content))
+		}
+	}
+	if _, ok := RenderSysctl(c, RenderOptions{IsContainer: true}); ok {
+		t.Fatalf("expected RenderSysctl disabled in container")
+	}
+	if _, ok := RenderModulesLoad(c, RenderOptions{IsContainer: true}); ok {
+		t.Fatalf("expected RenderModulesLoad disabled in container")
+	}
+
+	// 2. Flowtable active on client without WireGuard AND on relay with nft forward
+	c.Client.WireGuard.Enabled = false
+	nftClient, cNeed, _, err := RenderNFTables(c, RenderOptions{PhysicalNICs: []string{"eth0", "eth1"}})
+	if err != nil || !cNeed {
+		t.Fatalf("RenderNFTables client no-WG failed: err=%v cNeed=%v", err, cNeed)
+	}
+	if !strings.Contains(string(nftClient), "table inet dex_flow {") || !strings.Contains(string(nftClient), "meta l4proto { tcp, udp } ct state established flow offload @acceleration") {
+		t.Fatalf("expected dex_flow offload on client without WG:\n%s", string(nftClient))
+	}
+
+	rel := state.NewDefaultState(state.RoleRelay)
+	rel.System.EnableFlowtable = true
+	rel.Relay.Forwards = []state.ForwardRule{
+		{ID: "r-nft", ListenPort: 10001, TargetHost: "198.51.100.1", TargetPort: 443, Proto: "tcp,udp", Engine: "nft"},
+		{ID: "r-hap", ListenPort: 10002, TargetHost: "198.51.100.2", TargetPort: 443, Proto: "tcp", Engine: "haproxy"},
+	}
+	relBundle, err := RenderAll(rel, RenderOptions{PhysicalNICs: []string{"ens3"}, InitSystem: "systemd"})
+	if err != nil {
+		t.Fatalf("RenderAll relay: %v", err)
+	}
+	nftRel, _ := findFile(relBundle, "nftables.conf")
+	if !strings.Contains(string(nftRel.Content), "devices = { ens3 };") || !strings.Contains(string(nftRel.Content), "meta l4proto { tcp, udp } ct state established flow offload @acceleration") {
+		t.Fatalf("expected dex_flow offload on nft relay:\n%s", string(nftRel.Content))
+	}
+	hapFile, _ := findFile(relBundle, "haproxy.cfg")
+	for _, want := range []string{"maxconn 65535", "option splice-auto", "option dontlognull", "timeout client-fin 30s", "timeout tunnel     1h"} {
+		if !strings.Contains(string(hapFile.Content), want) {
+			t.Errorf("haproxy.cfg missing %q:\n%s", want, string(hapFile.Content))
+		}
+	}
+	hapLim, ok := findFile(relBundle, "systemd/haproxy-limits.conf")
+	if !ok || hapLim.TargetPath != "/etc/systemd/system/haproxy.service.d/dex-limits.conf" || !strings.Contains(string(hapLim.Content), "LimitNOFILE=1000000") {
+		t.Fatalf("missing/invalid systemd haproxy-limits.conf: ok=%v file=%+v", ok, hapLim)
+	}
+
+	// 3. GoMemLimit cap 1024MiB + Xray policy bufferSize
+	if got := (RenderOptions{MemMB: 128}).GoMemLimit(); got != "44MiB" {
+		t.Errorf("GoMemLimit(128) = %q, want 44MiB", got)
+	}
+	if got := (RenderOptions{MemMB: 2048}).GoMemLimit(); got != "716MiB" {
+		t.Errorf("GoMemLimit(2048) = %q, want 716MiB", got)
+	}
+	if got := (RenderOptions{MemMB: 4096}).GoMemLimit(); got != "1024MiB" {
+		t.Errorf("GoMemLimit(4096) = %q, want 1024MiB", got)
+	}
+
+	xbLow, _, err := RenderXray(c, RenderOptions{MemMB: 256})
+	if err != nil {
+		t.Fatalf("RenderXray low mem: %v", err)
+	}
+	var xLow map[string]any
+	_ = json.Unmarshal(xbLow, &xLow)
+	if buf := xLow["policy"].(map[string]any)["levels"].(map[string]any)["0"].(map[string]any)["bufferSize"]; buf != float64(64) {
+		t.Fatalf("expected bufferSize=64 for MemMB=256, got %v", buf)
+	}
+	xbHigh, _, err := RenderXray(c, RenderOptions{MemMB: 1024})
+	if err != nil {
+		t.Fatalf("RenderXray high mem: %v", err)
+	}
+	var xHigh map[string]any
+	_ = json.Unmarshal(xbHigh, &xHigh)
+	if buf := xHigh["policy"].(map[string]any)["levels"].(map[string]any)["0"].(map[string]any)["bufferSize"]; buf != float64(512) {
+		t.Fatalf("expected bufferSize=512 for MemMB=1024, got %v", buf)
+	}
+
+	// 4. Nginx DoH upstream pool (without Cache-Control no-cache) + systemd limits + OpenRC rc_ulimit
+	srv := state.NewDefaultState(state.RoleServer)
+	srv.Server.TLSMode = "nginx"
+	srv.Server.Domain = "srv.example.com"
+	srv.Server.EnableDoH = true
+	srv.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	srvBundle, err := RenderAll(srv, RenderOptions{InitSystem: "systemd"})
+	if err != nil {
+		t.Fatalf("RenderAll server systemd: %v", err)
+	}
+	ngf, _ := findFile(srvBundle, "nginx-dex.conf")
+	ngStr := string(ngf.Content)
+	if !strings.Contains(ngStr, "keepalive 256;") || !strings.Contains(ngStr, "upstream dex_doh") || !strings.Contains(ngStr, "proxy_pass                  http://dex_doh/dq;") {
+		t.Fatalf("expected keepalive pools in nginx-dex.conf:\n%s", ngStr)
+	}
+	if strings.Contains(ngStr, "add_header Cache-Control    no-cache;") {
+		t.Fatalf("expected Cache-Control no-cache removed from nginx /dq location:\n%s", ngStr)
+	}
+	if ngLim, ok := findFile(srvBundle, "systemd/nginx-limits.conf"); !ok || !strings.Contains(string(ngLim.Content), "LimitNOFILE=1000000") {
+		t.Fatalf("missing systemd/nginx-limits.conf")
+	}
+	if dohUnit, ok := findFile(srvBundle, "systemd/dex-doh.service"); !ok || !strings.Contains(string(dohUnit.Content), "LimitNOFILE=65535") {
+		t.Fatalf("missing LimitNOFILE=65535 in dex-doh.service")
+	}
+	if dmnUnit, ok := findFile(srvBundle, "systemd/dex-daemon.service"); !ok || !strings.Contains(string(dmnUnit.Content), "LimitNOFILE=65535") {
+		t.Fatalf("missing LimitNOFILE=65535 in dex-daemon.service")
+	}
+
+	// OpenRC rc_ulimit checks
+	orcSrv, err := RenderAll(srv, RenderOptions{InitSystem: "openrc"})
+	if err != nil {
+		t.Fatalf("RenderAll server openrc: %v", err)
+	}
+	if f, ok := findFile(orcSrv, "openrc/dex-xray"); !ok || !strings.Contains(string(f.Content), `rc_ulimit="-n 1000000"`) {
+		t.Fatalf("missing rc_ulimit on openrc/dex-xray")
+	}
+	if f, ok := findFile(orcSrv, "openrc/dex-doh"); !ok || !strings.Contains(string(f.Content), `rc_ulimit="-n 65535"`) {
+		t.Fatalf("missing rc_ulimit on openrc/dex-doh")
+	}
+	if f, ok := findFile(orcSrv, "openrc/dex-daemon"); !ok || !strings.Contains(string(f.Content), `rc_ulimit="-n 65535"`) {
+		t.Fatalf("missing rc_ulimit on openrc/dex-daemon")
+	}
+	orcCli, err := RenderAll(c, RenderOptions{InitSystem: "openrc"})
+	if err != nil {
+		t.Fatalf("RenderAll client openrc: %v", err)
+	}
+	if f, ok := findFile(orcCli, "openrc/dex-mosdns"); !ok || !strings.Contains(string(f.Content), `rc_ulimit="-n 65535"`) {
+		t.Fatalf("missing rc_ulimit on openrc/dex-mosdns")
 	}
 }

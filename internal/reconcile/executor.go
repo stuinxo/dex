@@ -267,3 +267,27 @@ func (OSExecutor) ResolveHostIPs(ctx context.Context, host string) ([]netip.Addr
 	}
 	return ips, nil
 }
+
+// ReadKernelNetOpt returns the active Linux TCP congestion control algorithm and default qdisc
+// (e.g. "bbr + cake" or "bbr + fq"), or "" if unavailable on the host OS.
+func ReadKernelNetOpt() string {
+	ccBytes, err1 := os.ReadFile("/proc/sys/net/ipv4/tcp_congestion_control")
+	qdBytes, err2 := os.ReadFile("/proc/sys/net/core/default_qdisc")
+	var cc, qd string
+	if err1 == nil {
+		cc = strings.TrimSpace(string(ccBytes))
+	}
+	if err2 == nil {
+		qd = strings.TrimSpace(string(qdBytes))
+	}
+	switch {
+	case cc != "" && qd != "":
+		return cc + " + " + qd
+	case cc != "":
+		return cc
+	case qd != "":
+		return qd
+	default:
+		return ""
+	}
+}

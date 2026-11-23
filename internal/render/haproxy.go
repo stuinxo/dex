@@ -27,14 +27,19 @@ func RenderHAProxy(s *state.State) (data []byte, needed bool, err error) {
 
 	var b strings.Builder
 	b.WriteString(`global
-  maxconn 4096
+  maxconn 65535
 
 defaults
   mode tcp
-  timeout connect 10s
-  timeout client  1h
-  timeout server  1h
-  timeout check   10s
+  option splice-auto
+  option dontlognull
+  timeout connect    5s
+  timeout client     30m
+  timeout server     30m
+  timeout client-fin 30s
+  timeout server-fin 30s
+  timeout tunnel     1h
+  timeout check      10s
 
 resolvers dex_dns
   nameserver dns1 1.1.1.1:53

@@ -114,7 +114,6 @@ func writeNFTSet(b *strings.Builder, name, nftType string, elems []string, inter
 func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeeded bool, relayNeeded bool, err error) {
 	opts = opts.WithDefaults()
 	var b strings.Builder
-	b.WriteString("#!/usr/sbin/nft -f\n\n")
 
 	if s.Role == state.RoleClient {
 		clientNeeded = true
@@ -232,28 +231,6 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 		}
 		lanProxy4, lanProxy6 := splitIPsByFamily(lanProxyRaw)
 		lanDirect4, lanDirect6 := splitIPsByFamily(lanDirectRaw)
-
-		// Optional flowtable acceleration for WireGuard/LAN forwarding
-		if s.System.EnableFlowtable && len(opts.PhysicalNICs) > 0 {
-			var nics []string
-			for _, nic := range opts.PhysicalNICs {
-				nic = strings.TrimSpace(nic)
-				if nic != "" {
-					nics = append(nics, nic)
-				}
-			}
-			if len(nics) > 0 {
-				b.WriteString("table inet dex_flow {}\ndelete table inet dex_flow\ntable inet dex_flow {\n")
-				fmt.Fprintf(&b, "    flowtable acceleration {\n        hook ingress priority filter; devices = { %s };\n    }\n", strings.Join(nics, ", "))
-				b.WriteString("    chain forward {\n        type filter hook forward priority filter; policy accept;\n")
-				if s.Client.WireGuard.Enabled {
-					wgNet := wireGuardSubnetCIDR(s.Client.WireGuard.SubnetCIDR)
-					fmt.Fprintf(&b, "        ct state established ip daddr %s flow offload @acceleration\n", wgNet)
-					fmt.Fprintf(&b, "        ct state established ip saddr %s flow offload @acceleration\n", wgNet)
-				}
-				b.WriteString("    }\n}\n\n")
-			}
-		}
 
 		// Filter + NAT table for WireGuard, MSS clamping, and QUIC UDP/443 rejection
 		b.WriteString("table inet dex_filter {}\ndelete table inet dex_filter\ntable inet dex_filter {\n")
@@ -456,5 +433,28 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 	if !clientNeeded && !relayNeeded {
 		return nil, false, false, nil
 	}
-	return []byte(b.String()), clientNeeded, relayNeeded, nil
+
+	var out strings.Builder
+	out.WriteString("#!/usr/sbin/nft -f\n\n")
+
+	// Optional flowtable acceleration for bypass-gateway direct traffic and nft relay forwarding
+	if (s.Role == state.RoleClient || relayNeeded) && s.System.EnableFlowtable && len(opts.PhysicalNICs) > 0 {
+		var nics []string
+		for _, nic := range opts.PhysicalNICs {
+			nic = strings.TrimSpace(nic)
+			if nic != "" {
+				nics = append(nics, nic)
+			}
+		}
+		if len(nics) > 0 {
+			out.WriteString("table inet dex_flow {}\ndelete table inet dex_flow\ntable inet dex_flow {\n")
+			fmt.Fprintf(&out, "    flowtable acceleration {\n        hook ingress priority filter; devices = { %s };\n    }\n", strings.Join(nics, ", "))
+			out.WriteString("    chain forward {\n        type filter hook forward priority filter; policy accept;\n")
+			out.WriteString("        meta l4proto { tcp, udp } ct state established flow offload @acceleration\n")
+			out.WriteString("    }\n}\n\n")
+		}
+	}
+
+	out.WriteString(b.String())
+	return []byte(out.String()), clientNeeded, relayNeeded, nil
 }

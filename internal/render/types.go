@@ -85,14 +85,14 @@ func (o RenderOptions) WithDefaults() RenderOptions {
 	return o
 }
 
-// GoMemLimit computes GOMEMLIMIT string matching des logic: clamp(MemMB*35/100, 24, 256) + "MiB".
+// GoMemLimit computes GOMEMLIMIT string: clamp(MemMB*35/100, 24, 1024) + "MiB".
 func (o RenderOptions) GoMemLimit() string {
 	g := o.MemMB * 35 / 100
 	if g < 24 {
 		g = 24
 	}
-	if g > 256 {
-		g = 256
+	if g > 1024 {
+		g = 1024
 	}
 	return fmt.Sprintf("%dMiB", g)
 }

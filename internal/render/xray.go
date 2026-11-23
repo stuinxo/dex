@@ -1184,11 +1184,27 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 		logLevel = "warning"
 	}
 
+	bufKB := 512
+	if opts.MemMB < 512 {
+		bufKB = 64
+	}
+
 	cfg := map[string]any{
 		"log": map[string]any{
 			"access":   "none",
 			"error":    "none",
 			"loglevel": logLevel,
+		},
+		"policy": map[string]any{
+			"levels": map[string]any{
+				"0": map[string]any{
+					"handshake":    4,
+					"connIdle":     300,
+					"uplinkOnly":   2,
+					"downlinkOnly": 5,
+					"bufferSize":   bufKB,
+				},
+			},
 		},
 		"dns": dnsCfg,
 		"routing": map[string]any{

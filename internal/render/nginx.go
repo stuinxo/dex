@@ -7,18 +7,22 @@ import (
 	"github.com/stuinxo/dex/internal/state"
 )
 
-func listenSSLDirective(port int, legacyHTTP2, enableIPv6 bool) string {
+func listenSSLDirective(port int, legacyHTTP2, enableIPv6, withSocketOpts bool) string {
+	sockOpts := ""
+	if withSocketOpts {
+		sockOpts = " reuseport fastopen=256"
+	}
 	var b strings.Builder
 	if legacyHTTP2 {
-		fmt.Fprintf(&b, "  listen %d ssl http2;", port)
+		fmt.Fprintf(&b, "  listen %d ssl http2%s;", port, sockOpts)
 		if enableIPv6 {
-			fmt.Fprintf(&b, "\n  listen [::]:%d ssl http2;", port)
+			fmt.Fprintf(&b, "\n  listen [::]:%d ssl http2%s;", port, sockOpts)
 		}
 		return b.String()
 	}
-	fmt.Fprintf(&b, "  listen %d ssl;", port)
+	fmt.Fprintf(&b, "  listen %d ssl%s;", port, sockOpts)
 	if enableIPv6 {
-		fmt.Fprintf(&b, "\n  listen [::]:%d ssl;", port)
+		fmt.Fprintf(&b, "\n  listen [::]:%d ssl%s;", port, sockOpts)
 	}
 	b.WriteString("\n  http2 on;")
 	return b.String()
@@ -40,7 +44,8 @@ func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, 
 	}
 
 	var b strings.Builder
-	b.WriteString("# Managed declaratively by dex v3. Do not edit manually.\n\n")
+	b.WriteString("# Managed declaratively by dex v4. Do not edit manually.\n\n")
+	seenListenPorts := make(map[int]bool)
 
 	if hasMainNginx {
 		domain := s.Server.Domain
@@ -74,10 +79,22 @@ func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, 
 
 		b.WriteString(`upstream dex_xray {
   server 127.0.0.1:9890;
-  keepalive 32;
+  keepalive 256;
+  keepalive_requests 10000;
+  keepalive_timeout 60s;
 }
 
 `)
+		if s.Server.EnableDoH {
+			b.WriteString(`upstream dex_doh {
+  server 127.0.0.1:9853;
+  keepalive 64;
+}
+
+`)
+		}
+		withSockOpts := !seenListenPorts[port]
+		seenListenPorts[port] = true
 		fmt.Fprintf(&b, `server {
 %s
   server_name %s;
@@ -101,12 +118,13 @@ func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, 
   ssl_buffer_size 4k;
   ssl_early_data on;
 
-`, listenSSLDirective(port, opts.NginxLegacyHTTP2, s.System.EnableIPv6), domain, webRoot, port, opts.CertFile, opts.KeyFile)
+`, listenSSLDirective(port, opts.NginxLegacyHTTP2, s.System.EnableIPv6, withSockOpts), domain, webRoot, port, opts.CertFile, opts.KeyFile)
 
 		if s.Server.EnableDoH {
 			b.WriteString(`  location /dq {
-    proxy_pass                  http://127.0.0.1:9853/dq;
+    proxy_pass                  http://dex_doh/dq;
     proxy_http_version          1.1;
+    proxy_set_header            Connection "";
     proxy_set_header            Host $host;
     proxy_set_header            X-Real-IP $remote_addr;
     proxy_connect_timeout       60s;
@@ -117,7 +135,6 @@ func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, 
     proxy_store                 off;
     proxy_cache                 off;
     proxy_buffering             off;
-    add_header Cache-Control    no-cache;
   }
 
 `)
@@ -168,7 +185,15 @@ func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, 
 		if internalPort <= 0 {
 			internalPort = ExtraInternalPort(ex.ListenPort)
 		}
+		withSockOpts := !seenListenPorts[ex.ListenPort]
+		seenListenPorts[ex.ListenPort] = true
+		upstreamName := fmt.Sprintf("dex_extra_%d", internalPort)
 		fmt.Fprintf(&b, `
+upstream %s {
+  server 127.0.0.1:%d;
+  keepalive 128;
+}
+
 server {
 %s
   server_name %s;
@@ -177,7 +202,7 @@ server {
   ssl_protocols TLSv1.2 TLSv1.3;
 
   location %s {
-    proxy_pass http://127.0.0.1:%d;
+    proxy_pass http://%s;
     proxy_http_version 1.1;
 %s
     proxy_set_header Host $host;
@@ -189,7 +214,7 @@ server {
     proxy_read_timeout 600s;
   }
 }
-`, listenSSLDirective(ex.ListenPort, opts.NginxLegacyHTTP2, s.System.EnableIPv6), dom, opts.CertFile, opts.KeyFile, path, internalPort, wsHeaders)
+`, upstreamName, internalPort, listenSSLDirective(ex.ListenPort, opts.NginxLegacyHTTP2, s.System.EnableIPv6, withSockOpts), dom, opts.CertFile, opts.KeyFile, path, upstreamName, wsHeaders)
 	}
 
 	return []byte(b.String()), true, nil

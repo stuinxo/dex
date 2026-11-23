@@ -233,3 +233,62 @@ func TestNormalizeUpstreamAddrIPv6(t *testing.T) {
 		}
 	}
 }
+
+func TestDoHFastFailoverOnBlackholedPrimaryUpstream(t *testing.T) {
+	// Primary upstream: UDP+TCP sockets that accept packets/connections and never respond (blackhole)
+	deadPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen dead udp: %v", err)
+	}
+	defer deadPC.Close()
+	deadAddr := deadPC.LocalAddr().String()
+	deadTCP, err := net.Listen("tcp", deadAddr)
+	if err != nil {
+		t.Fatalf("listen dead tcp: %v", err)
+	}
+	defer deadTCP.Close()
+
+	// Secondary upstream: healthy UDP DNS server
+	goodPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen good udp: %v", err)
+	}
+	defer goodPC.Close()
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, raddr, rerr := goodPC.ReadFrom(buf)
+			if rerr != nil {
+				return
+			}
+			resp := buildTestDNSResponse(buf[:n], 180, false)
+			_, _ = goodPC.WriteTo(resp, raddr)
+		}
+	}()
+
+	// Sub-1200ms overall timeout: splits remaining/remainingCount so primary times out quickly and secondary succeeds
+	h := NewHandler(Config{
+		Path:      "/dq",
+		Upstreams: []string{deadAddr, goodPC.LocalAddr().String()},
+		Timeout:   500 * time.Millisecond,
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	q := buildTestDNSQuery(0x5566, "failover.example")
+	resp, err := http.Post(srv.URL+"/dq", "application/dns-message", bytes.NewReader(q))
+	if err != nil {
+		t.Fatalf("POST /dq failover: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK after failover to secondary upstream, got %d (%s)", resp.StatusCode, string(body))
+	}
+	if binary.BigEndian.Uint16(body[:2]) != 0x5566 {
+		t.Fatalf("transaction ID mismatch after failover")
+	}
+	if resp.Header.Get("Cache-Control") != "max-age=180" {
+		t.Fatalf("Cache-Control = %q, want max-age=180", resp.Header.Get("Cache-Control"))
+	}
+}

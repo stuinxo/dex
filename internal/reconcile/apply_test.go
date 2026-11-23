@@ -794,7 +794,7 @@ func TestReconcileWave1ImportedCertBlockAdsAndNginxLegacy(t *testing.T) {
 	if !strings.Contains(ngStr, "ssl_certificate "+customCert+";") || !strings.Contains(ngStr, "ssl_certificate_key "+customKey+";") {
 		t.Fatalf("expected imported cert/key in nginx config, got:\n%s", ngStr)
 	}
-	if !strings.Contains(ngStr, "listen 443 ssl http2;") {
+	if !strings.Contains(ngStr, "listen 443 ssl http2 reuseport fastopen=256;") {
 		t.Fatalf("expected legacy http2 directive for nginx 1.22.1, got:\n%s", ngStr)
 	}
 
@@ -1248,5 +1248,113 @@ func TestDryRunRunsPreflightValidationAndCheckRequiredBinaries(t *testing.T) {
 	}
 	if err := checkRequiredBinaries(hapExec, render.RenderOptions{}, &render.RenderBundle{HAProxyNeeded: true}, false); err == nil {
 		t.Fatalf("expected non-dryRun to require haproxy binary directly")
+	}
+}
+
+type qdiscMockExec struct {
+	mockExecutor
+	qdisc string
+}
+
+func (q *qdiscMockExec) RunCommand(ctx context.Context, env []string, name string, args ...string) (string, error) {
+	full := name + " " + strings.Join(args, " ")
+	q.mu.Lock()
+	q.cmds = append(q.cmds, full)
+	q.mu.Unlock()
+	if name == "sysctl" && len(args) == 2 && args[0] == "-n" && args[1] == "net.core.default_qdisc" {
+		return q.qdisc + "\n", nil
+	}
+	return "ok", nil
+}
+
+func TestReconcileV004SysctlModprobeFallbackAndDropinLifecycle(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "etc", "dex")
+	store := state.NewStore(stateDir)
+
+	srv := state.NewDefaultState(state.RoleServer)
+	srv.Server.Domain = "srv.example.com"
+	srv.Server.TLSMode = "nginx"
+	srv.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	if err := store.Save(srv); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := &qdiscMockExec{qdisc: "pfifo_fast"}
+	opts := ApplyOptions{
+		RootPrefix: root,
+		RenderOpts: render.RenderOptions{
+			StateDir:     "/etc/dex",
+			GeneratedDir: "/etc/dex/generated",
+			CertFile:     filepath.Join(stateDir, "ssl", "dex.cer"),
+			KeyFile:      filepath.Join(stateDir, "ssl", "dex.key"),
+		},
+	}
+
+	if _, err := Reconcile(context.Background(), store, exec, opts); err != nil {
+		t.Fatalf("initial server Reconcile failed: %v", err)
+	}
+
+	// Verify modprobe + sysctl -e -p + qdisc fallback to fq
+	cmdsJoined := strings.Join(exec.cmds, "\n")
+	for _, want := range []string{
+		"modprobe tcp_bbr",
+		"modprobe nf_conntrack",
+		"modprobe sch_cake",
+		"sysctl -e -p " + filepath.Join(root, "etc", "sysctl.d", "99-dex.conf"),
+		"sysctl -n net.core.default_qdisc",
+		"sysctl -w net.core.default_qdisc=fq",
+	} {
+		if !strings.Contains(cmdsJoined, want) {
+			t.Errorf("expected command %q, got:\n%s", want, cmdsJoined)
+		}
+	}
+
+	// Verify modules-load.d and nginx drop-in written
+	modPath := filepath.Join(root, "etc", "modules-load.d", "99-dex.conf")
+	if b, err := os.ReadFile(modPath); err != nil || string(b) != "tcp_bbr\nsch_cake\nnf_conntrack\n" {
+		t.Fatalf("unexpected modules-load file: err=%v content=%q", err, string(b))
+	}
+	dropinPath := filepath.Join(root, "etc", "systemd", "system", "nginx.service.d", "dex-limits.conf")
+	if b, err := os.ReadFile(dropinPath); err != nil || !strings.Contains(string(b), "LimitNOFILE=1000000") {
+		t.Fatalf("unexpected nginx dropin: err=%v content=%q", err, string(b))
+	}
+
+	// When default_qdisc is already cake, no fallback sysctl -w is invoked;
+	// and modifying nginx drop-in triggers restart (ServiceEnableStart) rather than reload.
+	exec.mu.Lock()
+	exec.cmds = nil
+	exec.startedSvcs = nil
+	exec.reloadedSvcs = nil
+	exec.qdisc = "cake"
+	exec.mu.Unlock()
+	if err := os.WriteFile(dropinPath, []byte("[Service]\nLimitNOFILE=65535\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	optsForce := opts
+	optsForce.Force = true
+	if _, err := Reconcile(context.Background(), store, exec, optsForce); err != nil {
+		t.Fatalf("Reconcile after dropin edit failed: %v", err)
+	}
+	if strings.Contains(strings.Join(exec.cmds, "\n"), "net.core.default_qdisc=fq") {
+		t.Fatalf("did not expect fq fallback when kernel already uses cake")
+	}
+	if !reflect.DeepEqual(exec.startedSvcs, []string{"nginx"}) || len(exec.reloadedSvcs) != 0 {
+		t.Fatalf("expected nginx restarted (not reloaded) when drop-in changed, started=%v reloaded=%v", exec.startedSvcs, exec.reloadedSvcs)
+	}
+
+	// Switching server TLSMode to direct removes nginx drop-in AND cleans up empty nginx.service.d directory
+	if _, _, err := UpdateAndReconcile(context.Background(), store, state.RoleServer, exec, opts, func(cur *state.State) error {
+		cur.Server.TLSMode = "direct"
+		cur.Server.EnableDoH = false
+		return nil
+	}); err != nil {
+		t.Fatalf("switch to direct TLS failed: %v", err)
+	}
+	if _, err := os.Stat(dropinPath); !os.IsNotExist(err) {
+		t.Fatalf("expected nginx dropin removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Dir(dropinPath)); !os.IsNotExist(err) {
+		t.Fatalf("expected empty nginx.service.d dir removed, stat err=%v", err)
 	}
 }

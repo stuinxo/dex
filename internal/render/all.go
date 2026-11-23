@@ -129,6 +129,9 @@ func RenderAll(s *state.State, opts RenderOptions) (*RenderBundle, error) {
 	if sysctlFile, needed := RenderSysctl(s, opts); needed {
 		bundle.Files = append(bundle.Files, sysctlFile)
 	}
+	if modFile, needed := RenderModulesLoad(s, opts); needed {
+		bundle.Files = append(bundle.Files, modFile)
+	}
 
 	bundle.Files = append(bundle.Files, RenderUnits(s, opts, bundle)...)
 	return bundle, nil

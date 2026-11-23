@@ -288,8 +288,8 @@ func TestWave2ServerExtraNodeCertWGCommands(t *testing.T) {
 		t.Fatalf("wg keygen-server failed: %s", errOut)
 	}
 	code, stOut, _ := runC("status")
-	if code != 0 || !strings.Contains(stOut, "Services:") || !strings.Contains(stOut, "Certificate:") {
-		t.Fatalf("expected Services and Certificate summary in dex status, got:\n%s", stOut)
+	if code != 0 || !strings.Contains(stOut, "Services:") || !strings.Contains(stOut, "Certificate:") || !strings.Contains(stOut, "Sysctl:") || !strings.Contains(stOut, "Flowtable:") {
+		t.Fatalf("expected Services, Certificate, Sysctl and Flowtable summary in dex status, got:\n%s", stOut)
 	}
 
 	// 5. dex extra del rejects ambiguous shared port and deletes by exact tag only

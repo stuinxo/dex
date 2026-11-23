@@ -854,10 +854,12 @@
             <div class="grid-2">
               <div class="card">
                 <div class="card-header">
-                  <span class="card-header-title">组件在线更新与监听地址</span>
+                  <span class="card-header-title">系统网络优化与组件更新</span>
                 </div>
                 <div class="card-body">
                   <div class="row-gap mb">
+                    <label class="check-row"><input type="checkbox" id="sys-auto-sysctl"> 启用内核网络高并发调优 (BBR / CAKE-FQ / 大缓冲 / Conntrack)</label>
+                    <label class="check-row"><input type="checkbox" id="sys-flowtable"> 启用 nftables Flowtable 转发加速</label>
                     <label class="check-row"><input type="checkbox" id="sys-auto-update-core"> 每周自动更新核心组件 (auto_update_core)</label>
                   </div>
                   <div class="grid-2">

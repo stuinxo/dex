@@ -145,9 +145,56 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) exchange(ctx context.Context, req []byte) ([]byte, error) {
+	if _, ok := ctx.Deadline(); !ok && h.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, h.Timeout)
+		defer cancel()
+	}
 	var lastErr error
-	for _, upstream := range h.Upstreams {
-		resp, err := exchangeSingle(ctx, upstream, req)
+	for i, upstream := range h.Upstreams {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, err
+		}
+		tryCtx := ctx
+		var cancel context.CancelFunc
+		remainingCount := len(h.Upstreams) - i
+		if remainingCount > 1 {
+			if dl, ok := ctx.Deadline(); ok {
+				rem := time.Until(dl)
+				if rem <= 0 {
+					if lastErr != nil {
+						return nil, lastErr
+					}
+					return nil, context.DeadlineExceeded
+				}
+				var perTry time.Duration
+				if h.Timeout > 0 && h.Timeout < 1200*time.Millisecond {
+					perTry = rem / time.Duration(remainingCount)
+				} else {
+					total := h.Timeout
+					if total <= 0 {
+						total = rem
+					}
+					perTry = total / time.Duration(len(h.Upstreams))
+					if perTry < 1200*time.Millisecond {
+						perTry = 1200 * time.Millisecond
+					}
+					if perTry > rem {
+						perTry = rem
+					}
+				}
+				if perTry > 0 && perTry < rem {
+					tryCtx, cancel = context.WithTimeout(ctx, perTry)
+				}
+			}
+		}
+		resp, err := exchangeSingle(tryCtx, upstream, req)
+		if cancel != nil {
+			cancel()
+		}
 		if err == nil {
 			return resp, nil
 		}

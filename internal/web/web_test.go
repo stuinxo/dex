@@ -879,3 +879,67 @@ func TestHardeningWebStatusServerPauseAndCertExternalReconcile(t *testing.T) {
 		t.Fatalf("expected RoleRelay nft-only with dex-nft inactive to report proxy_paused=true, got %v", got)
 	}
 }
+
+func TestV004WebStatusNetOptAndSystemNetSwitches(t *testing.T) {
+	srv, store, root := setupTestWeb(t, false)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	loginReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/auth/login", strings.NewReader(`{"password":"myPass123"}`))
+	loginReq.Header.Set("Content-Type", "application/json")
+	loginRec := httptest.NewRecorder()
+	srv.ServeHTTP(loginRec, loginReq)
+	if loginRec.Code != 200 {
+		t.Fatalf("login failed: %d", loginRec.Code)
+	}
+	var lData map[string]any
+	_ = json.Unmarshal(loginRec.Body.Bytes(), &lData)
+	csrf := lData["csrf_token"].(string)
+	cookies := loginRec.Result().Cookies()
+
+	doReq := func(method, path, body string) *httptest.ResponseRecorder {
+		var rBody io.Reader
+		if body != "" {
+			rBody = strings.NewReader(body)
+		}
+		req, _ := http.NewRequest(method, ts.URL+path, rBody)
+		req.Header.Set("X-CSRF-Token", csrf)
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. /api/v1/status exposes net_opt field
+	stRec := doReq(http.MethodGet, "/api/v1/status", "")
+	if stRec.Code != 200 {
+		t.Fatalf("status failed: %d", stRec.Code)
+	}
+	var stBody map[string]any
+	_ = json.Unmarshal(stRec.Body.Bytes(), &stBody)
+	if _, hasNetOpt := stBody["net_opt"]; !hasNetOpt {
+		t.Fatalf("expected net_opt field in /api/v1/status response, got %+v", stBody)
+	}
+
+	// 2. PUT /api/v1/system toggling auto_tune_sysctl & enable_flowtable triggers Reconcile
+	sysRec := doReq(http.MethodPut, "/api/v1/system", `{"auto_tune_sysctl":false,"enable_flowtable":false}`)
+	if sysRec.Code != 200 || !strings.Contains(sysRec.Body.String(), `"reconciled":true`) {
+		t.Fatalf("expected reconciled=true when toggling net switches: %d %s", sysRec.Code, sysRec.Body.String())
+	}
+	loaded, _ := store.Load()
+	if loaded.System.AutoTuneSysctl || loaded.System.EnableFlowtable {
+		t.Fatalf("expected AutoTuneSysctl=false and EnableFlowtable=false, got %+v", loaded.System)
+	}
+	nftBytes, _ := os.ReadFile(filepath.Join(root, "etc", "dex", "generated", "nftables.conf"))
+	if strings.Contains(string(nftBytes), "dex_flow") {
+		t.Fatalf("expected dex_flow removed when enable_flowtable=false")
+	}
+	if _, err := os.Stat(filepath.Join(root, "etc", "sysctl.d", "99-dex.conf")); !os.IsNotExist(err) {
+		t.Fatalf("expected sysctl file absent when auto_tune_sysctl=false, err=%v", err)
+	}
+}

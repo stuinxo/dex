@@ -810,6 +810,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, _ *session
 		"device_alias":     st.System.Hostname,
 		"arch":             runtime.GOOS + "/" + runtime.GOARCH,
 		"kernel":           kernelRel,
+		"net_opt":          reconcile.ReadKernelNetOpt(),
 		"mem_mb":           s.Exec.DetectMemMB(),
 		"init_system":      initSys,
 		"is_container":     s.Exec.DetectIsContainer(),
@@ -2028,8 +2029,10 @@ func (s *Server) handleBackup(w http.ResponseWriter, _ *http.Request, _ *session
 
 func (s *Server) handlePutSystem(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
 	var req struct {
-		Hostname       *string `json:"hostname"`
-		AutoUpdateCore *bool   `json:"auto_update_core"`
+		Hostname        *string `json:"hostname"`
+		AutoUpdateCore  *bool   `json:"auto_update_core"`
+		AutoTuneSysctl  *bool   `json:"auto_tune_sysctl"`
+		EnableFlowtable *bool   `json:"enable_flowtable"`
 	}
 	if err := decodeJSONBody(r, &req, 4096); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid system JSON: "+err.Error())
@@ -2055,9 +2058,17 @@ func (s *Server) handlePutSystem(w http.ResponseWriter, r *http.Request, _ *sess
 		if req.AutoUpdateCore != nil {
 			dst.System.AutoUpdateCore = *req.AutoUpdateCore
 		}
+		if req.AutoTuneSysctl != nil {
+			dst.System.AutoTuneSysctl = *req.AutoTuneSysctl
+		}
+		if req.EnableFlowtable != nil {
+			dst.System.EnableFlowtable = *req.EnableFlowtable
+		}
 		return nil
 	}
-	needReconcile := req.AutoUpdateCore != nil && *req.AutoUpdateCore != cur.System.AutoUpdateCore
+	needReconcile := (req.AutoUpdateCore != nil && *req.AutoUpdateCore != cur.System.AutoUpdateCore) ||
+		(req.AutoTuneSysctl != nil && *req.AutoTuneSysctl != cur.System.AutoTuneSysctl) ||
+		(req.EnableFlowtable != nil && *req.EnableFlowtable != cur.System.EnableFlowtable)
 	var updated *state.State
 	if needReconcile {
 		updated, _, err = reconcile.UpdateAndReconcile(r.Context(), s.Store, cur.Role, s.Exec, s.ApplyOpts, mutate)

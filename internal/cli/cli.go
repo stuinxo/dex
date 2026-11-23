@@ -422,6 +422,13 @@ func cmdStatus(store *state.Store, exec reconcile.SystemExecutor, stdout, stderr
 	initSys := exec.DetectInitSystem()
 	fmt.Fprintf(stdout, "DEX %s | Role: %s | Init: %s | Mem: %d MiB\n",
 		version.Summary(), st.Role, initSys, exec.DetectMemMB())
+	if netOpt := reconcile.ReadKernelNetOpt(); netOpt != "" {
+		fmt.Fprintf(stdout, "Net Opt: %s | Sysctl: %v | Flowtable: %v\n",
+			netOpt, st.System.AutoTuneSysctl, st.System.EnableFlowtable)
+	} else {
+		fmt.Fprintf(stdout, "Sysctl: %v | Flowtable: %v\n",
+			st.System.AutoTuneSysctl, st.System.EnableFlowtable)
+	}
 	fmt.Fprintf(stdout, "State: %s\n", store.StatePath())
 	if st.Role == state.RoleClient {
 		if active := st.Client.ActiveNode(); active != nil {
