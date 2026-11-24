@@ -1,5 +1,4 @@
 # Build outputs
-/dex
 /dex-*
 dex-linux-*
 dist/

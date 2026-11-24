@@ -16,17 +16,20 @@
 支持 **Debian 12/13 / Ubuntu**（`apt + systemd`）与 **Alpine 3.x**（`apk + OpenRC`），`amd64` / `arm64`：
 
 ```sh
-# 安装后自动进入交互菜单
-curl -Lso- github.com/stuinxo/dex/raw/main/i | sh
-# 或使用 wget
-wget -qO- github.com/stuinxo/dex/raw/main/i | sh
+# 方式一：短域名极简安装（国内直连，安装后自动进入交互菜单）
+curl -Lso- dex.234579.xyz | sh
+wget -qO- dex.234579.xyz | sh
 
-# 指定角色直装（client / server / landing / relay）
-curl -Lso- github.com/stuinxo/dex/raw/main/i | sh -s client
-curl -Lso- github.com/stuinxo/dex/raw/main/i | sh -s server
+# 指定角色一键直装（client / server / landing / relay）
+curl -Lso- dex.234579.xyz/client | sh
+curl -Lso- dex.234579.xyz/server | sh
+
+# 方式二：GitHub 原生短路径
+curl -Lso- github.com/stuinxo/dex/raw/main/dex | sh
+wget -qO- github.com/stuinxo/dex/raw/main/dex | sh
 ```
 
-离线部署需显式指定本地二进制或压缩包路径环境变量（不隐式扫描 `.` 或 `/tmp`）：`DEX_BIN=/root/dex-linux-amd64 XRAY_ZIP=/root/Xray-linux-64.zip MOSDNS_ZIP=/root/mosdns-linux-amd64.zip sh i [client|server|landing|relay]`。
+离线部署需显式指定本地二进制或压缩包路径环境变量（不隐式扫描 `.` 或 `/tmp`）：`DEX_BIN=/root/dex-linux-amd64 XRAY_ZIP=/root/Xray-linux-64.zip MOSDNS_ZIP=/root/mosdns-linux-amd64.zip sh dex [client|server|landing|relay]`。
 
 ## 四种运行角色
 

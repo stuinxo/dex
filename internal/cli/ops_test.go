@@ -910,23 +910,7 @@ func TestUpdateComponentsRollsBackOnRestartFailure(t *testing.T) {
 }
 
 func TestShortInstallerSyncAndRegularFile(t *testing.T) {
-	shortPath := filepath.Join("..", "..", "i")
 	installPath := filepath.Join("..", "..", "scripts", "install.sh")
-
-	shortInfo, err := os.Lstat(shortPath)
-	if err != nil {
-		t.Fatalf("lstat %s: %v", shortPath, err)
-	}
-	if shortInfo.Mode()&os.ModeSymlink != 0 {
-		t.Fatalf("%s must be a regular file, not a symlink", shortPath)
-	}
-	if !shortInfo.Mode().IsRegular() {
-		t.Fatalf("%s must be a regular file, mode=%v", shortPath, shortInfo.Mode())
-	}
-	if shortInfo.Mode().Perm()&0o111 == 0 {
-		t.Fatalf("%s must be executable, mode=%v", shortPath, shortInfo.Mode().Perm())
-	}
-
 	installInfo, err := os.Lstat(installPath)
 	if err != nil {
 		t.Fatalf("lstat %s: %v", installPath, err)
@@ -934,17 +918,40 @@ func TestShortInstallerSyncAndRegularFile(t *testing.T) {
 	if installInfo.Mode()&os.ModeSymlink != 0 || !installInfo.Mode().IsRegular() {
 		t.Fatalf("%s must be a regular non-symlink file", installPath)
 	}
-
-	shortBytes, err := os.ReadFile(shortPath)
-	if err != nil {
-		t.Fatalf("read %s: %v", shortPath, err)
-	}
 	installBytes, err := os.ReadFile(installPath)
 	if err != nil {
 		t.Fatalf("read %s: %v", installPath, err)
 	}
-	if !bytes.Equal(shortBytes, installBytes) {
-		t.Fatalf("%s and %s must be byte-for-byte identical", shortPath, installPath)
+	if !bytes.HasPrefix(installBytes, []byte("#!/bin/sh\n")) {
+		t.Fatalf("%s must start with #!/bin/sh", installPath)
+	}
+
+	for _, name := range []string{"i", "dex"} {
+		shortPath := filepath.Join("..", "..", name)
+		shortInfo, err := os.Lstat(shortPath)
+		if err != nil {
+			t.Fatalf("lstat %s: %v", shortPath, err)
+		}
+		if shortInfo.Mode()&os.ModeSymlink != 0 {
+			t.Fatalf("%s must be a regular file, not a symlink", shortPath)
+		}
+		if !shortInfo.Mode().IsRegular() {
+			t.Fatalf("%s must be a regular file, mode=%v", shortPath, shortInfo.Mode())
+		}
+		if shortInfo.Mode().Perm()&0o111 == 0 {
+			t.Fatalf("%s must be executable, mode=%v", shortPath, shortInfo.Mode().Perm())
+		}
+
+		shortBytes, err := os.ReadFile(shortPath)
+		if err != nil {
+			t.Fatalf("read %s: %v", shortPath, err)
+		}
+		if !bytes.HasPrefix(shortBytes, []byte("#!/bin/sh\n")) {
+			t.Fatalf("%s must start with #!/bin/sh", shortPath)
+		}
+		if !bytes.Equal(shortBytes, installBytes) {
+			t.Fatalf("%s and %s must be byte-for-byte identical", shortPath, installPath)
+		}
 	}
 }
 

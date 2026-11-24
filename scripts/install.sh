@@ -455,7 +455,7 @@ main() {
         say "[+] DEX installed. Opening interactive menu..."
         exec "$INSTALL_BIN" </dev/tty
       else
-        say "[+] DEX installed. Run 'dex' to open menu, or pass a role: curl -Lso- github.com/${DEX_REPO}/raw/main/i | sh -s [client|server|landing|relay]"
+        say "[+] DEX installed. Run 'dex' to open menu, or pass a role: curl -Lso- dex.234579.xyz | sh -s [client|server|landing|relay]"
       fi
       ;;
     *)
