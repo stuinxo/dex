@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -417,5 +418,67 @@ func TestHardeningCertIPSANsAndACMEErrorHandling(t *testing.T) {
 		KeyPath:   filepath.Join(dir, "out2.key"),
 	}); err == nil || !strings.Contains(err.Error(), "install-cert") {
 		t.Fatalf("expected install-cert error propagated, got %v", err)
+	}
+}
+
+type captureHTTPACMERunner struct {
+	acmeHome  string
+	domain    string
+	certBytes []byte
+	keyBytes  []byte
+	calls     [][]string
+}
+
+func (c *captureHTTPACMERunner) Run(_ context.Context, _ []string, _ string, args ...string) ([]byte, error) {
+	c.calls = append(c.calls, append([]string(nil), args...))
+	if strings.Contains(strings.Join(args, " "), "--issue") {
+		d := filepath.Join(c.acmeHome, c.domain+"_ecc")
+		_ = os.MkdirAll(d, 0o755)
+		_ = os.WriteFile(filepath.Join(d, "fullchain.cer"), c.certBytes, 0o644)
+		_ = os.WriteFile(filepath.Join(d, c.domain+".key"), c.keyBytes, 0o600)
+	}
+	return []byte("ok"), nil
+}
+
+func TestIssueHTTPACMEListenV6Flag(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	cPEM, kPEM, _, _ := genTestCert(t, "v6.example.com", []string{"v6.example.com"}, now.Add(-time.Hour), now.Add(90*24*time.Hour), nil, nil)
+
+	for _, listenV6 := range []bool{true, false} {
+		acmeHome := filepath.Join(dir, fmt.Sprintf("acme-%v", listenV6))
+		_ = os.MkdirAll(acmeHome, 0o755)
+		_ = os.WriteFile(filepath.Join(acmeHome, "acme.sh"), []byte("#!/bin/sh\n"), 0o755)
+		runner := &captureHTTPACMERunner{
+			acmeHome:  acmeHome,
+			domain:    "v6.example.com",
+			certBytes: cPEM,
+			keyBytes:  kPEM,
+		}
+		if _, err := IssueHTTPACME(context.Background(), runner, ACMEConfig{
+			Domain:   "v6.example.com",
+			ListenV6: listenV6,
+			AcmeBin:  filepath.Join(acmeHome, "acme.sh"),
+			AcmeHome: acmeHome,
+			CertPath: filepath.Join(dir, fmt.Sprintf("out-%v.cer", listenV6)),
+			KeyPath:  filepath.Join(dir, fmt.Sprintf("out-%v.key", listenV6)),
+		}); err != nil {
+			t.Fatalf("IssueHTTPACME(ListenV6=%v): %v", listenV6, err)
+		}
+		var issueArgs string
+		for _, call := range runner.calls {
+			joined := strings.Join(call, " ")
+			if strings.Contains(joined, "--issue") {
+				issueArgs = joined
+				break
+			}
+		}
+		if !strings.Contains(issueArgs, "--standalone") {
+			t.Fatalf("expected --standalone in issue args %q", issueArgs)
+		}
+		hasV6 := strings.Contains(issueArgs, "--listen-v6")
+		if hasV6 != listenV6 {
+			t.Fatalf("ListenV6=%v: has --listen-v6 = %v (args=%q)", listenV6, hasV6, issueArgs)
+		}
 	}
 }

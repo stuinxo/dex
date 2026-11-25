@@ -584,4 +584,15 @@ func TestHardeningCLIInitForceDLModeNodeDelMenuPortRelayAndServices(t *testing.T
 	if code := cmdCertWithOpts(extStore, nil, reconcile.ApplyOptions{}, []string{"inspect"}, &ciOut, &ciErr); code != 0 || !strings.Contains(ciOut.String(), "ext-inspect.example.com") {
 		t.Fatalf("expected cert inspect to read active external cert, code=%d out=%q err=%q", code, ciOut.String(), ciErr.String())
 	}
+
+	// 8. dex init --role landing --ipv6 enables System.EnableIPv6
+	v6Dir := filepath.Join(dir, "v6-init")
+	var v6Out, v6Err bytes.Buffer
+	if code := RunWithExecutor([]string{"--state-dir", v6Dir, "init", "--role", "landing", "--domain", "v6.example.com", "--ipv6"}, &fakeOpsExec{}, strings.NewReader(""), &v6Out, &v6Err); code != 0 {
+		t.Fatalf("dex init --ipv6 failed: code=%d err=%q", code, v6Err.String())
+	}
+	v6St, err := state.NewStore(v6Dir).Load()
+	if err != nil || !v6St.System.EnableIPv6 {
+		t.Fatalf("expected System.EnableIPv6=true after init --ipv6, err=%v st=%+v", err, v6St)
+	}
 }

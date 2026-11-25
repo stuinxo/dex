@@ -942,4 +942,52 @@ func TestV004WebStatusNetOptAndSystemNetSwitches(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "etc", "sysctl.d", "99-dex.conf")); !os.IsNotExist(err) {
 		t.Fatalf("expected sysctl file absent when auto_tune_sysctl=false, err=%v", err)
 	}
+
+	// 3. PUT /api/v1/system toggling enable_ipv6 updates state and reconciles dual-stack xray inbound
+	srvRoot := t.TempDir()
+	srvStore := state.NewStore(srvRoot + "/etc/dex")
+	srvSt := state.NewDefaultState(state.RoleLanding)
+	srvSt.Server.Domain = "v6.example.com"
+	srvSt.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	srvSt.Auth.PasswordHash, _ = cryptoext.HashPassword("secret123")
+	if err := srvStore.Save(srvSt); err != nil {
+		t.Fatal(err)
+	}
+	hub2 := daemon.NewTaskHub(16)
+	appOpts2 := reconcile.ApplyOptions{RootPrefix: srvRoot}
+	srv2 := NewServer(srvStore, stubExec{}, hub2, daemon.NewCloudflareDDNS(hub2), appOpts2)
+	ts2 := httptest.NewServer(srv2)
+	defer ts2.Close()
+
+	lRec := httptest.NewRecorder()
+	lReq, _ := http.NewRequest(http.MethodPost, ts2.URL+"/api/v1/auth/login", strings.NewReader(`{"password":"secret123"}`))
+	lReq.Header.Set("Content-Type", "application/json")
+	srv2.ServeHTTP(lRec, lReq)
+	if lRec.Code != 200 {
+		t.Fatalf("login2 failed: %d", lRec.Code)
+	}
+	var lBody2 map[string]any
+	_ = json.Unmarshal(lRec.Body.Bytes(), &lBody2)
+	csrf2, _ := lBody2["csrf_token"].(string)
+	cookies2 := lRec.Result().Cookies()
+
+	v6Req, _ := http.NewRequest(http.MethodPut, ts2.URL+"/api/v1/system", strings.NewReader(`{"enable_ipv6":true}`))
+	v6Req.Header.Set("X-CSRF-Token", csrf2)
+	v6Req.Header.Set("Content-Type", "application/json")
+	for _, c := range cookies2 {
+		v6Req.AddCookie(c)
+	}
+	v6Rec := httptest.NewRecorder()
+	srv2.ServeHTTP(v6Rec, v6Req)
+	if v6Rec.Code != 200 || !strings.Contains(v6Rec.Body.String(), `"reconciled":true`) {
+		t.Fatalf("expected reconciled=true on enable_ipv6=true, got %d %s", v6Rec.Code, v6Rec.Body.String())
+	}
+	loadedSrv2, _ := srvStore.Load()
+	if !loadedSrv2.System.EnableIPv6 {
+		t.Fatalf("expected EnableIPv6=true persisted")
+	}
+	xrayBytes, err := os.ReadFile(filepath.Join(srvRoot, "etc", "dex", "generated", "xray.json"))
+	if err != nil || !strings.Contains(string(xrayBytes), `"listen": "::"`) {
+		t.Fatalf("expected xray.json reconciled with dual-stack listen ::, err=%v content=%s", err, string(xrayBytes))
+	}
 }

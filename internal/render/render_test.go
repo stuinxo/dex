@@ -3,6 +3,7 @@ package render
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/netip"
 	"strings"
 	"testing"
@@ -1456,5 +1457,175 @@ func TestV004SysctlMemoryTiersFlowtableNginxPoolHAProxyXrayPolicyAndUnits(t *tes
 	}
 	if f, ok := findFile(orcCli, "openrc/dex-mosdns"); !ok || !strings.Contains(string(f.Content), `rc_ulimit="-n 65535"`) {
 		t.Fatalf("missing rc_ulimit on openrc/dex-mosdns")
+	}
+}
+
+func TestIPv6InboundAndDualStackRendering(t *testing.T) {
+	uuid1 := "11111111-1111-4111-8111-111111111111"
+	uuid2 := "22222222-2222-4222-8222-222222222222"
+
+	assertListenMap := func(t *testing.T, xb []byte, want map[string]string, wantIPv6DNS bool) {
+		t.Helper()
+		var cfg map[string]any
+		if err := json.Unmarshal(xb, &cfg); err != nil {
+			t.Fatalf("unmarshal xray: %v", err)
+		}
+		got := make(map[string]string)
+		for _, raw := range cfg["inbounds"].([]any) {
+			inb := raw.(map[string]any)
+			tag, _ := inb["tag"].(string)
+			listen, _ := inb["listen"].(string)
+			got[tag] = listen
+		}
+		for tag, w := range want {
+			if got[tag] != w {
+				t.Errorf("inbound %q listen = %q, want %q (all=%v)", tag, got[tag], w, got)
+			}
+		}
+		dnsObj := cfg["dns"].(map[string]any)
+		srvStr := fmt.Sprintf("%v", dnsObj["servers"])
+		if wantIPv6DNS {
+			if !strings.Contains(srvStr, "2606:4700:4700::1111") {
+				t.Errorf("expected IPv6 DNS server in %v", dnsObj["servers"])
+			}
+		} else if strings.Contains(srvStr, "2606:4700:4700::1111") {
+			t.Errorf("unexpected IPv6 DNS server when EnableIPv6=false: %v", dnsObj["servers"])
+		}
+	}
+
+	// 1. RoleServer (nginx main + direct extra + via_nginx extra + RproxyS + xray relay)
+	srv := state.NewDefaultState(state.RoleServer)
+	srv.Server.TLSMode = "nginx"
+	srv.Server.Domain = "srv.example.com"
+	srv.Server.EnableDoH = true
+	srv.Server.UUIDs = []string{uuid1}
+	srv.RproxyS = state.RproxySConfig{
+		Enabled:    true,
+		ListenPort: 20000,
+		UUIDs:      []string{uuid1},
+		Mappings:   []state.RproxyServerMapping{{Port: 20443, Proto: "tcp"}},
+	}
+	srv.Relay.Forwards = []state.ForwardRule{
+		{ID: "xfwd", ListenPort: 10001, TargetHost: "2001:db8::9", TargetPort: 443, Proto: "tcp", Engine: "xray"},
+	}
+	srv.ExtraInbounds = []state.ExtraInbound{
+		{Tag: "ex-rel", Protocol: "vless-reality", ListenPort: 9443, UUID: uuid1, RealityDest: "www.apple.com:443", RealitySNI: "www.apple.com", RealityPrivKey: "priv", RealityShortID: "abcd"},
+		{Tag: "ex-nginx", Protocol: "vless-ws", ListenPort: 8444, UUID: uuid2, ViaNginx: true},
+		{Tag: "ex-direct", Protocol: "vless-xhttp", ListenPort: 8445, UUID: uuid2, ViaNginx: false},
+		{Tag: "ex-socks", Protocol: "socks5", ListenPort: 1080},
+		{Tag: "ex-doko", Protocol: "dokodemo", ListenPort: 10002, TargetAddr: "2001:db8::2", TargetPort: 443},
+	}
+
+	xbV4, _, err := RenderXray(srv, RenderOptions{})
+	if err != nil {
+		t.Fatalf("RenderXray server v4: %v", err)
+	}
+	assertListenMap(t, xbV4, map[string]string{
+		"main":          "127.0.0.1",
+		"rps-tunnel":    "0.0.0.0",
+		"rps-map-20443": "0.0.0.0",
+		"fwd-xfwd":      "0.0.0.0",
+		"ex-rel":        "0.0.0.0",
+		"ex-nginx":      "127.0.0.1",
+		"ex-direct":     "0.0.0.0",
+		"ex-socks":      "0.0.0.0",
+		"ex-doko":       "0.0.0.0",
+	}, false)
+
+	srv.System.EnableIPv6 = true
+	srvBundle, err := RenderAll(srv, RenderOptions{InitSystem: "systemd"})
+	if err != nil {
+		t.Fatalf("RenderAll server v6: %v", err)
+	}
+	xFile, _ := findFile(srvBundle, "xray.json")
+	assertListenMap(t, xFile.Content, map[string]string{
+		"main":          "127.0.0.1",
+		"rps-tunnel":    "::",
+		"rps-map-20443": "::",
+		"fwd-xfwd":      "::",
+		"ex-rel":        "::",
+		"ex-nginx":      "127.0.0.1",
+		"ex-direct":     "::",
+		"ex-socks":      "::",
+		"ex-doko":       "::",
+	}, true)
+	dohSysd, _ := findFile(srvBundle, "systemd/dex-doh.service")
+	if !strings.Contains(string(dohSysd.Content), "[2606:4700:4700::1111]:53,[2001:4860:4860::8888]:53,1.1.1.1:53") {
+		t.Fatalf("expected IPv6 DoH upstreams in systemd unit:\n%s", string(dohSysd.Content))
+	}
+	srvOpenRC, err := RenderAll(srv, RenderOptions{InitSystem: "openrc"})
+	if err != nil {
+		t.Fatalf("RenderAll server openrc v6: %v", err)
+	}
+	dohORC, _ := findFile(srvOpenRC, "openrc/dex-doh")
+	if !strings.Contains(string(dohORC.Content), "[2606:4700:4700::1111]:53,[2001:4860:4860::8888]:53,1.1.1.1:53") {
+		t.Fatalf("expected IPv6 DoH upstreams in openrc unit:\n%s", string(dohORC.Content))
+	}
+
+	// 2. RoleLanding direct TLS main inbound
+	land := state.NewDefaultState(state.RoleLanding)
+	land.Server.Domain = "land.example.com"
+	land.Server.UUIDs = []string{uuid1}
+	land.System.EnableIPv6 = true
+	landXray, _, err := RenderXray(land, RenderOptions{})
+	if err != nil {
+		t.Fatalf("RenderXray landing v6: %v", err)
+	}
+	assertListenMap(t, landXray, map[string]string{"main": "::"}, true)
+
+	// 3. RoleClient FWD0 / FWD1 listen "::"
+	cli := state.NewDefaultState(state.RoleClient)
+	cli.System.EnableIPv6 = true
+	cli.Client.FWD0 = state.FWD0Config{Enabled: true, Protocol: "vmess-tcp", Port: 9800, UUIDs: []string{uuid1}}
+	cli.Client.FWD1 = state.FWD1Config{Enabled: true, Protocol: "vless-xhttp", Port: 9801, UUIDs: []string{uuid2}}
+	cliXray, _, err := RenderXray(cli, RenderOptions{})
+	if err != nil {
+		t.Fatalf("RenderXray client v6: %v", err)
+	}
+	assertListenMap(t, cliXray, map[string]string{"tproxy-in": "127.0.0.1", "tproxy-in-v6": "::1", "forward0": "::", "forward1": "::"}, false)
+
+	// 4. RoleRelay HAProxy v4v6 bind & IPv6 resolvers + nftables dual-stack domain DNAT
+	rel := state.NewDefaultState(state.RoleRelay)
+	rel.Relay.Forwards = []state.ForwardRule{
+		{ID: "h1", ListenPort: 10001, TargetHost: "dual.example.com", TargetPort: 443, Proto: "tcp", Engine: "haproxy"},
+		{ID: "n1", ListenPort: 10002, TargetHost: "dual.example.com", TargetPort: 8443, Proto: "tcp,udp", Engine: "nft"},
+	}
+	roptsDual := RenderOptions{
+		ResolvedHostIPs: map[string][]netip.Addr{
+			"dual.example.com": {netip.MustParseAddr("198.51.100.7"), netip.MustParseAddr("2001:db8::7")},
+		},
+	}
+	hapV4, _, err := RenderHAProxy(rel)
+	if err != nil {
+		t.Fatalf("RenderHAProxy v4: %v", err)
+	}
+	if !strings.Contains(string(hapV4), "bind :10001") || strings.Contains(string(hapV4), "v4v6") {
+		t.Fatalf("unexpected v4 HAProxy config:\n%s", string(hapV4))
+	}
+
+	rel.System.EnableIPv6 = true
+	hapV6, _, err := RenderHAProxy(rel)
+	if err != nil {
+		t.Fatalf("RenderHAProxy v6: %v", err)
+	}
+	for _, want := range []string{"[2606:4700:4700::1111]:53", "[2001:4860:4860::8888]:53", "bind :::10001 v4v6"} {
+		if !strings.Contains(string(hapV6), want) {
+			t.Errorf("v6 HAProxy missing %q:\n%s", want, string(hapV6))
+		}
+	}
+
+	nftDual, _, rNeed, err := RenderNFTables(rel, roptsDual)
+	if err != nil || !rNeed {
+		t.Fatalf("RenderNFTables dual-stack relay: err=%v rNeed=%v", err, rNeed)
+	}
+	for _, want := range []string{
+		"meta nfproto ipv4 tcp dport 10002 dnat ip to 198.51.100.7:8443",
+		"meta nfproto ipv6 tcp dport 10002 dnat ip6 to [2001:db8::7]:8443",
+		"ip daddr 198.51.100.7 udp dport 8443 masquerade",
+		"ip6 daddr 2001:db8::7 udp dport 8443 masquerade",
+	} {
+		if !strings.Contains(string(nftDual), want) {
+			t.Errorf("dual-stack nft relay missing %q:\n%s", want, string(nftDual))
+		}
 	}
 }

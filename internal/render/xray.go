@@ -260,7 +260,14 @@ func buildClientOutbound(tag string, n state.OutboundNode, mark int) map[string]
 	}
 }
 
-func buildVMessTCPInbound(tag string, port int, uuids []string) map[string]any {
+func inboundWildcardListen(enableIPv6 bool) string {
+	if enableIPv6 {
+		return "::"
+	}
+	return "0.0.0.0"
+}
+
+func buildVMessTCPInbound(tag string, port int, uuids []string, listen string) map[string]any {
 	clients := make([]map[string]any, 0, len(uuids))
 	for _, u := range uuids {
 		clients = append(clients, map[string]any{
@@ -270,7 +277,7 @@ func buildVMessTCPInbound(tag string, port int, uuids []string) map[string]any {
 	}
 	return map[string]any{
 		"tag":      tag,
-		"listen":   "0.0.0.0",
+		"listen":   listen,
 		"port":     port,
 		"protocol": "vmess",
 		"settings": map[string]any{
@@ -334,7 +341,7 @@ func buildMainServerInbound(s *state.State, opts RenderOptions) map[string]any {
 	proto := s.Server.EffectiveProtocol()
 	path := NormalizePath(s.Server.Path, firstUUID)
 
-	listen := "0.0.0.0"
+	listen := inboundWildcardListen(s.System.EnableIPv6)
 	port := s.Server.ListenPort
 	if s.Server.TLSMode == "nginx" {
 		listen = "127.0.0.1"
@@ -425,7 +432,7 @@ func buildMainServerInbound(s *state.State, opts RenderOptions) map[string]any {
 	}
 }
 
-func buildXHTTPDirectTLSInbound(tag string, port int, uuids []string, path, certFile, keyFile string) map[string]any {
+func buildXHTTPDirectTLSInbound(tag string, port int, uuids []string, path, certFile, keyFile, listen string) map[string]any {
 	clients := make([]map[string]any, 0, len(uuids))
 	for _, u := range uuids {
 		clients = append(clients, map[string]any{"id": u})
@@ -436,7 +443,7 @@ func buildXHTTPDirectTLSInbound(tag string, port int, uuids []string, path, cert
 	}
 	return map[string]any{
 		"tag":      tag,
-		"listen":   "0.0.0.0",
+		"listen":   listen,
 		"port":     port,
 		"protocol": "vless",
 		"settings": map[string]any{
@@ -471,13 +478,14 @@ func buildXHTTPDirectTLSInbound(tag string, port int, uuids []string, path, cert
 	}
 }
 
-func buildExtraInbound(ex state.ExtraInbound, viaNginxPort int, certFile, keyFile string) map[string]any {
+func buildExtraInbound(ex state.ExtraInbound, viaNginxPort int, certFile, keyFile string, enableIPv6 bool) map[string]any {
 	sniff := map[string]any{
 		"enabled":      true,
 		"destOverride": []string{"http", "tls", "quic"},
 		"routeOnly":    true,
 	}
-	listen := "0.0.0.0"
+	wildcardListen := inboundWildcardListen(enableIPv6)
+	listen := wildcardListen
 	bindPort := ex.ListenPort
 	if ex.ViaNginx {
 		listen = "127.0.0.1"
@@ -492,7 +500,7 @@ func buildExtraInbound(ex state.ExtraInbound, viaNginxPort int, certFile, keyFil
 	case "vless-reality":
 		return map[string]any{
 			"tag":      ex.Tag,
-			"listen":   "0.0.0.0",
+			"listen":   wildcardListen,
 			"port":     ex.ListenPort,
 			"protocol": "vless",
 			"settings": map[string]any{
@@ -571,7 +579,7 @@ func buildExtraInbound(ex state.ExtraInbound, viaNginxPort int, certFile, keyFil
 		}
 		return map[string]any{
 			"tag":      ex.Tag,
-			"listen":   "0.0.0.0",
+			"listen":   wildcardListen,
 			"port":     ex.ListenPort,
 			"protocol": "socks",
 			"settings": settings,
@@ -583,7 +591,7 @@ func buildExtraInbound(ex state.ExtraInbound, viaNginxPort int, certFile, keyFil
 		}
 		return map[string]any{
 			"tag":      ex.Tag,
-			"listen":   "0.0.0.0",
+			"listen":   wildcardListen,
 			"port":     ex.ListenPort,
 			"protocol": "dokodemo-door",
 			"settings": map[string]any{
@@ -610,6 +618,8 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 	dnsServers := []string{"1.1.1.1", "8.8.8.8", "localhost"}
 	if s.Role == state.RoleClient {
 		dnsServers = []string{"tcp+local://127.0.0.1:53"}
+	} else if s.System.EnableIPv6 {
+		dnsServers = []string{"localhost", "2606:4700:4700::1111", "2001:4860:4860::8888", "1.1.1.1", "8.8.8.8"}
 	}
 	dnsCfg := map[string]any{
 		"tag":           "dnsflow",
@@ -619,6 +629,7 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 	}
 
 	viaNginxPorts := AllocateViaNginxInternalPorts(s)
+	wildcardListen := inboundWildcardListen(s.System.EnableIPv6)
 
 	addCommonRelayAndExtra := func(mark int) {
 		usedTags := make(map[string]bool, len(inbounds)+len(s.Relay.Forwards)+len(s.ExtraInbounds)+2)
@@ -651,7 +662,7 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 			fwdTags = append(fwdTags, tag)
 			inbounds = append(inbounds, map[string]any{
 				"tag":      tag,
-				"listen":   "0.0.0.0",
+				"listen":   wildcardListen,
 				"port":     fwd.ListenPort,
 				"protocol": "dokodemo-door",
 				"settings": map[string]any{
@@ -699,7 +710,7 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 			}
 			inbounds = append(inbounds, map[string]any{
 				"tag":      "rps-tunnel",
-				"listen":   "0.0.0.0",
+				"listen":   wildcardListen,
 				"port":     s.RproxyS.ListenPort,
 				"protocol": "vless",
 				"settings": map[string]any{
@@ -722,7 +733,7 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 				rpsTags = append(rpsTags, tag)
 				inbounds = append(inbounds, map[string]any{
 					"tag":      tag,
-					"listen":   "0.0.0.0",
+					"listen":   wildcardListen,
 					"port":     m.Port,
 					"protocol": "dokodemo-door",
 					"settings": map[string]any{
@@ -746,7 +757,7 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 
 		var dokoTags []string
 		for _, ex := range s.ExtraInbounds {
-			if inb := buildExtraInbound(ex, viaNginxPorts[ex.Tag], opts.CertFile, opts.KeyFile); inb != nil {
+			if inb := buildExtraInbound(ex, viaNginxPorts[ex.Tag], opts.CertFile, opts.KeyFile, s.System.EnableIPv6); inb != nil {
 				inbounds = append(inbounds, inb)
 				if ex.Protocol == "dokodemo" {
 					dokoTags = append(dokoTags, ex.Tag)
@@ -827,10 +838,10 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 		// FWD0 inbound (routes into client default/routing pipeline)
 		if s.Client.FWD0.Enabled {
 			if s.Client.FWD0.EffectiveProtocol() == "vmess-tcp" {
-				inbounds = append(inbounds, buildVMessTCPInbound("forward0", s.Client.FWD0.Port, s.Client.FWD0.UUIDs))
+				inbounds = append(inbounds, buildVMessTCPInbound("forward0", s.Client.FWD0.Port, s.Client.FWD0.UUIDs, wildcardListen))
 			} else {
 				inbounds = append(inbounds, buildXHTTPDirectTLSInbound(
-					"forward0", s.Client.FWD0.Port, s.Client.FWD0.UUIDs, s.Client.FWD0.Path, opts.CertFile, opts.KeyFile,
+					"forward0", s.Client.FWD0.Port, s.Client.FWD0.UUIDs, s.Client.FWD0.Path, opts.CertFile, opts.KeyFile, wildcardListen,
 				))
 			}
 		}
@@ -838,10 +849,10 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 		// FWD1 inbound + dedicated upstream outbound (always freedom/vless safe with finalRules)
 		if s.Client.FWD1.Enabled {
 			if s.Client.FWD1.EffectiveProtocol() == "vmess-tcp" {
-				inbounds = append(inbounds, buildVMessTCPInbound("forward1", s.Client.FWD1.Port, s.Client.FWD1.UUIDs))
+				inbounds = append(inbounds, buildVMessTCPInbound("forward1", s.Client.FWD1.Port, s.Client.FWD1.UUIDs, wildcardListen))
 			} else {
 				inbounds = append(inbounds, buildXHTTPDirectTLSInbound(
-					"forward1", s.Client.FWD1.Port, s.Client.FWD1.UUIDs, s.Client.FWD1.Path, opts.CertFile, opts.KeyFile,
+					"forward1", s.Client.FWD1.Port, s.Client.FWD1.UUIDs, s.Client.FWD1.Path, opts.CertFile, opts.KeyFile, wildcardListen,
 				))
 			}
 			var upNode *state.OutboundNode

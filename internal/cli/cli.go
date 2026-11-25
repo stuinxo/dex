@@ -155,6 +155,42 @@ Commands:
 `)
 }
 
+func isIPv6OnlyHost() bool {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return false
+	}
+	hasGlobalV6 := false
+	hasNonLoopbackV4 := false
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+				continue
+			}
+			if ip.To4() != nil {
+				hasNonLoopbackV4 = true
+			} else if ip.IsGlobalUnicast() {
+				hasGlobalV6 = true
+			}
+		}
+	}
+	return hasGlobalV6 && !hasNonLoopbackV4
+}
+
 func cmdInit(store *state.Store, exec reconcile.SystemExecutor, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -167,11 +203,19 @@ func cmdInit(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 	pw := fs.String("password", "", "web UI password (random 16-char if omitted)")
 	uuid := fs.String("uuid", "", "primary UUID (auto-generated if omitted)")
 	doh := fs.String("doh", "", "custom DoH URL(s), comma-separated (client role)")
+	enableIPv6 := fs.Bool("ipv6", false, "enable IPv6 dual-stack inbound/forwarding")
 	doApply := fs.Bool("apply", false, "apply configuration immediately")
 	force := fs.Bool("force", false, "overwrite existing state file")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+
+	ipv6Explicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "ipv6" {
+			ipv6Explicit = true
+		}
+	})
 
 	if _, err := os.Stat(store.StatePath()); err == nil && !*force {
 		fmt.Fprintf(stderr, "state file already exists at %s; use 'dex apply' to apply configuration or pass '--force' to overwrite\n", store.StatePath())
@@ -179,6 +223,15 @@ func cmdInit(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 	}
 
 	st := state.NewDefaultState(*role)
+	autoDetectedIPv6Only := false
+	if ipv6Explicit {
+		st.System.EnableIPv6 = *enableIPv6
+	} else {
+		if _, isOS := exec.(reconcile.OSExecutor); isOS && isIPv6OnlyHost() {
+			st.System.EnableIPv6 = true
+			autoDetectedIPv6Only = true
+		}
+	}
 	rawPW := *pw
 	if rawPW == "" {
 		var err error
@@ -252,6 +305,9 @@ func cmdInit(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 	}
 
 	fmt.Fprintf(stdout, "Initialized %s state at %s\n", st.Role, store.StatePath())
+	if autoDetectedIPv6Only {
+		fmt.Fprintln(stdout, "Detected IPv6-only host: enabled system.enable_ipv6=true")
+	}
 	if *pw == "" {
 		fmt.Fprintf(stdout, "Initial Web Password: %s\n", rawPW)
 	}
@@ -1196,6 +1252,7 @@ func cmdCertWithOpts(store *state.Store, exec reconcile.SystemExecutor, applyOpt
 			CFToken:   *tok,
 			CFEmail:   *email,
 			Webroot:   *webroot,
+			ListenV6:  st != nil && st.System.EnableIPv6,
 			AutoRenew: *renew,
 			CertPath:  store.DefaultCert(),
 			KeyPath:   store.DefaultKey(),

@@ -1802,6 +1802,7 @@ func (s *Server) handleCertIssue(w http.ResponseWriter, r *http.Request, _ *sess
 		CFToken:   tok,
 		CFEmail:   email,
 		Webroot:   strings.TrimSpace(req.Webroot),
+		ListenV6:  st != nil && st.System.EnableIPv6,
 		AutoRenew: autoRenew,
 		CertPath:  s.Store.DefaultCert(),
 		KeyPath:   s.Store.DefaultKey(),
@@ -2030,6 +2031,7 @@ func (s *Server) handleBackup(w http.ResponseWriter, _ *http.Request, _ *session
 func (s *Server) handlePutSystem(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
 	var req struct {
 		Hostname        *string `json:"hostname"`
+		EnableIPv6      *bool   `json:"enable_ipv6"`
 		AutoUpdateCore  *bool   `json:"auto_update_core"`
 		AutoTuneSysctl  *bool   `json:"auto_tune_sysctl"`
 		EnableFlowtable *bool   `json:"enable_flowtable"`
@@ -2055,6 +2057,9 @@ func (s *Server) handlePutSystem(w http.ResponseWriter, r *http.Request, _ *sess
 			}
 			dst.System.Hostname = h
 		}
+		if req.EnableIPv6 != nil {
+			dst.System.EnableIPv6 = *req.EnableIPv6
+		}
 		if req.AutoUpdateCore != nil {
 			dst.System.AutoUpdateCore = *req.AutoUpdateCore
 		}
@@ -2066,7 +2071,8 @@ func (s *Server) handlePutSystem(w http.ResponseWriter, r *http.Request, _ *sess
 		}
 		return nil
 	}
-	needReconcile := (req.AutoUpdateCore != nil && *req.AutoUpdateCore != cur.System.AutoUpdateCore) ||
+	needReconcile := (req.EnableIPv6 != nil && *req.EnableIPv6 != cur.System.EnableIPv6) ||
+		(req.AutoUpdateCore != nil && *req.AutoUpdateCore != cur.System.AutoUpdateCore) ||
 		(req.AutoTuneSysctl != nil && *req.AutoTuneSysctl != cur.System.AutoTuneSysctl) ||
 		(req.EnableFlowtable != nil && *req.EnableFlowtable != cur.System.EnableFlowtable)
 	var updated *state.State

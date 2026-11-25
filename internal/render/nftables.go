@@ -376,21 +376,26 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 	})
 
 	for _, fwd := range forwardsSorted {
-		var targetIP netip.Addr
+		var targetV4, targetV6 netip.Addr
 		if ip, perr := netip.ParseAddr(strings.Trim(fwd.TargetHost, "[]")); perr == nil {
-			targetIP = ip
+			if ip.Is4() {
+				targetV4 = ip
+			} else {
+				targetV6 = ip
+			}
 		} else if ips := opts.ResolvedHostIPs[fwd.TargetHost]; len(ips) > 0 {
 			for _, candidate := range ips {
-				if candidate.Is4() {
-					targetIP = candidate
-					break
+				if candidate.Is4() && !targetV4.IsValid() {
+					targetV4 = candidate
+				} else if candidate.Is6() && !targetV6.IsValid() {
+					targetV6 = candidate
 				}
 			}
-			if !targetIP.IsValid() {
-				targetIP = ips[0]
+			if !s.System.EnableIPv6 && targetV4.IsValid() {
+				targetV6 = netip.Addr{}
 			}
 		}
-		if !targetIP.IsValid() {
+		if !targetV4.IsValid() && !targetV6.IsValid() {
 			return nil, clientNeeded, relayNeeded, fmt.Errorf("cannot resolve target %q for nft forward rule %q", fwd.TargetHost, fwd.ID)
 		}
 
@@ -399,14 +404,15 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 			if proto == "" {
 				continue
 			}
-			if targetIP.Is4() {
-				preRules = append(preRules, fmt.Sprintf("        %s dport %d dnat ip to %s:%d", proto, fwd.ListenPort, targetIP.String(), fwd.TargetPort))
-				outRules = append(outRules, fmt.Sprintf("        %s dport %d dnat ip to %s:%d", proto, fwd.ListenPort, targetIP.String(), fwd.TargetPort))
-				postRules = append(postRules, fmt.Sprintf("        ip daddr %s %s dport %d masquerade", targetIP.String(), proto, fwd.TargetPort))
-			} else {
-				preRules = append(preRules, fmt.Sprintf("        %s dport %d dnat ip6 to [%s]:%d", proto, fwd.ListenPort, targetIP.String(), fwd.TargetPort))
-				outRules = append(outRules, fmt.Sprintf("        %s dport %d dnat ip6 to [%s]:%d", proto, fwd.ListenPort, targetIP.String(), fwd.TargetPort))
-				postRules = append(postRules, fmt.Sprintf("        ip6 daddr %s %s dport %d masquerade", targetIP.String(), proto, fwd.TargetPort))
+			if targetV4.IsValid() {
+				preRules = append(preRules, fmt.Sprintf("        meta nfproto ipv4 %s dport %d dnat ip to %s:%d", proto, fwd.ListenPort, targetV4.String(), fwd.TargetPort))
+				outRules = append(outRules, fmt.Sprintf("        meta nfproto ipv4 %s dport %d dnat ip to %s:%d", proto, fwd.ListenPort, targetV4.String(), fwd.TargetPort))
+				postRules = append(postRules, fmt.Sprintf("        ip daddr %s %s dport %d masquerade", targetV4.String(), proto, fwd.TargetPort))
+			}
+			if targetV6.IsValid() {
+				preRules = append(preRules, fmt.Sprintf("        meta nfproto ipv6 %s dport %d dnat ip6 to [%s]:%d", proto, fwd.ListenPort, targetV6.String(), fwd.TargetPort))
+				outRules = append(outRules, fmt.Sprintf("        meta nfproto ipv6 %s dport %d dnat ip6 to [%s]:%d", proto, fwd.ListenPort, targetV6.String(), fwd.TargetPort))
+				postRules = append(postRules, fmt.Sprintf("        ip6 daddr %s %s dport %d masquerade", targetV6.String(), proto, fwd.TargetPort))
 			}
 		}
 	}

@@ -27,6 +27,7 @@ type ACMEConfig struct {
 	CFToken   string
 	CFEmail   string
 	Webroot   string
+	ListenV6  bool
 	AutoRenew bool
 	AcmeBin   string
 	AcmeHome  string
@@ -364,6 +365,9 @@ func IssueHTTPACME(ctx context.Context, runner ACMERunner, cfg ACMEConfig) (*Cer
 		args = append(args, "--webroot", wr)
 	} else {
 		args = append(args, "--standalone")
+		if cfg.ListenV6 {
+			args = append(args, "--listen-v6")
+		}
 	}
 	args = append(args, "-k", "ec-256")
 	if out, err := runner.Run(ctx, nil, cfg.AcmeBin, args...); err != nil {

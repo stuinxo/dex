@@ -83,6 +83,16 @@ func runInteractiveMenu(store *state.Store, exec reconcile.SystemExecutor, stdin
 			if p != "" {
 				args = append(args, "--port", p)
 			}
+			if r == state.RoleServer || r == state.RoleLanding || r == state.RoleRelay {
+				defV6 := "n"
+				if isIPv6OnlyHost() {
+					defV6 = "y"
+				}
+				v6Ans := ask("Enable IPv6 inbound? (y/N)", defV6)
+				if strings.EqualFold(v6Ans, "y") || strings.EqualFold(v6Ans, "yes") {
+					args = append(args, "--ipv6=true")
+				}
+			}
 			if cmdInit(store, exec, args, stdout, stderr) == 0 {
 				if _, isOS := exec.(reconcile.OSExecutor); isOS {
 					ans := ask("Install runtime dependencies & Apply now? (Y/n)", "y")

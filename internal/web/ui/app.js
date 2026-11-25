@@ -570,6 +570,7 @@
 
     var defListen = defaultListenAddrForRole(currentState.role);
     $("sys-hostname").value = (currentState.system && currentState.system.hostname) || "";
+    $("sys-enable-ipv6").checked = !!(currentState.system && currentState.system.enable_ipv6);
     $("sys-auto-sysctl").checked = !!(currentState.system && currentState.system.auto_tune_sysctl);
     $("sys-flowtable").checked = !!(currentState.system && currentState.system.enable_flowtable);
     $("sys-auto-update-core").checked = !!(currentState.system && currentState.system.auto_update_core);
@@ -1887,6 +1888,7 @@
 
   $("btn-save-system").addEventListener("click", function () {
     currentState.system.hostname = $("sys-hostname").value.trim();
+    currentState.system.enable_ipv6 = $("sys-enable-ipv6").checked;
     currentState.system.auto_tune_sysctl = $("sys-auto-sysctl").checked;
     currentState.system.enable_flowtable = $("sys-flowtable").checked;
     currentState.system.auto_update_core = $("sys-auto-update-core").checked;

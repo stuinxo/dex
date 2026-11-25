@@ -17,6 +17,11 @@ func RenderUnits(s *state.State, opts RenderOptions, b *RenderBundle) []Rendered
 	nftConf := filepath.Join(opts.GeneratedDir, "nftables.conf")
 	memLimit := opts.GoMemLimit()
 
+	dohUpstreams := "1.1.1.1:53,8.8.8.8:53,127.0.0.53:53,127.0.0.1:53"
+	if s.System.EnableIPv6 {
+		dohUpstreams = "[2606:4700:4700::1111]:53,[2001:4860:4860::8888]:53,1.1.1.1:53,8.8.8.8:53,127.0.0.53:53,127.0.0.1:53"
+	}
+
 	if opts.InitSystem == "openrc" {
 		if b.XrayNeeded {
 			caps := "cap_net_bind_service"
@@ -130,12 +135,12 @@ stop() {
 			script := fmt.Sprintf(`#!/sbin/openrc-run
 description="DEX RFC 8484 DoH Server"
 command="%s"
-command_args="serve-doh --listen 127.0.0.1:9853 --upstream 1.1.1.1:53,8.8.8.8:53,127.0.0.53:53,127.0.0.1:53 --path /dq"
+command_args="serve-doh --listen 127.0.0.1:9853 --upstream %s --path /dq"
 command_background=true
 pidfile="/run/dex-doh.pid"
 rc_ulimit="-n 65535"
 depend() { need net; }
-`, opts.DexBin)
+`, opts.DexBin, dohUpstreams)
 			out = append(out, RenderedFile{
 				RelName:    "openrc/dex-doh",
 				TargetPath: "/etc/init.d/dex-doh",
@@ -275,14 +280,14 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=%s serve-doh --listen 127.0.0.1:9853 --upstream 1.1.1.1:53,8.8.8.8:53,127.0.0.53:53,127.0.0.1:53 --path /dq
+ExecStart=%s serve-doh --listen 127.0.0.1:9853 --upstream %s --path /dq
 Restart=always
 RestartSec=2
 LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
-`, opts.DexBin)
+`, opts.DexBin, dohUpstreams)
 		out = append(out, RenderedFile{
 			RelName:    "systemd/dex-doh.service",
 			TargetPath: "/etc/systemd/system/dex-doh.service",

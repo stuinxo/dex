@@ -25,6 +25,18 @@ func RenderHAProxy(s *state.State) (data []byte, needed bool, err error) {
 		return rules[i].ListenPort < rules[j].ListenPort
 	})
 
+	resolverDNS := `resolvers dex_dns
+  nameserver dns1 1.1.1.1:53
+  nameserver dns2 8.8.8.8:53
+  nameserver dns3 223.5.5.5:53`
+	if s.System.EnableIPv6 {
+		resolverDNS = `resolvers dex_dns
+  nameserver dns1 [2606:4700:4700::1111]:53
+  nameserver dns2 [2001:4860:4860::8888]:53
+  nameserver dns3 1.1.1.1:53
+  nameserver dns4 8.8.8.8:53`
+	}
+
 	var b strings.Builder
 	b.WriteString(`global
   maxconn 65535
@@ -41,10 +53,7 @@ defaults
   timeout tunnel     1h
   timeout check      10s
 
-resolvers dex_dns
-  nameserver dns1 1.1.1.1:53
-  nameserver dns2 8.8.8.8:53
-  nameserver dns3 223.5.5.5:53
+` + resolverDNS + `
   resolve_retries 3
   timeout retry   3s
   hold valid      10s
@@ -57,12 +66,16 @@ resolvers dex_dns
 		if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
 			host = "[" + host + "]"
 		}
+		bindSpec := fmt.Sprintf(":%d", r.ListenPort)
+		if s.System.EnableIPv6 {
+			bindSpec = fmt.Sprintf(":::%d v4v6", r.ListenPort)
+		}
 		if _, err := netip.ParseAddr(unbracketed); err == nil {
-			fmt.Fprintf(&b, "\nfrontend ft_%d\n  bind :%d\n  default_backend bk_%d\n\nbackend bk_%d\n  server srv1 %s:%d check\n",
-				r.ListenPort, r.ListenPort, r.ListenPort, r.ListenPort, host, r.TargetPort)
+			fmt.Fprintf(&b, "\nfrontend ft_%d\n  bind %s\n  default_backend bk_%d\n\nbackend bk_%d\n  server srv1 %s:%d check\n",
+				r.ListenPort, bindSpec, r.ListenPort, r.ListenPort, host, r.TargetPort)
 		} else {
-			fmt.Fprintf(&b, "\nfrontend ft_%d\n  bind :%d\n  default_backend bk_%d\n\nbackend bk_%d\n  server srv1 %s:%d check resolvers dex_dns init-addr libc,none\n",
-				r.ListenPort, r.ListenPort, r.ListenPort, r.ListenPort, host, r.TargetPort)
+			fmt.Fprintf(&b, "\nfrontend ft_%d\n  bind %s\n  default_backend bk_%d\n\nbackend bk_%d\n  server srv1 %s:%d check resolvers dex_dns init-addr libc,none\n",
+				r.ListenPort, bindSpec, r.ListenPort, r.ListenPort, host, r.TargetPort)
 		}
 	}
 	return []byte(b.String()), true, nil
