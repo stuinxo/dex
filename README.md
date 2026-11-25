@@ -17,12 +17,12 @@
 
 ```sh
 # 方式一：短域名极简安装（国内直连，安装后自动进入交互菜单）
-curl -Lso- dex.234579.xyz | sh
-wget -qO- dex.234579.xyz | sh
+curl -Lso- dex.stuinx.net | sh
+wget -qO- dex.stuinx.net | sh
 
 # 指定角色一键直装（client / server / landing / relay）
-curl -Lso- dex.234579.xyz/client | sh
-curl -Lso- dex.234579.xyz/server | sh
+curl -Lso- dex.stuinx.net/client | sh
+curl -Lso- dex.stuinx.net/server | sh
 
 # 方式二：GitHub 原生短路径
 curl -Lso- github.com/stuinxo/dex/raw/main/dex | sh

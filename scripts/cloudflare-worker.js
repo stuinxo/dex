@@ -3,9 +3,9 @@
  *
  * Deployment:
  * 1. Create a Cloudflare Worker (or `wrangler deploy`) using this script.
- * 2. Bind Custom Domain `dex.234579.xyz` to the Worker under Workers & Pages
+ * 2. Bind Custom Domain `dex.stuinx.net` to the Worker under Workers & Pages
  *    -> Settings -> Domains & Routes -> Add -> Custom Domain.
- * 3. Ensure `dex.234579.xyz` DNS is proxied by Cloudflare (orange cloud / managed by Workers).
+ * 3. Ensure `dex.stuinx.net` DNS is proxied by Cloudflare (orange cloud / managed by Workers).
  */
 
 const UPSTREAM_URL = "https://raw.githubusercontent.com/stuinxo/dex/main/scripts/install.sh";
@@ -35,7 +35,13 @@ export default {
       return textResponse("Method Not Allowed\n", 405, { Allow: "GET, HEAD" });
     }
 
-    const { pathname } = new URL(request.url);
+    const url = new URL(request.url);
+    if (url.protocol === "http:") {
+      url.protocol = "https:";
+      return Response.redirect(url.toString(), 301);
+    }
+
+    const { pathname } = url;
     const cleanPath = pathname.length > 1 ? pathname.replace(/\/+$/, "") : pathname;
     const isRaw = RAW_PATHS.has(cleanPath);
     const role = ROLE_PATHS.get(cleanPath);
