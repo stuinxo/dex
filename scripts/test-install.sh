@@ -246,6 +246,7 @@ EOF
 chmod +x "$STUB_BIN_A"/*
 
 if PATH="$STUB_BIN_A:/usr/bin:/bin" \
+   DEX_KEEP_PATH=1 \
    DEX_OS_INIT="openrc" \
    DEX_NGINX_DEFAULT_SITE="$E2E_ALPINE/nginx-default" \
    DEX_STATE_DIR="$STATE_A" \
@@ -264,6 +265,34 @@ if PATH="$STUB_BIN_A:/usr/bin:/bin" \
 else
   fail "E2E Alpine/OpenRC offline server install exited non-zero: $(cat "$E2E_ALPINE/out.log")"
 fi
+
+# 4b. Pre-existing nginx must not be reinstalled via apk
+cat > "$STUB_BIN_A/nginx" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$STUB_BIN_A/nginx"
+: > "$E2E_ALPINE/apk.log"
+if PATH="$STUB_BIN_A:/usr/bin:/bin" \
+   DEX_KEEP_PATH=1 \
+   DEX_OS_INIT="openrc" \
+   DEX_NGINX_DEFAULT_SITE="$E2E_ALPINE/nginx-default" \
+   DEX_STATE_DIR="$STATE_A" \
+   DEX_INSTALL_BIN="$DST_BIN_A/dex" \
+   DEX_XRAY_BIN="$DST_BIN_A/xray" \
+   DEX_MOSDNS_BIN="$DST_BIN_A/mosdns" \
+   DEX_BIN="$E2E_ALPINE/dex.elf" \
+   XRAY_ZIP="$E2E_ALPINE/Xray-linux-64.zip" \
+   sh "$INSTALL_SCRIPT" server >"$E2E_ALPINE/out-preserve.log" 2>&1; then
+  if ! grep -q 'apk add --no-cache.*nginx' "$E2E_ALPINE/apk.log"; then
+    pass "E2E Alpine/OpenRC preserves pre-existing nginx without reinstalling package"
+  else
+    fail "E2E Alpine/OpenRC preserves pre-existing nginx without reinstalling package: $(cat "$E2E_ALPINE/apk.log")"
+  fi
+else
+  fail "E2E Alpine/OpenRC preserves pre-existing nginx without reinstalling package: $(cat "$E2E_ALPINE/out-preserve.log")"
+fi
+rm -f "$STUB_BIN_A/nginx"
 
 # ---------------------------------------------------------------------------
 # 5. End-to-end mocked install flow: Debian/apt online with SHA256 verification & tamper rejection

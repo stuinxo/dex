@@ -2,7 +2,7 @@
 # DEX Bootstrap Installer (POSIX sh)
 # Supports Debian 12/13, Ubuntu (apt + systemd), and Alpine 3.x (apk + OpenRC) on amd64/arm64.
 set -eu
-export PATH="${PATH:-/usr/bin:/bin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin"
+[ "${DEX_KEEP_PATH:-0}" = "1" ] || export PATH="${PATH:-/usr/bin:/bin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin"
 
 DEX_REPO="${DEX_REPO:-stuinxo/dex}"
 DEX_VERSION="${DEX_VERSION:-latest}"
