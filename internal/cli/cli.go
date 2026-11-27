@@ -2316,7 +2316,11 @@ func cmdRproxy(store *state.Store, exec reconcile.SystemExecutor, args []string,
 		fmt.Fprintf(stdout, "RproxyS: enabled=%v domain=%s port=%d uuids=%v mappings=%d\n",
 			st.RproxyS.Enabled, st.RproxyS.Domain, st.RproxyS.ListenPort, st.RproxyS.UUIDs, len(st.RproxyS.Mappings))
 		for _, m := range st.RproxyS.Mappings {
-			fmt.Fprintf(stdout, "  S-Map :%d (%s)\n", m.Port, m.Proto)
+			if strings.TrimSpace(m.UUID) != "" {
+				fmt.Fprintf(stdout, "  S-Map :%d (%s) -> uuid=%s\n", m.Port, m.Proto, strings.TrimSpace(m.UUID))
+			} else {
+				fmt.Fprintf(stdout, "  S-Map :%d (%s)\n", m.Port, m.Proto)
+			}
 		}
 		fmt.Fprintf(stdout, "RproxyC: enabled=%v tunnel=%s:%d uuid=%s mappings=%d\n",
 			st.Client.RproxyC.Enabled, st.Client.RproxyC.TunnelAddress, st.Client.RproxyC.TunnelPort, st.Client.RproxyC.TunnelUUID, len(st.Client.RproxyC.Mappings))
@@ -2332,15 +2336,23 @@ func cmdRproxy(store *state.Store, exec reconcile.SystemExecutor, args []string,
 		fs.SetOutput(stderr)
 		dom := fs.String("domain", "", "tunnel domain")
 		port := fs.Int("port", 20000, "tunnel listen port")
-		uuid := fs.String("uuid", "", "tunnel UUID")
+		uuid := fs.String("uuid", "", "tunnel UUID (comma-separated for multiple clients)")
 		mapPort := fs.Int("map-port", 0, "optional mapped port to add")
 		mapProto := fs.String("map-proto", "tcp", "tcp|udp|tcp,udp")
+		mapUUID := fs.String("map-uuid", "", "optional client UUID binding for --map-port")
 		doApply := fs.Bool("apply", false, "apply immediately")
 		if err := fs.Parse(args[1:]); err != nil {
 			return 2
 		}
-		if *uuid == "" {
-			*uuid, _ = cryptoext.GenerateUUID()
+		var uuids []string
+		for _, part := range strings.Split(*uuid, ",") {
+			if u := strings.TrimSpace(part); u != "" {
+				uuids = append(uuids, u)
+			}
+		}
+		if len(uuids) == 0 {
+			gen, _ := cryptoext.GenerateUUID()
+			uuids = []string{gen}
 		}
 		if err := applyOrSave(store, exec, defRole, *doApply, func(cur *state.State) error {
 			cur.RproxyS.Enabled = true
@@ -2348,11 +2360,12 @@ func cmdRproxy(store *state.Store, exec reconcile.SystemExecutor, args []string,
 				cur.RproxyS.Domain = *dom
 			}
 			cur.RproxyS.ListenPort = *port
-			cur.RproxyS.UUIDs = []string{*uuid}
+			cur.RproxyS.UUIDs = uuids
 			if *mapPort > 0 {
 				cur.RproxyS.Mappings = upsertRproxyServerMapping(cur.RproxyS.Mappings, state.RproxyServerMapping{
 					Port:  *mapPort,
 					Proto: *mapProto,
+					UUID:  strings.TrimSpace(*mapUUID),
 				})
 			}
 			return nil
@@ -2360,13 +2373,14 @@ func cmdRproxy(store *state.Store, exec reconcile.SystemExecutor, args []string,
 			fmt.Fprintf(stderr, "rproxy set failed: %v\n", err)
 			return 1
 		}
-		fmt.Fprintf(stdout, "RproxyS configured on :%d (UUID: %s)\n", *port, *uuid)
+		fmt.Fprintf(stdout, "RproxyS configured on :%d (UUID: %s)\n", *port, strings.Join(uuids, ","))
 		return 0
 	case "map-add":
 		fs := flag.NewFlagSet("rproxy map-add", flag.ContinueOnError)
 		fs.SetOutput(stderr)
 		port := fs.Int("port", 0, "mapped public port")
 		proto := fs.String("proto", "tcp", "tcp|udp|tcp,udp")
+		uuid := fs.String("uuid", "", "optional client UUID for multi-client isolation")
 		doApply := fs.Bool("apply", false, "apply immediately")
 		if err := fs.Parse(args[1:]); err != nil {
 			return 2
@@ -2382,6 +2396,7 @@ func cmdRproxy(store *state.Store, exec reconcile.SystemExecutor, args []string,
 			cur.RproxyS.Mappings = upsertRproxyServerMapping(cur.RproxyS.Mappings, state.RproxyServerMapping{
 				Port:  *port,
 				Proto: *proto,
+				UUID:  strings.TrimSpace(*uuid),
 			})
 			return nil
 		}); err != nil {

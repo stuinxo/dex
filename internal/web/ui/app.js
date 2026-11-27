@@ -952,7 +952,7 @@
     maps.forEach(function (m, idx) {
       var tr = make("tr");
       tr.appendChild(make("td", "", String(m.port)));
-      tr.appendChild(make("td", "", m.proto || "tcp"));
+      tr.appendChild(make("td", "", (m.proto || "tcp") + (m.uuid ? " [" + m.uuid.slice(0, 8) + "…]" : "")));
       var td = make("td");
       var bDel = make("button", "btn btn-sm btn-outline-danger", "删");
       bDel.type = "button";
@@ -1788,12 +1788,17 @@
       }
       var fP = fld("公网监听端口", make("input")); fP.type = "number"; fP.value = "18080";
       var fPr = make("select"); ["tcp", "udp", "tcp,udp"].forEach(function (p) { var o = make("option", "", p); o.value = p; fPr.appendChild(o); }); fld("协议", fPr);
+      var fU = fld("绑定客户端 UUID (多客户端隔离可选)", make("input")); fU.placeholder = "留空则共享默认隧道";
       var b = make("button", "btn btn-primary mt", "加入映射");
       b.type = "button";
       b.addEventListener("click", function () {
         currentState.rproxys = currentState.rproxys || {};
         currentState.rproxys.mappings = currentState.rproxys.mappings || [];
-        currentState.rproxys.mappings.push({ port: Number(fP.value), proto: fPr.value });
+        var item = { port: Number(fP.value), proto: fPr.value };
+        if (fU.value.trim()) {
+          item.uuid = fU.value.trim();
+        }
+        currentState.rproxys.mappings.push(item);
         onAdded();
         closeModal();
       });

@@ -605,6 +605,11 @@ func buildExtraInbound(ex state.ExtraInbound, viaNginxPort int, certFile, keyFil
 	}
 }
 
+func rpsPortalTagForUUID(u string) string {
+	clean := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(u), "-", ""))
+	return "portal-" + clean
+}
+
 // RenderXray builds the unified single-process Xray configuration JSON and reports whether Xray is needed.
 func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, err error) {
 	opts = opts.WithDefaults()
@@ -673,22 +678,45 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 			})
 		}
 		if s.RproxyS.Enabled {
+			dedicatedUUIDs := make(map[string]bool)
+			for _, m := range s.RproxyS.Mappings {
+				if u := strings.ToLower(strings.TrimSpace(m.UUID)); u != "" {
+					dedicatedUUIDs[u] = true
+				}
+			}
 			rpsClients := make([]map[string]any, 0, len(s.RproxyS.UUIDs)+len(s.RproxyS.InUUIDs))
 			seenRPS := make(map[string]struct{}, len(s.RproxyS.UUIDs))
 			for _, u := range s.RproxyS.UUIDs {
-				seenRPS[u] = struct{}{}
+				uTrim := strings.TrimSpace(u)
+				uKey := strings.ToLower(uTrim)
+				if uKey == "" {
+					continue
+				}
+				if _, exists := seenRPS[uKey]; exists {
+					continue
+				}
+				seenRPS[uKey] = struct{}{}
+				pTag := "portal"
+				if dedicatedUUIDs[uKey] {
+					pTag = rpsPortalTagForUUID(uTrim)
+				}
 				rpsClients = append(rpsClients, map[string]any{
-					"id":      u,
-					"reverse": map[string]any{"tag": "portal"},
+					"id":      uTrim,
+					"reverse": map[string]any{"tag": pTag},
 				})
 			}
 			for _, u := range s.RproxyS.InUUIDs {
-				if _, exists := seenRPS[u]; exists {
+				uTrim := strings.TrimSpace(u)
+				uKey := strings.ToLower(uTrim)
+				if uKey == "" {
 					continue
 				}
-				seenRPS[u] = struct{}{}
+				if _, exists := seenRPS[uKey]; exists {
+					continue
+				}
+				seenRPS[uKey] = struct{}{}
 				rpsClients = append(rpsClients, map[string]any{
-					"id": u,
+					"id": uTrim,
 				})
 			}
 			rpsSec := strings.TrimSpace(s.RproxyS.Security)
@@ -727,10 +755,25 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 					"outboundTag": "portal",
 				})
 			}
-			var rpsTags []string
+			usedMapTags := make(map[string]bool, len(s.RproxyS.Mappings))
+			var sharedTags []string
+			var dedicatedOrder []string
+			dedicatedTags := make(map[string][]string)
 			for _, m := range s.RproxyS.Mappings {
 				tag := fmt.Sprintf("rps-map-%d", m.Port)
-				rpsTags = append(rpsTags, tag)
+				if usedMapTags[tag] {
+					suffix := strings.ReplaceAll(strings.TrimSpace(m.Proto), ",", "_")
+					if suffix != "" {
+						cand := tag + "-" + suffix
+						if !usedMapTags[cand] {
+							tag = cand
+						}
+					}
+					for idx := 2; usedMapTags[tag]; idx++ {
+						tag = fmt.Sprintf("rps-map-%d-%d", m.Port, idx)
+					}
+				}
+				usedMapTags[tag] = true
 				inbounds = append(inbounds, map[string]any{
 					"tag":      tag,
 					"listen":   wildcardListen,
@@ -742,11 +785,27 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 						"network": m.Proto,
 					},
 				})
+				if uTrim := strings.TrimSpace(m.UUID); uTrim != "" {
+					pTag := rpsPortalTagForUUID(uTrim)
+					if _, exists := dedicatedTags[pTag]; !exists {
+						dedicatedOrder = append(dedicatedOrder, pTag)
+					}
+					dedicatedTags[pTag] = append(dedicatedTags[pTag], tag)
+				} else {
+					sharedTags = append(sharedTags, tag)
+				}
 			}
-			if len(rpsTags) > 0 {
+			for _, pTag := range dedicatedOrder {
 				highPrioRules = append(highPrioRules, map[string]any{
 					"type":        "field",
-					"inboundTag":  rpsTags,
+					"inboundTag":  dedicatedTags[pTag],
+					"outboundTag": pTag,
+				})
+			}
+			if len(sharedTags) > 0 {
+				highPrioRules = append(highPrioRules, map[string]any{
+					"type":        "field",
+					"inboundTag":  sharedTags,
 					"outboundTag": "portal",
 				})
 			}

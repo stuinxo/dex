@@ -1829,3 +1829,74 @@ func TestBuildDoHURLAndRoleGating(t *testing.T) {
 		t.Fatalf("expected relay DoHNeeded=false, err=%v", err)
 	}
 }
+
+func TestRenderMultiClientRproxyS(t *testing.T) {
+	uA := "11111111-1111-4111-8111-111111111111"
+	uB := "22222222-2222-4222-8222-222222222222"
+	uC := "33333333-3333-4333-8333-333333333333"
+	rel := state.NewDefaultState(state.RoleRelay)
+	rel.RproxyS = state.RproxySConfig{
+		Enabled:    true,
+		Domain:     "sd.example.com",
+		ListenPort: 33335,
+		UUIDs:      []string{uA, uB, uC},
+		Mappings: []state.RproxyServerMapping{
+			{Port: 33337, Proto: "tcp", UUID: uA},
+			{Port: 33338, Proto: "tcp", UUID: uB},
+			{Port: 33339, Proto: "tcp", UUID: uC},
+		},
+	}
+	relBytes, relNeeded, err := RenderXray(rel, RenderOptions{})
+	if err != nil || !relNeeded {
+		t.Fatalf("RenderXray multi-client RproxyS: err=%v needed=%v", err, relNeeded)
+	}
+	var relCfg struct {
+		Inbounds []struct {
+			Tag      string `json:"tag"`
+			Settings struct {
+				Clients []struct {
+					ID      string `json:"id"`
+					Reverse struct {
+						Tag string `json:"tag"`
+					} `json:"reverse"`
+				} `json:"clients"`
+			} `json:"settings"`
+		} `json:"inbounds"`
+		Routing struct {
+			Rules []struct {
+				InboundTag  []string `json:"inboundTag"`
+				OutboundTag string   `json:"outboundTag"`
+			} `json:"rules"`
+		} `json:"routing"`
+	}
+	if err := json.Unmarshal(relBytes, &relCfg); err != nil {
+		t.Fatalf("unmarshal multi-client RproxyS xray.json: %v", err)
+	}
+	clientPortals := make(map[string]string)
+	for _, inb := range relCfg.Inbounds {
+		if inb.Tag == "rps-tunnel" {
+			for _, cl := range inb.Settings.Clients {
+				clientPortals[cl.ID] = cl.Reverse.Tag
+			}
+		}
+	}
+	wantPortals := map[string]string{
+		uA: "portal-11111111111141118111111111111111",
+		uB: "portal-22222222222242228222222222222222",
+		uC: "portal-33333333333343338333333333333333",
+	}
+	for id, wantTag := range wantPortals {
+		if got := clientPortals[id]; got != wantTag {
+			t.Fatalf("client %s reverse portal = %q, want %q", id, got, wantTag)
+		}
+	}
+	ruleMap := make(map[string]string)
+	for _, r := range relCfg.Routing.Rules {
+		for _, it := range r.InboundTag {
+			ruleMap[it] = r.OutboundTag
+		}
+	}
+	if ruleMap["rps-map-33337"] != wantPortals[uA] || ruleMap["rps-map-33338"] != wantPortals[uB] || ruleMap["rps-map-33339"] != wantPortals[uC] {
+		t.Fatalf("unexpected isolated RproxyS routing rules: %+v", ruleMap)
+	}
+}

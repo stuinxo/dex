@@ -358,7 +358,8 @@ type RproxySConfig struct {
 
 type RproxyServerMapping struct {
 	Port  int    `json:"port"`
-	Proto string `json:"proto"` // tcp | udp | tcp,udp
+	Proto string `json:"proto"`          // tcp | udp | tcp,udp
+	UUID  string `json:"uuid,omitempty"` // optional client UUID in rproxys.uuids for multi-client isolation
 }
 
 type ExtraInbound struct {

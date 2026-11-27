@@ -322,9 +322,34 @@ func TestWave1StateValidationAdditions(t *testing.T) {
 		Security:   "none",
 		UUIDs:      []string{"22222222-2222-4222-8222-222222222222"},
 		InUUIDs:    []string{"33333333-3333-4333-8333-333333333333"},
+		Mappings: []RproxyServerMapping{
+			{Port: 20443, Proto: "tcp", UUID: "22222222-2222-4222-8222-222222222222"},
+		},
 	}
 	if err := srv.Validate(); err != nil {
 		t.Fatalf("expected valid server vmess-ws + rproxys state, got %v", err)
+	}
+
+	srvBadMapUUID := NewDefaultState(RoleRelay)
+	srvBadMapUUID.RproxyS = RproxySConfig{
+		Enabled:    true,
+		ListenPort: 33335,
+		UUIDs:      []string{"22222222-2222-4222-8222-222222222222"},
+		Mappings:   []RproxyServerMapping{{Port: 33337, Proto: "tcp", UUID: "not-a-uuid"}},
+	}
+	if err := srvBadMapUUID.Validate(); err == nil {
+		t.Fatalf("expected malformed rproxys.mappings[].uuid rejected")
+	}
+
+	srvUnknownMapUUID := NewDefaultState(RoleRelay)
+	srvUnknownMapUUID.RproxyS = RproxySConfig{
+		Enabled:    true,
+		ListenPort: 33335,
+		UUIDs:      []string{"22222222-2222-4222-8222-222222222222"},
+		Mappings:   []RproxyServerMapping{{Port: 33337, Proto: "tcp", UUID: "44444444-4444-4444-8444-444444444444"}},
+	}
+	if err := srvUnknownMapUUID.Validate(); err == nil {
+		t.Fatalf("expected rproxys.mappings[].uuid absent from rproxys.uuids rejected")
 	}
 
 	srv.Server.Protocol = "vmess-tcp"

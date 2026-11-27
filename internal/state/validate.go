@@ -494,10 +494,12 @@ func (s *State) Validate() error {
 		if len(s.RproxyS.UUIDs) == 0 {
 			return errors.New("rproxys.uuids: at least one UUID is required")
 		}
+		rpsUUIDSet := make(map[string]struct{}, len(s.RproxyS.UUIDs))
 		for _, u := range s.RproxyS.UUIDs {
 			if !uuidRe.MatchString(u) {
 				return fmt.Errorf("rproxys.uuids: invalid UUID %q", u)
 			}
+			rpsUUIDSet[strings.ToLower(strings.TrimSpace(u))] = struct{}{}
 		}
 		for _, u := range s.RproxyS.InUUIDs {
 			if !uuidRe.MatchString(u) {
@@ -513,6 +515,14 @@ func (s *State) Validate() error {
 			}
 			if err := claimPort(m.Proto, m.Port, fmt.Sprintf("rproxys.mapping:%d", m.Port)); err != nil {
 				return err
+			}
+			if u := strings.TrimSpace(m.UUID); u != "" {
+				if !uuidRe.MatchString(u) {
+					return fmt.Errorf("rproxys.mappings[%d]: invalid uuid %q", i, m.UUID)
+				}
+				if _, ok := rpsUUIDSet[strings.ToLower(u)]; !ok {
+					return fmt.Errorf("rproxys.mappings[%d]: uuid %q must be listed in rproxys.uuids", i, m.UUID)
+				}
 			}
 		}
 	}
