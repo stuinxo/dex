@@ -2,6 +2,7 @@
 # DEX Bootstrap Installer (POSIX sh)
 # Supports Debian 12/13, Ubuntu (apt + systemd), and Alpine 3.x (apk + OpenRC) on amd64/arm64.
 set -eu
+export PATH="${PATH:-/usr/bin:/bin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin"
 
 DEX_REPO="${DEX_REPO:-stuinxo/dex}"
 DEX_VERSION="${DEX_VERSION:-latest}"
@@ -576,18 +577,26 @@ main() {
       ;;
     server|landing)
       if [ "$role" = "server" ]; then
-        say "[*] Installing server packages (nginx, socat, wireguard-tools)..."
-        case "$OS_PKG" in
-          apk)
-            apk add --no-cache nginx socat wireguard-tools >/dev/null 2>&1 \
-              || die "Failed to install server Alpine packages."
-            ;;
-          apt)
-            wait_apt_lock
-            apt-get install -y -qq --no-install-recommends nginx socat wireguard-tools >/dev/null 2>&1 \
-              || die "Failed to install server Debian/Ubuntu packages."
-            ;;
-        esac
+        srv_pkgs=""
+        command -v nginx >/dev/null 2>&1 || srv_pkgs="$srv_pkgs nginx"
+        command -v socat >/dev/null 2>&1 || srv_pkgs="$srv_pkgs socat"
+        command -v wg-quick >/dev/null 2>&1 || srv_pkgs="$srv_pkgs wireguard-tools"
+        if [ -n "$srv_pkgs" ]; then
+          say "[*] Installing server packages ($srv_pkgs)..."
+          case "$OS_PKG" in
+            apk)
+              # shellcheck disable=SC2086
+              apk add --no-cache $srv_pkgs >/dev/null 2>&1 \
+                || die "Failed to install server Alpine packages."
+              ;;
+            apt)
+              wait_apt_lock
+              # shellcheck disable=SC2086
+              apt-get install -y -qq --no-install-recommends $srv_pkgs >/dev/null 2>&1 \
+                || die "Failed to install server Debian/Ubuntu packages."
+              ;;
+          esac
+        fi
         rm -f "${DEX_NGINX_DEFAULT_SITE:-/etc/nginx/sites-enabled/default}" 2>/dev/null || true
       fi
       ensure_ntp

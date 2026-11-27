@@ -256,7 +256,7 @@ if PATH="$STUB_BIN_A:/usr/bin:/bin" \
    XRAY_ZIP="$E2E_ALPINE/Xray-linux-64.zip" \
    sh "$INSTALL_SCRIPT" server >"$E2E_ALPINE/out.log" 2>&1; then
   if [ -x "$DST_BIN_A/dex" ] && [ -L "$DST_BIN_A/de_GWD" ] && [ -x "$DST_BIN_A/xray" ] \
-    && grep -q 'apk add --no-cache nginx socat wireguard-tools' "$E2E_ALPINE/apk.log"; then
+    && grep -q 'apk add --no-cache.*nginx' "$E2E_ALPINE/apk.log"; then
     pass "E2E Alpine/OpenRC offline server install (dex + de_GWD symlink + xray + nginx pkgs)"
   else
     fail "E2E Alpine/OpenRC offline server install missing expected artifacts"
