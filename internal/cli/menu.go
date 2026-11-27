@@ -16,7 +16,6 @@ import (
 	"github.com/stuinxo/dex/internal/cryptoext"
 	"github.com/stuinxo/dex/internal/reconcile"
 	"github.com/stuinxo/dex/internal/render"
-	"github.com/stuinxo/dex/internal/socks5out"
 	"github.com/stuinxo/dex/internal/state"
 	"github.com/stuinxo/dex/internal/version"
 )
@@ -491,7 +490,7 @@ func menuInitWizardForRole(store *state.Store, exec reconcile.SystemExecutor, r 
 			if d == "0" {
 				return 0
 			}
-			if d == "" || !socks5out.IsValidAddress(d) {
+			if d == "" || !state.IsValidAddress(d) {
 				fmt.Fprintln(stdout, "请输入有效的域名")
 				continue
 			}
@@ -1274,7 +1273,7 @@ func menuSocks5Outbounds(store *state.Store, exec reconcile.SystemExecutor, p *m
 					stLabel = "启用"
 				}
 				fmt.Fprintf(stdout, " [%d] %-12s [%s] %s (域名:%d IP:%d)\n",
-					i+1, prof.Name, stLabel, socks5out.FormatEndpoint(prof.Address, prof.Port), len(prof.Domains), len(prof.IPs))
+					i+1, prof.Name, stLabel, state.FormatEndpoint(prof.Address, prof.Port), len(prof.Domains), len(prof.IPs))
 			}
 		}
 		fmt.Fprint(stdout, "\n1. 添加出口配置\n2. 启用 / 停用出口\n3. 测试出口连通性\n4. 删除出口\n0. 返回\n")
@@ -1705,14 +1704,7 @@ func installSystemPackages(ctx context.Context, exec reconcile.SystemExecutor, p
 }
 
 func clientRulesMissing(store *state.Store, rulesDir string) bool {
-	required := []string{
-		"geoip.dat",
-		"geosite.dat",
-		"IPchnroute",
-		"Domains.chn.txt",
-		"Domains.apple.txt",
-		"Domains.games.txt",
-	}
+	required := append([]string(nil), state.RequiredClientBaseRuleFiles...)
 	if store != nil {
 		if st, err := store.Load(); err == nil && st != nil && st.Client.DNS.BlockAds {
 			required = append(required, "Domains.ads.txt")

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stuinxo/dex/internal/fsutil"
 	"github.com/stuinxo/dex/internal/reconcile"
 	"github.com/stuinxo/dex/internal/state"
 )
@@ -164,7 +165,7 @@ func TestInstallZabblyKernelRejectsInvalidKey(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "HTML") {
 		t.Fatalf("expected HTML key rejection, got %v", err)
 	}
-	if _, statErr := os.Stat(kernelTargetPath(root, zabblySourcesSysPath)); !os.IsNotExist(statErr) {
+	if _, statErr := os.Stat(fsutil.MapRootPrefix(root, zabblySourcesSysPath)); !os.IsNotExist(statErr) {
 		t.Fatalf("expected sources file not written on key error, statErr=%v", statErr)
 	}
 }
@@ -207,7 +208,7 @@ func TestInstallZabblyKernelDryRunAndFullSuccess(t *testing.T) {
 	if !strings.Contains(dryOut.String(), "Suites: trixie") || !strings.Contains(dryOut.String(), "linux-zabbly") {
 		t.Fatalf("unexpected dry-run output:\n%s", dryOut.String())
 	}
-	if _, err := os.Stat(kernelTargetPath(root, zabblySourcesSysPath)); !os.IsNotExist(err) {
+	if _, err := os.Stat(fsutil.MapRootPrefix(root, zabblySourcesSysPath)); !os.IsNotExist(err) {
 		t.Fatalf("dry-run should not write sources file")
 	}
 
@@ -216,11 +217,11 @@ func TestInstallZabblyKernelDryRunAndFullSuccess(t *testing.T) {
 	if err := InstallZabblyKernel(context.Background(), exec, cfg, false, &out); err != nil {
 		t.Fatalf("InstallZabblyKernel failed: %v", err)
 	}
-	keyBytes, err := os.ReadFile(kernelTargetPath(root, zabblyKeyringSysPath))
+	keyBytes, err := os.ReadFile(fsutil.MapRootPrefix(root, zabblyKeyringSysPath))
 	if err != nil || string(keyBytes) != fakeKey {
 		t.Fatalf("keyring mismatch: err=%v got=%q", err, string(keyBytes))
 	}
-	srcBytes, err := os.ReadFile(kernelTargetPath(root, zabblySourcesSysPath))
+	srcBytes, err := os.ReadFile(fsutil.MapRootPrefix(root, zabblySourcesSysPath))
 	if err != nil {
 		t.Fatalf("read sources failed: %v", err)
 	}

@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/stuinxo/dex/internal/fsutil"
 	"github.com/stuinxo/dex/internal/reconcile"
 	"github.com/stuinxo/dex/internal/state"
 )
@@ -154,7 +155,7 @@ func cmdRules(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 func printRulesStatus(store *state.Store, stdout io.Writer) int {
 	rulesDir := filepath.Join(store.Dir, "rules")
 	fmt.Fprintf(stdout, "Rules Directory: %s\n", rulesDir)
-	for _, name := range []string{"geoip.dat", "geosite.dat", "IPchnroute", "Domains.chn.txt", "Domains.apple.txt", "Domains.games.txt", "Domains.ads.txt"} {
+	for _, name := range state.ManagedRuleFiles {
 		p := filepath.Join(rulesDir, name)
 		info, err := os.Stat(p)
 		if err != nil {
@@ -317,48 +318,12 @@ func anyRuleFileChanged(backups []ruleFileBackup, names ...string) bool {
 	return false
 }
 
-func copyFileWithMode(src, dst string, mode os.FileMode) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".rulebak.tmp.*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	ok := false
-	defer func() {
-		if !ok {
-			_ = os.Remove(tmpName)
-		}
-	}()
-	if _, err := io.Copy(tmp, in); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(mode); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, dst); err != nil {
-		return err
-	}
-	ok = true
-	return nil
-}
-
 func backupRulesFiles(rulesDir string) ([]ruleFileBackup, string, error) {
 	bakDir, err := os.MkdirTemp(rulesDir, ".rules-bak-*")
 	if err != nil {
 		return nil, "", err
 	}
-	names := []string{"geoip.dat", "geosite.dat", "IPchnroute", "Domains.chn.txt", "Domains.apple.txt", "Domains.games.txt", "Domains.ads.txt"}
+	names := state.ManagedRuleFiles
 	backups := make([]ruleFileBackup, 0, len(names))
 	for _, name := range names {
 		live := filepath.Join(rulesDir, name)
@@ -376,7 +341,7 @@ func backupRulesFiles(rulesDir string) ([]ruleFileBackup, string, error) {
 		}
 		bakPath := filepath.Join(bakDir, name)
 		mode := info.Mode().Perm()
-		if err := copyFileWithMode(live, bakPath, mode); err != nil {
+		if err := fsutil.CopyFileAtomic(live, bakPath, mode); err != nil {
 			_ = os.RemoveAll(bakDir)
 			return nil, "", err
 		}
@@ -394,7 +359,7 @@ func backupRulesFiles(rulesDir string) ([]ruleFileBackup, string, error) {
 func restoreRulesFiles(backups []ruleFileBackup) {
 	for _, b := range backups {
 		if b.existed {
-			_ = copyFileWithMode(b.bakPath, b.livePath, b.mode)
+			_ = fsutil.CopyFileAtomic(b.bakPath, b.livePath, b.mode)
 		} else {
 			_ = os.Remove(b.livePath)
 		}
@@ -586,43 +551,7 @@ func installBinaryAtomic(srcPath, dstPath string) error {
 	if err != nil || !ok {
 		return fmt.Errorf("%s is not a valid Linux ELF binary", srcPath)
 	}
-	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(dstPath), ".dexupd.tmp.*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	success := false
-	defer func() {
-		if !success {
-			_ = os.Remove(tmpName)
-		}
-	}()
-	in, err := os.Open(srcPath)
-	if err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	_, copyErr := io.Copy(tmp, in)
-	_ = in.Close()
-	if copyErr != nil {
-		_ = tmp.Close()
-		return copyErr
-	}
-	if err := tmp.Chmod(0o755); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, dstPath); err != nil {
-		return err
-	}
-	success = true
-	return nil
+	return fsutil.CopyFileAtomic(srcPath, dstPath, 0o755)
 }
 
 func extractZipBinaryToTemp(zipPath, entryBase, tmpDir string) (string, error) {

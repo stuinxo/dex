@@ -19,6 +19,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/stuinxo/dex/internal/fsutil"
 )
 
 // ACMEConfig configures ACME certificate issuance via acme.sh (DNS-01 or HTTP-01).
@@ -49,44 +51,6 @@ func (osACMERunner) Run(ctx context.Context, env []string, name string, args ...
 		cmd.Env = append(os.Environ(), env...)
 	}
 	return cmd.CombinedOutput()
-}
-
-func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ".cert.tmp.*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	ok := false
-	defer func() {
-		if !ok {
-			_ = os.Remove(tmpName)
-		}
-	}()
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(perm); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	ok = true
-	return nil
 }
 
 // EnsureSelfSigned creates a 10-year ECDSA P-256 self-signed cert/key pair in pure Go
@@ -166,10 +130,10 @@ func generateAndWriteSelfSigned(certPath, keyPath, cn string) error {
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8})
 
-	if err := writeFileAtomic(keyPath, keyPEM, 0o600); err != nil {
+	if err := fsutil.WriteFileAtomic(keyPath, keyPEM, 0o600); err != nil {
 		return err
 	}
-	return writeFileAtomic(certPath, certPEM, 0o644)
+	return fsutil.WriteFileAtomic(certPath, certPEM, 0o644)
 }
 
 // ImportPair validates a certificate/key pair, skips identical rewrites, and atomically installs them.
@@ -203,10 +167,10 @@ func ImportPair(srcCert, srcKey, dstCert, dstKey string, allowSelfSigned bool, c
 		return report, false, nil
 	}
 
-	if err := writeFileAtomic(dstKey, keyPEM, 0o600); err != nil {
+	if err := fsutil.WriteFileAtomic(dstKey, keyPEM, 0o600); err != nil {
 		return report, false, fmt.Errorf("install private key: %w", err)
 	}
-	if err := writeFileAtomic(dstCert, certPEM, 0o644); err != nil {
+	if err := fsutil.WriteFileAtomic(dstCert, certPEM, 0o644); err != nil {
 		return report, false, fmt.Errorf("install certificate: %w", err)
 	}
 	return report, true, nil
@@ -260,10 +224,10 @@ func stageAndInstallACMECert(ctx context.Context, runner ACMERunner, env []strin
 		return nil, fmt.Errorf("issued certificate failed validation (existing cert untouched): %w", err)
 	}
 
-	if err := writeFileAtomic(cfg.KeyPath, keyPEM, 0o600); err != nil {
+	if err := fsutil.WriteFileAtomic(cfg.KeyPath, keyPEM, 0o600); err != nil {
 		return nil, fmt.Errorf("write key: %w", err)
 	}
-	if err := writeFileAtomic(cfg.CertPath, certPEM, 0o644); err != nil {
+	if err := fsutil.WriteFileAtomic(cfg.CertPath, certPEM, 0o644); err != nil {
 		return nil, fmt.Errorf("write cert: %w", err)
 	}
 
@@ -391,7 +355,7 @@ func scrubLegacyKeys(path string) {
 		}
 		kept = append(kept, l)
 	}
-	_ = writeFileAtomic(path, []byte(strings.Join(kept, "\n")), 0o600)
+	_ = fsutil.WriteFileAtomic(path, []byte(strings.Join(kept, "\n")), 0o600)
 }
 
 func scrubTokenFromAccountConf(path string) {
@@ -407,5 +371,5 @@ func scrubTokenFromAccountConf(path string) {
 		}
 		kept = append(kept, l)
 	}
-	_ = writeFileAtomic(path, []byte(strings.Join(kept, "\n")), 0o600)
+	_ = fsutil.WriteFileAtomic(path, []byte(strings.Join(kept, "\n")), 0o600)
 }

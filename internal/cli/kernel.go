@@ -8,12 +8,12 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/stuinxo/dex/internal/fsutil"
 	"github.com/stuinxo/dex/internal/reconcile"
 	"github.com/stuinxo/dex/internal/state"
 )
@@ -79,13 +79,6 @@ type KernelInfo struct {
 	BootFreeKnown  bool
 	Eligible       bool
 	BlockReason    string
-}
-
-func kernelTargetPath(rootPrefix, absPath string) string {
-	if strings.TrimSpace(rootPrefix) == "" {
-		return absPath
-	}
-	return filepath.Join(rootPrefix, strings.TrimPrefix(filepath.Clean(absPath), string(filepath.Separator)))
 }
 
 func defaultBootFreeMB() (uint64, error) {
@@ -308,43 +301,6 @@ Signed-By: %s
 `, strings.TrimRight(repoBase, "/"), codename, arch, zabblyKeyringSysPath)
 }
 
-func writeKernelFileAtomic(path string, data []byte, mode os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".dex-kern.tmp.*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	ok := false
-	defer func() {
-		if !ok {
-			_ = os.Remove(tmpName)
-		}
-	}()
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(mode); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	ok = true
-	return nil
-}
-
 // InstallZabblyKernel validates host eligibility and Zabbly repo support, configures
 // DEB822 APT sources + GPG keyring, and installs linux-zabbly without purging stock kernels.
 func InstallZabblyKernel(ctx context.Context, exec reconcile.SystemExecutor, cfg KernelConfig, dryRun bool, stdout io.Writer) error {
@@ -363,8 +319,8 @@ func InstallZabblyKernel(ctx context.Context, exec reconcile.SystemExecutor, cfg
 	}
 
 	sourcesContent := renderZabblySources(cfg.RepoBaseURL, info.Codename, info.Arch)
-	keyDst := kernelTargetPath(cfg.RootPrefix, zabblyKeyringSysPath)
-	sourcesDst := kernelTargetPath(cfg.RootPrefix, zabblySourcesSysPath)
+	keyDst := fsutil.MapRootPrefix(cfg.RootPrefix, zabblyKeyringSysPath)
+	sourcesDst := fsutil.MapRootPrefix(cfg.RootPrefix, zabblySourcesSysPath)
 
 	if dryRun {
 		if stdout != nil {
@@ -380,10 +336,10 @@ func InstallZabblyKernel(ctx context.Context, exec reconcile.SystemExecutor, cfg
 	if err != nil {
 		return err
 	}
-	if err := writeKernelFileAtomic(keyDst, keyData, 0o644); err != nil {
+	if err := fsutil.WriteFileAtomic(keyDst, keyData, 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", keyDst, err)
 	}
-	if err := writeKernelFileAtomic(sourcesDst, []byte(sourcesContent), 0o644); err != nil {
+	if err := fsutil.WriteFileAtomic(sourcesDst, []byte(sourcesContent), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", sourcesDst, err)
 	}
 

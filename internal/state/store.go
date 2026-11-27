@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/stuinxo/dex/internal/fsutil"
 )
 
 var ErrNotFound = errors.New("state file not found")
@@ -121,12 +123,7 @@ func readValidStateFile(path string) (*State, error) {
 	if st.Role == "" {
 		return nil, errors.New("state missing role")
 	}
-	if st.Client.Routing.ServiceMap == nil {
-		st.Client.Routing.ServiceMap = make(map[string]string)
-	}
-	if st.Client.DNS.Hosts == nil {
-		st.Client.DNS.Hosts = make(map[string]string)
-	}
+	st.Normalize()
 	return &st, nil
 }
 
@@ -166,62 +163,20 @@ func (s *Store) LoadOrDefault(role string) (*State, error) {
 	return st, err
 }
 
-func writeJSONAtomic(path string, v any, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-
-	tmp, err := os.CreateTemp(dir, ".state.tmp.*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	success := false
-	defer func() {
-		if !success {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(perm); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	success = true
-	return nil
-}
-
 func (s *Store) saveUnlocked(st *State) error {
+	if st != nil {
+		st.Normalize()
+	}
 	if err := st.Validate(); err != nil {
 		return fmt.Errorf("validate state: %w", err)
 	}
 	// Preserve existing valid primary state in .bak before atomic replacement.
 	if prev, err := readValidStateFile(s.StatePath()); err == nil && prev != nil {
-		if err := writeJSONAtomic(s.BackupPath(), prev, 0o600); err != nil {
+		if err := fsutil.WriteJSONAtomic(s.BackupPath(), prev, 0o600); err != nil {
 			return fmt.Errorf("write backup: %w", err)
 		}
 	}
-	return writeJSONAtomic(s.StatePath(), st, 0o600)
+	return fsutil.WriteJSONAtomic(s.StatePath(), st, 0o600)
 }
 
 // Save validates and atomically writes st to state.json under an exclusive flock.
@@ -266,7 +221,7 @@ func (s *Store) BeginTxn() error {
 			return err
 		}
 		_ = os.Remove(s.EmptyTxnPath())
-		return writeJSONAtomic(s.TxnPath(), cur, 0o600)
+		return fsutil.WriteJSONAtomic(s.TxnPath(), cur, 0o600)
 	})
 }
 
@@ -304,7 +259,7 @@ func (s *Store) RollbackTxn() (*State, error) {
 			}
 			return err
 		}
-		if err := writeJSONAtomic(s.StatePath(), txn, 0o600); err != nil {
+		if err := fsutil.WriteJSONAtomic(s.StatePath(), txn, 0o600); err != nil {
 			return err
 		}
 		_ = os.Remove(s.TxnPath())

@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/stuinxo/dex/internal/state"
 )
 
 // ProbeResult holds the connectivity result of probing an upstream SOCKS5 endpoint.
@@ -162,7 +164,7 @@ func ProbeProfile(ctx context.Context, proxyHost string, proxyPort int, user, pa
 			"https://api.ip.sb/ip",
 		}
 	}
-	proxyAddr := FormatEndpoint(proxyHost, proxyPort)
+	proxyAddr := state.FormatEndpoint(proxyHost, proxyPort)
 	tr := &http.Transport{
 		DialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
 			if network != "tcp" && network != "tcp4" && network != "tcp6" {

@@ -5,9 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
-	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/stuinxo/dex/internal/state"
 )
 
 // Endpoint describes a parsed SOCKS5 upstream endpoint.
@@ -18,68 +19,6 @@ type Endpoint struct {
 	Username string `json:"username,omitempty"`
 	Password string `json:"password,omitempty"`
 	HasAuth  bool   `json:"has_auth"`
-}
-
-var (
-	domainLabelRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$`)
-	geoRuleRe     = regexp.MustCompile(`^geoip:!?[A-Za-z0-9_-]+$`)
-	extRuleRe     = regexp.MustCompile(`^ext:[A-Za-z0-9._-]+:[A-Za-z0-9!_-]+$`)
-)
-
-// IsValidAddress reports whether addr is a valid IPv4, IPv6, or hostname/domain.
-func IsValidAddress(addr string) bool {
-	if addr == "" || strings.ContainsAny(addr, " \t\r\n") {
-		return false
-	}
-	if ip, err := netip.ParseAddr(addr); err == nil && ip.Zone() == "" {
-		return true
-	}
-	// If it looks purely numeric/dotted, do not treat invalid IPv4 as hostname.
-	isNumericDotted := true
-	for i := 0; i < len(addr); i++ {
-		c := addr[i]
-		if (c < '0' || c > '9') && c != '.' {
-			isNumericDotted = false
-			break
-		}
-	}
-	if isNumericDotted {
-		return false
-	}
-	if strings.Contains(addr, ":") {
-		return false
-	}
-	return len(addr) <= 253 && domainLabelRe.MatchString(addr)
-}
-
-// IsValidIPRule validates a routing IP/CIDR/geoip/ext rule entry.
-func IsValidIPRule(rule string) bool {
-	if rule == "" || strings.ContainsAny(rule, " \t\r\n") {
-		return false
-	}
-	if geoRuleRe.MatchString(rule) || extRuleRe.MatchString(rule) {
-		return true
-	}
-	if strings.Contains(rule, "/") {
-		p, err := netip.ParsePrefix(rule)
-		return err == nil && p.Addr().Zone() == ""
-	}
-	ip, err := netip.ParseAddr(rule)
-	return err == nil && ip.Zone() == ""
-}
-
-// IsValidDomainRule validates a routing domain rule entry (domain:, full:, regexp:, keyword:, geosite:, ext:, or bare domain).
-func IsValidDomainRule(rule string) bool {
-	if rule == "" {
-		return false
-	}
-	for i := 0; i < len(rule); i++ {
-		b := rule[i]
-		if b <= 0x20 || b == 0x7f {
-			return false
-		}
-	}
-	return true
 }
 
 func hasControlByte(s string) bool {
@@ -325,7 +264,7 @@ func ParseEndpoint(raw string) (*Endpoint, error) {
 		}
 	}
 
-	if !IsValidAddress(ep.Address) {
+	if !state.IsValidAddress(ep.Address) {
 		return nil, fmt.Errorf("invalid address %q", ep.Address)
 	}
 	if ep.HasAuth && (ep.Username == "" || ep.Password == "" || hasControlByte(ep.Username) || hasControlByte(ep.Password)) {
@@ -378,23 +317,15 @@ func ExpandPresetRules(kind, csvInput string) ([]string, error) {
 			continue
 		}
 		if kind == "domain" {
-			if !IsValidDomainRule(tok) {
+			if !state.IsValidDomainRule(tok) {
 				return nil, fmt.Errorf("invalid domain rule %q", tok)
 			}
 		} else {
-			if !IsValidIPRule(tok) {
+			if !state.IsValidIPRule(tok) {
 				return nil, fmt.Errorf("invalid IP/CIDR rule %q", tok)
 			}
 		}
 		add(tok)
 	}
 	return out, nil
-}
-
-// FormatEndpoint formats address and port for display (bracketing IPv6 addresses).
-func FormatEndpoint(address string, port int) string {
-	if strings.Contains(address, ":") && !strings.HasPrefix(address, "[") {
-		return fmt.Sprintf("[%s]:%d", address, port)
-	}
-	return fmt.Sprintf("%s:%d", address, port)
 }

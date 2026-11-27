@@ -6,7 +6,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/stuinxo/dex/internal/socks5out"
 	"github.com/stuinxo/dex/internal/state"
 )
 
@@ -1105,7 +1104,7 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 				outbounds = append(outbounds, buildFreedomOutbound(
 					mTag,
 					clientMark,
-					socks5out.FormatEndpoint(m.IntIP, m.IntPort),
+					state.FormatEndpoint(m.IntIP, m.IntPort),
 				))
 				bridgeRules = append(bridgeRules, map[string]any{
 					"type":        "field",

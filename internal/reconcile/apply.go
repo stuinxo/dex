@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/stuinxo/dex/internal/cert"
+	"github.com/stuinxo/dex/internal/fsutil"
 	"github.com/stuinxo/dex/internal/render"
 	"github.com/stuinxo/dex/internal/state"
 )
@@ -175,19 +176,6 @@ type fileBackup struct {
 	mode     os.FileMode
 }
 
-func mapTargetPath(rootPrefix, targetPath string) string {
-	if rootPrefix == "" {
-		return targetPath
-	}
-	cleanRoot := filepath.Clean(rootPrefix)
-	cleanTarget := filepath.Clean(targetPath)
-	if cleanTarget == cleanRoot || strings.HasPrefix(cleanTarget, cleanRoot+string(filepath.Separator)) {
-		return cleanTarget
-	}
-	clean := strings.TrimPrefix(cleanTarget, string(filepath.Separator))
-	return filepath.Join(cleanRoot, clean)
-}
-
 func readChnRouteFile(path string) []string {
 	f, err := os.Open(path)
 	if err != nil {
@@ -278,10 +266,10 @@ func populateRenderOptions(ctx context.Context, st *state.State, store *state.St
 	ropts = ropts.WithDefaults()
 
 	if !ropts.DomainsAppleExists {
-		ropts.DomainsAppleExists = isNonEmptyFile(mapTargetPath(opts.RootPrefix, ropts.DomainsApplePath))
+		ropts.DomainsAppleExists = isNonEmptyFile(fsutil.MapRootPrefix(opts.RootPrefix, ropts.DomainsApplePath))
 	}
 	if !ropts.DomainsGamesExists {
-		ropts.DomainsGamesExists = isNonEmptyFile(mapTargetPath(opts.RootPrefix, ropts.DomainsGamesPath))
+		ropts.DomainsGamesExists = isNonEmptyFile(fsutil.MapRootPrefix(opts.RootPrefix, ropts.DomainsGamesPath))
 	}
 	if !opts.RenderOpts.NginxLegacyHTTP2 && stateNeedsNginx(st) && exec != nil && exec.HasCommand("nginx") {
 		if out, _ := exec.RunCommand(ctx, nil, "nginx", "-v"); out != "" {
@@ -308,7 +296,7 @@ func populateRenderOptions(ctx context.Context, st *state.State, store *state.St
 		ropts.ResolvedHostIPs = make(map[string][]netip.Addr)
 	}
 
-	cachedHosts := loadHostsFileCache(mapTargetPath(opts.RootPrefix, filepath.Join(ropts.GeneratedDir, "mosdns", "hosts.txt")))
+	cachedHosts := loadHostsFileCache(fsutil.MapRootPrefix(opts.RootPrefix, filepath.Join(ropts.GeneratedDir, "mosdns", "hosts.txt")))
 
 	var warnings []string
 	resolveHost := func(h string) {
@@ -482,8 +470,8 @@ func dryRunPreflight(ctx context.Context, exec SystemExecutor, store *state.Stor
 	dryRopts := ropts
 	dryFiles := bundle.Files
 	if !isCustomExternalCertState(st, store) {
-		certDisk := mapTargetPath(rootPrefix, ropts.CertFile)
-		keyDisk := mapTargetPath(rootPrefix, ropts.KeyFile)
+		certDisk := fsutil.MapRootPrefix(rootPrefix, ropts.CertFile)
+		keyDisk := fsutil.MapRootPrefix(rootPrefix, ropts.KeyFile)
 		_, errC := os.Stat(certDisk)
 		_, errK := os.Stat(keyDisk)
 		if os.IsNotExist(errC) || os.IsNotExist(errK) {
@@ -592,7 +580,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 	}
 	if !opts.Force {
 		if err := CheckUnmanagedEdits(prevManifest, bundle.Files, func(p string) string {
-			return mapTargetPath(opts.RootPrefix, p)
+			return fsutil.MapRootPrefix(opts.RootPrefix, p)
 		}); err != nil {
 			_, _ = store.RollbackTxn()
 			return nil, err
@@ -602,7 +590,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 	// Ensure placeholder rules & self-signed fallback cert exist only after RenderAll & unmanaged checks pass.
 	certCreated := false
 	if st.Role == state.RoleClient && st.Client.DNS.BlockAds {
-		adsDiskPath := mapTargetPath(opts.RootPrefix, filepath.Join(ropts.StateDir, "rules", "Domains.ads.txt"))
+		adsDiskPath := fsutil.MapRootPrefix(opts.RootPrefix, filepath.Join(ropts.StateDir, "rules", "Domains.ads.txt"))
 		if _, statErr := os.Stat(adsDiskPath); os.IsNotExist(statErr) {
 			if werr := writeBytesExact(adsDiskPath, []byte{}, 0o644); werr != nil {
 				res.Warnings = append(res.Warnings, fmt.Sprintf("create placeholder Domains.ads.txt: %v", werr))
@@ -612,8 +600,8 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		}
 	}
 	if !isCustomExternalCertState(st, store) {
-		certDisk := mapTargetPath(opts.RootPrefix, ropts.CertFile)
-		keyDisk := mapTargetPath(opts.RootPrefix, ropts.KeyFile)
+		certDisk := fsutil.MapRootPrefix(opts.RootPrefix, ropts.CertFile)
+		keyDisk := fsutil.MapRootPrefix(opts.RootPrefix, ropts.KeyFile)
 		prevCert, errC := os.ReadFile(certDisk)
 		prevKey, errK := os.ReadFile(keyDisk)
 		cn := st.Server.Domain
@@ -637,7 +625,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		}
 	}
 	for _, f := range bundle.Files {
-		diskTarget := mapTargetPath(opts.RootPrefix, f.TargetPath)
+		diskTarget := fsutil.MapRootPrefix(opts.RootPrefix, f.TargetPath)
 		staged := diskTarget + ".new"
 		if strings.HasSuffix(diskTarget, ".json") {
 			staged = strings.TrimSuffix(diskTarget, ".json") + ".new.json"
@@ -691,7 +679,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 
 	var backups []fileBackup
 	backupOne := func(targetPath string) error {
-		diskPath := mapTargetPath(opts.RootPrefix, targetPath)
+		diskPath := fsutil.MapRootPrefix(opts.RootPrefix, targetPath)
 		prevPath := diskPath + ".prev"
 		info, statErr := os.Stat(diskPath)
 		if os.IsNotExist(statErr) {
@@ -751,7 +739,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 	// Detect changed/added/removed files before promoting staged files onto disk.
 	var changedFiles []changedFile
 	for _, f := range bundle.Files {
-		diskPath := mapTargetPath(opts.RootPrefix, f.TargetPath)
+		diskPath := fsutil.MapRootPrefix(opts.RootPrefix, f.TargetPath)
 		diskBytes, rerr := os.ReadFile(diskPath)
 		if rerr != nil || !bytes.Equal(diskBytes, f.Content) {
 			changedFiles = append(changedFiles, changedFile{relName: f.RelName, targetPath: f.TargetPath})
@@ -765,7 +753,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 
 	// Atomically promote staged files into place
 	for _, f := range bundle.Files {
-		diskPath := mapTargetPath(opts.RootPrefix, f.TargetPath)
+		diskPath := fsutil.MapRootPrefix(opts.RootPrefix, f.TargetPath)
 		if err := os.Rename(stagedPaths[f.TargetPath], diskPath); err != nil {
 			cleanupStaged()
 			rollbackFiles()
@@ -783,7 +771,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 			obsoleteUnitPaths = append(obsoleteUnitPaths, oldTarget)
 			continue
 		}
-		diskPath := mapTargetPath(opts.RootPrefix, oldTarget)
+		diskPath := fsutil.MapRootPrefix(opts.RootPrefix, oldTarget)
 		_ = os.Remove(diskPath)
 		res.FilesRemoved = append(res.FilesRemoved, oldTarget)
 	}
@@ -794,7 +782,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		if webRoot == "" {
 			webRoot = "/var/www/html"
 		}
-		indexDisk := mapTargetPath(opts.RootPrefix, filepath.Join(webRoot, "index.html"))
+		indexDisk := fsutil.MapRootPrefix(opts.RootPrefix, filepath.Join(webRoot, "index.html"))
 		if _, statErr := os.Stat(indexDisk); os.IsNotExist(statErr) {
 			_ = writeBytesExact(indexDisk, []byte("<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>Welcome</title></head><body><h1>Welcome</h1></body></html>\n"), 0o644)
 		}
@@ -841,7 +829,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		if f.RelName == "nftables.conf" {
 			// Read previous nftables.conf backup (if any) before applyServices runs so rollback can
 			// distinguish newly introduced dex_* tables from pre-existing ones.
-			diskNFT := mapTargetPath(opts.RootPrefix, f.TargetPath)
+			diskNFT := fsutil.MapRootPrefix(opts.RootPrefix, f.TargetPath)
 			prevNFTBytes, _ = os.ReadFile(diskNFT + ".prev")
 			break
 		}
@@ -853,7 +841,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 					_, _ = exec.RunCommand(ctx, nil, "modprobe", mod)
 				}
 			}
-			sysctlDisk := mapTargetPath(opts.RootPrefix, "/etc/sysctl.d/99-dex.conf")
+			sysctlDisk := fsutil.MapRootPrefix(opts.RootPrefix, "/etc/sysctl.d/99-dex.conf")
 			if _, err := os.Stat(sysctlDisk); err == nil && exec.HasCommand("sysctl") {
 				_, _ = exec.RunCommand(ctx, nil, "sysctl", "-e", "-p", sysctlDisk)
 				if qdiscOut, qerr := exec.RunCommand(ctx, nil, "sysctl", "-n", "net.core.default_qdisc"); qerr == nil {
@@ -868,11 +856,11 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		// Read original DNS config BEFORE stopping systemd-resolved so /run/systemd/resolve/resolv.conf is still available if /etc/resolv.conf is a 127.0.0.53 stub.
 		var backupResolvBytes []byte
 		if isOS && bundle.MosDNSNeeded {
-			resolvPath := mapTargetPath(opts.RootPrefix, "/etc/resolv.conf")
+			resolvPath := fsutil.MapRootPrefix(opts.RootPrefix, "/etc/resolv.conf")
 			if b, rerr := os.ReadFile(resolvPath); rerr == nil && hasNonLoopbackNameserver(b) {
 				backupResolvBytes = b
 			} else {
-				runResolvePath := mapTargetPath(opts.RootPrefix, "/run/systemd/resolve/resolv.conf")
+				runResolvePath := fsutil.MapRootPrefix(opts.RootPrefix, "/run/systemd/resolve/resolv.conf")
 				if rb, rerr2 := os.ReadFile(runResolvePath); rerr2 == nil && hasNonLoopbackNameserver(rb) {
 					backupResolvBytes = rb
 				}
@@ -881,7 +869,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 
 		// Stop/disable systemd-resolved on systemd hosts so it neither holds :53 nor bypasses /etc/resolv.conf via nss-resolve
 		if isOS && bundle.MosDNSNeeded && ropts.InitSystem == "systemd" {
-			_ = os.Remove(mapTargetPath(opts.RootPrefix, "/etc/systemd/resolved.conf.d/99-dex.conf"))
+			_ = os.Remove(fsutil.MapRootPrefix(opts.RootPrefix, "/etc/systemd/resolved.conf.d/99-dex.conf"))
 			if exec.ServiceIsActive(ctx, "systemd", "systemd-resolved") {
 				wasResolvedActive = true
 				_ = exec.ServiceStopDisable(ctx, "systemd", "systemd-resolved")
@@ -947,7 +935,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		}
 
 		for _, oldUnit := range obsoleteUnitPaths {
-			diskPath := mapTargetPath(opts.RootPrefix, oldUnit)
+			diskPath := fsutil.MapRootPrefix(opts.RootPrefix, oldUnit)
 			_ = os.Remove(diskPath)
 			if dir := filepath.Dir(diskPath); strings.HasSuffix(dir, ".service.d") {
 				_ = os.Remove(dir)
@@ -1067,7 +1055,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 				return fmt.Errorf("local DNS 127.0.0.1:53 readiness probe failed: %w", probeErr)
 			}
 
-			resolvPath := mapTargetPath(opts.RootPrefix, "/etc/resolv.conf")
+			resolvPath := fsutil.MapRootPrefix(opts.RootPrefix, "/etc/resolv.conf")
 			origPath := filepath.Join(store.Dir, "resolv.conf.orig")
 			curResolvBytes, readResolvErr := os.ReadFile(resolvPath)
 			curResolvLink, linkErr := os.Readlink(resolvPath)
@@ -1093,7 +1081,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 				return fmt.Errorf("update /etc/resolv.conf: %w", werr)
 			}
 		} else if isOS && !bundle.MosDNSNeeded {
-			resolvPath := mapTargetPath(opts.RootPrefix, "/etc/resolv.conf")
+			resolvPath := fsutil.MapRootPrefix(opts.RootPrefix, "/etc/resolv.conf")
 			origPath := filepath.Join(store.Dir, "resolv.conf.orig")
 			if rerr := restoreResolvConfIfNeeded(resolvPath, origPath); rerr != nil {
 				res.Warnings = append(res.Warnings, fmt.Sprintf("restore /etc/resolv.conf: %v", rerr))
@@ -1251,7 +1239,7 @@ func restoreResolvConfIfNeeded(resolvPath, origPath string) error {
 }
 
 func cleanupStalePrevFiles(rootPrefix, generatedDir string) {
-	genDisk := mapTargetPath(rootPrefix, generatedDir)
+	genDisk := fsutil.MapRootPrefix(rootPrefix, generatedDir)
 	dirs := []string{
 		genDisk,
 		filepath.Join(genDisk, "mosdns"),
@@ -1268,5 +1256,5 @@ func cleanupStalePrevFiles(rootPrefix, generatedDir string) {
 			}
 		}
 	}
-	_ = os.Remove(mapTargetPath(rootPrefix, "/etc/wireguard/wg0.conf.prev"))
+	_ = os.Remove(fsutil.MapRootPrefix(rootPrefix, "/etc/wireguard/wg0.conf.prev"))
 }

@@ -1,5 +1,36 @@
 package state
 
+// Core domain port, network, and rule file constants (Single Source of Truth).
+const (
+	DefaultLocalDNSPort   = 53
+	DefaultTProxyPort     = 9896
+	DefaultServerXrayPort = 9890
+	DefaultServerDoHPort  = 9853
+	DefaultWGPort         = 51820
+	DefaultWGSubnet       = "172.16.66.1/24"
+)
+
+// ManagedRuleFiles lists all geo/domain rule files managed in /etc/dex/rules.
+var ManagedRuleFiles = []string{
+	"geoip.dat",
+	"geosite.dat",
+	"IPchnroute",
+	"Domains.chn.txt",
+	"Domains.apple.txt",
+	"Domains.games.txt",
+	"Domains.ads.txt",
+}
+
+// RequiredClientBaseRuleFiles lists rule files always required for client routing.
+var RequiredClientBaseRuleFiles = []string{
+	"geoip.dat",
+	"geosite.dat",
+	"IPchnroute",
+	"Domains.chn.txt",
+	"Domains.apple.txt",
+	"Domains.games.txt",
+}
+
 // NodeSMServices defines the ordered 16 predefined services from v2 ui-NodeSM.
 var NodeSMServices = []string{
 	"openai",

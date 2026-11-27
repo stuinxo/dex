@@ -23,6 +23,7 @@ import (
 	"github.com/stuinxo/dex/internal/cryptoext"
 	"github.com/stuinxo/dex/internal/daemon"
 	"github.com/stuinxo/dex/internal/doh"
+	"github.com/stuinxo/dex/internal/fsutil"
 	"github.com/stuinxo/dex/internal/migrate"
 	"github.com/stuinxo/dex/internal/reconcile"
 	"github.com/stuinxo/dex/internal/render"
@@ -943,7 +944,7 @@ func parseAndNormalizeDoHList(raw string) ([]string, error) {
 			continue
 		}
 		host := render.ExtractDoHHost(norm)
-		if host == "" || !socks5out.IsValidAddress(host) {
+		if host == "" || !state.IsValidAddress(host) {
 			return nil, fmt.Errorf("invalid DoH server %q", f)
 		}
 		if _, dup := seen[norm]; !dup {
@@ -1476,16 +1477,8 @@ func cmdCertWithOpts(store *state.Store, exec reconcile.SystemExecutor, applyOpt
 		st, _ := store.Load()
 		certFile, keyFile := resolveActiveCertPaths(store, st)
 		if applyOpts.RootPrefix != "" {
-			cleanRoot := filepath.Clean(applyOpts.RootPrefix)
-			prefixPath := func(p string) string {
-				cp := filepath.Clean(p)
-				if cp == cleanRoot || strings.HasPrefix(cp, cleanRoot+string(filepath.Separator)) {
-					return cp
-				}
-				return filepath.Join(cleanRoot, strings.TrimPrefix(cp, string(filepath.Separator)))
-			}
-			certFile = prefixPath(certFile)
-			keyFile = prefixPath(keyFile)
+			certFile = fsutil.MapRootPrefix(applyOpts.RootPrefix, certFile)
+			keyFile = fsutil.MapRootPrefix(applyOpts.RootPrefix, keyFile)
 		}
 		cb, err1 := os.ReadFile(certFile)
 		kb, err2 := os.ReadFile(keyFile)
@@ -2049,7 +2042,7 @@ func cmdSocks5(store *state.Store, exec reconcile.SystemExecutor, args []string,
 		}
 		for _, p := range st.Server.Socks5Outbounds {
 			fmt.Fprintf(stdout, "%-12s enabled=%-5v %s domains=%d ips=%d\n",
-				p.Name, p.Enabled, socks5out.FormatEndpoint(p.Address, p.Port), len(p.Domains), len(p.IPs))
+				p.Name, p.Enabled, state.FormatEndpoint(p.Address, p.Port), len(p.Domains), len(p.IPs))
 		}
 		return 0
 	}

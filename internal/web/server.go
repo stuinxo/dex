@@ -1353,7 +1353,7 @@ func (s *Server) handleAddWGPeer(w http.ResponseWriter, r *http.Request, _ *sess
 			cur.Client.WireGuard.ServerPrivateKey = sp
 			cur.Client.WireGuard.ServerPublicKey = spub
 		}
-		if ep := strings.TrimSpace(req.EndpointHost); ep != "" && socks5out.IsValidAddress(ep) {
+		if ep := strings.TrimSpace(req.EndpointHost); ep != "" && state.IsValidAddress(ep) {
 			cur.Client.WireGuard.EndpointHost = ep
 		}
 		if req.ListenPort >= 1 && req.ListenPort <= 65535 {
@@ -1465,19 +1465,6 @@ func (s *Server) handleRegenWGPeer(w http.ResponseWriter, r *http.Request, _ *se
 	})
 }
 
-func sanitizeFilenamePart(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
-			b.WriteRune(r)
-		}
-	}
-	if b.Len() == 0 {
-		return "peer"
-	}
-	return b.String()
-}
-
 func (s *Server) handleWGPeerConfig(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
 	name := r.PathValue("name")
 	st, err := s.Store.Load()
@@ -1489,7 +1476,7 @@ func (s *Server) handleWGPeerConfig(w http.ResponseWriter, r *http.Request, _ *s
 		if p.Name == name {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			if r.URL.Query().Get("download") == "1" {
-				w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="wg-%s.conf"`, sanitizeFilenamePart(p.Name)))
+				w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="wg-%s.conf"`, state.SanitizeSafeName(p.Name, "peer")))
 			}
 			_, _ = io.WriteString(w, render.BuildWGPeerConfig(st.Client.WireGuard, p))
 			return
@@ -1863,7 +1850,7 @@ func (s *Server) handleTestSocks5(w http.ResponseWriter, r *http.Request, _ *ses
 
 func (s *Server) handleRulesStatus(w http.ResponseWriter, _ *http.Request, _ *sessionRecord) {
 	rulesDir := filepath.Join(s.Store.Dir, "rules")
-	names := []string{"geoip.dat", "geosite.dat", "IPchnroute", "Domains.chn.txt", "Domains.apple.txt", "Domains.games.txt", "Domains.ads.txt"}
+	names := state.ManagedRuleFiles
 	type fileInfo struct {
 		Name      string `json:"name"`
 		Exists    bool   `json:"exists"`

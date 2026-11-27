@@ -7,8 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 
+	"github.com/stuinxo/dex/internal/fsutil"
 	"github.com/stuinxo/dex/internal/render"
 )
 
@@ -52,42 +52,7 @@ func LoadManifest(path string) (*Manifest, error) {
 
 // SaveManifest atomically writes manifest.json.
 func SaveManifest(path string, m *Manifest) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	b, err := json.MarshalIndent(m, "", "  ")
-	if err != nil {
-		return err
-	}
-	b = append(b, '\n')
-	tmp, err := os.CreateTemp(dir, ".manifest.tmp.*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	ok := false
-	defer func() {
-		if !ok {
-			_ = os.Remove(tmpName)
-		}
-	}()
-	if _, err := tmp.Write(b); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	ok = true
-	return nil
+	return fsutil.WriteJSONAtomic(path, m, 0o600)
 }
 
 // CheckUnmanagedEdits verifies that previously managed files still match their last recorded SHA256

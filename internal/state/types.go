@@ -432,8 +432,8 @@ func NewDefaultState(role string) *State {
 				DoHServerPath:   clientDoHPath,
 			},
 			WireGuard: WireGuardConfig{
-				ListenPort: 51820,
-				SubnetCIDR: "172.16.66.1/24",
+				ListenPort: DefaultWGPort,
+				SubnetCIDR: DefaultWGSubnet,
 			},
 			DDNS: DDNSConfig{
 				Provider: "cloudflare",
@@ -526,6 +526,23 @@ func (s ServerConfig) EffectivePublicPort() int {
 		return s.PublicPort
 	}
 	return s.ListenPort
+}
+
+// Normalize ensures schema version and required non-nil map fields are initialized
+// without mutating semantic configuration choices.
+func (s *State) Normalize() {
+	if s == nil {
+		return
+	}
+	if s.Version == 0 {
+		s.Version = CurrentSchemaVersion
+	}
+	if s.Client.Routing.ServiceMap == nil {
+		s.Client.Routing.ServiceMap = make(map[string]string)
+	}
+	if s.Client.DNS.Hosts == nil {
+		s.Client.DNS.Hosts = make(map[string]string)
+	}
 }
 
 // Clone deep-copies the state via JSON round-trip.

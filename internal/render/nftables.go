@@ -200,18 +200,15 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 		globalDNS4, globalDNS6 := splitIPsByFamily(globalDNSRaw)
 
 		// Collect all proxy node endpoint IPs into V2NODE bypass sets (filtering restricted special IPs)
-		isRestrictedBypassIP := func(ip netip.Addr) bool {
-			return ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsMulticast()
-		}
 		var v2nodeRaw []string
 		for _, n := range s.Client.Nodes {
 			if ip, ipErr := netip.ParseAddr(strings.Trim(n.Address, "[]")); ipErr == nil {
-				if !isRestrictedBypassIP(ip) {
+				if !state.IsRestrictedPeerIP(ip) {
 					v2nodeRaw = append(v2nodeRaw, ip.String())
 				}
 			} else if ips := opts.ResolvedHostIPs[n.Address]; len(ips) > 0 {
 				for _, ip := range ips {
-					if !isRestrictedBypassIP(ip) {
+					if !state.IsRestrictedPeerIP(ip) {
 						v2nodeRaw = append(v2nodeRaw, ip.String())
 					}
 				}
@@ -220,12 +217,12 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 		if s.Client.RproxyC.Enabled && s.Client.RproxyC.TunnelAddress != "" {
 			addr := s.Client.RproxyC.TunnelAddress
 			if ip, ipErr := netip.ParseAddr(strings.Trim(addr, "[]")); ipErr == nil {
-				if !isRestrictedBypassIP(ip) {
+				if !state.IsRestrictedPeerIP(ip) {
 					v2nodeRaw = append(v2nodeRaw, ip.String())
 				}
 			} else if ips := opts.ResolvedHostIPs[addr]; len(ips) > 0 {
 				for _, ip := range ips {
-					if !isRestrictedBypassIP(ip) {
+					if !state.IsRestrictedPeerIP(ip) {
 						v2nodeRaw = append(v2nodeRaw, ip.String())
 					}
 				}

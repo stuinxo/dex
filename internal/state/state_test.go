@@ -890,3 +890,49 @@ func TestRoleBasedDoHDefaultsAndValidation(t *testing.T) {
 		t.Fatalf("expected relay DoH disabled by default")
 	}
 }
+
+func TestValidateIsPureAndNormalizeSetsDefaults(t *testing.T) {
+	st := &State{Role: RoleRelay}
+	if err := st.Validate(); err != nil {
+		t.Fatalf("Validate zero-version relay state: %v", err)
+	}
+	if st.Version != 0 {
+		t.Fatalf("expected Validate() to remain side-effect-free (Version=0), got %d", st.Version)
+	}
+	st.Normalize()
+	if st.Version != CurrentSchemaVersion {
+		t.Fatalf("expected Normalize() Version=%d, got %d", CurrentSchemaVersion, st.Version)
+	}
+	if st.Client.Routing.ServiceMap == nil || st.Client.DNS.Hosts == nil {
+		t.Fatalf("expected Normalize() to initialize non-nil maps")
+	}
+	st.Version = 99
+	if err := st.Validate(); err == nil {
+		t.Fatalf("expected unsupported schema version error")
+	}
+}
+
+func TestNetRuleAndSanitizeHelpers(t *testing.T) {
+	if !IsValidAddress("1.1.1.1") || !IsValidAddress("2001:db8::1") || !IsValidAddress("example.com") {
+		t.Fatalf("expected valid addresses accepted")
+	}
+	if IsValidAddress("999.1.1.1") || IsValidAddress("bad host") {
+		t.Fatalf("expected invalid addresses rejected")
+	}
+	if !IsValidIPRule("10.0.0.0/8") || !IsValidIPRule("geoip:cn") || IsValidIPRule("not a cidr") {
+		t.Fatalf("unexpected IsValidIPRule behavior")
+	}
+	if !IsValidDomainRule("geosite:cn") || IsValidDomainRule("bad domain") {
+		t.Fatalf("unexpected IsValidDomainRule behavior")
+	}
+	if got := FormatEndpoint("2001:db8::1", 1080); got != "[2001:db8::1]:1080" {
+		t.Fatalf("FormatEndpoint IPv6: got %q", got)
+	}
+	if got := SanitizeSafeName("My Phone/1", "peer"); got != "My_Phone_1" {
+		t.Fatalf("SanitizeSafeName: got %q", got)
+	}
+	if got := SanitizeSafeName("///", "peer"); got != "peer" {
+		t.Fatalf("SanitizeSafeName fallback: got %q", got)
+	}
+}
+

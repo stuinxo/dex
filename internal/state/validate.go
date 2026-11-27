@@ -11,8 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
-
-	"github.com/stuinxo/dex/internal/socks5out"
 )
 
 var (
@@ -34,8 +32,8 @@ func (s *State) Validate() error {
 	default:
 		return fmt.Errorf("unsupported role %q", s.Role)
 	}
-	if s.Version == 0 {
-		s.Version = CurrentSchemaVersion
+	if s.Version != 0 && s.Version != CurrentSchemaVersion {
+		return fmt.Errorf("unsupported schema version %d (expected %d)", s.Version, CurrentSchemaVersion)
 	}
 
 	portOwner := make(map[string]string) // "tcp:443" -> "label"
@@ -71,11 +69,6 @@ func (s *State) Validate() error {
 				return fmt.Errorf("invalid auth.listen_addr %q", s.Auth.ListenAddr)
 			}
 		}
-		if s.Role == RoleClient || s.Role == RoleServer {
-			if err := claimPort("tcp", p, "web-ui"); err != nil {
-				return err
-			}
-		}
 	}
 
 	if err := validateCleanAbsPath("server.camouflage_dir", s.Server.CamouflageDir); err != nil {
@@ -94,15 +87,12 @@ func (s *State) Validate() error {
 		return err
 	}
 
+	if err := forEachStaticPortClaim(s, false, claimPort); err != nil {
+		return err
+	}
+
 	// Client-specific checks
 	if s.Role == RoleClient {
-		if err := claimPort("tcp,udp", 53, "mosdns"); err != nil {
-			return err
-		}
-		if err := claimPort("tcp,udp", 9896, "xray-tproxy"); err != nil {
-			return err
-		}
-
 		nodeIDs := make(map[string]struct{}, len(s.Client.Nodes))
 		for i, n := range s.Client.Nodes {
 			if n.ID == "" {
@@ -112,46 +102,17 @@ func (s *State) Validate() error {
 				return fmt.Errorf("client.nodes: duplicate id %q", n.ID)
 			}
 			nodeIDs[n.ID] = struct{}{}
-			if !socks5out.IsValidAddress(n.Address) {
+			if !IsValidAddress(n.Address) {
 				return fmt.Errorf("client node %q: invalid address %q", n.ID, n.Address)
 			}
-			if ip, err := netip.ParseAddr(strings.Trim(strings.TrimSpace(n.Address), "[]")); err == nil && isRestrictedNodeIP(ip) {
+			if ip, err := netip.ParseAddr(strings.Trim(strings.TrimSpace(n.Address), "[]")); err == nil && IsRestrictedPeerIP(ip) {
 				return fmt.Errorf("client node %q: restricted IP address %q", n.ID, n.Address)
 			}
 			if n.Port < 1 || n.Port > 65535 {
 				return fmt.Errorf("client node %q: invalid port %d", n.ID, n.Port)
 			}
-			switch n.Protocol {
-			case "vless-xhttp", "vless-ws", "vmess-ws":
-				if !uuidRe.MatchString(n.UUID) {
-					return fmt.Errorf("client node %q: invalid UUID %q", n.ID, n.UUID)
-				}
-				if n.Path != "" && !pathRe.MatchString(n.Path) {
-					return fmt.Errorf("client node %q: invalid path %q", n.ID, n.Path)
-				}
-			case "vmess-tcp":
-				if !uuidRe.MatchString(n.UUID) {
-					return fmt.Errorf("client node %q: invalid UUID %q", n.ID, n.UUID)
-				}
-				if n.Path != "" && !pathRe.MatchString(n.Path) {
-					return fmt.Errorf("client node %q: invalid path %q", n.ID, n.Path)
-				}
-			case "vless-reality":
-				if !uuidRe.MatchString(n.UUID) {
-					return fmt.Errorf("client node %q: invalid UUID %q", n.ID, n.UUID)
-				}
-				if strings.TrimSpace(n.RealityPubKey) == "" {
-					return fmt.Errorf("client node %q: missing reality_pubkey", n.ID)
-				}
-				if !shortIDRe.MatchString(n.RealityShortID) || len(n.RealityShortID)%2 != 0 {
-					return fmt.Errorf("client node %q: invalid reality_shortid %q", n.ID, n.RealityShortID)
-				}
-			case "socks5":
-				if (n.Username == "") != (n.Password == "") {
-					return fmt.Errorf("client node %q: socks5 username and password must both be set or both empty", n.ID)
-				}
-			default:
-				return fmt.Errorf("client node %q: unsupported protocol %q", n.ID, n.Protocol)
+			if err := validateOutboundProtocol("client node", n.ID, n, false); err != nil {
+				return err
 			}
 		}
 
@@ -188,7 +149,7 @@ func (s *State) Validate() error {
 				s.Client.Routing.Divert.DirectLANIPs,
 			} {
 				for _, rule := range list {
-					if !socks5out.IsValidIPRule(rule) {
+					if !IsValidIPRule(rule) {
 						return fmt.Errorf("client.routing.divert: invalid IP/CIDR %q", rule)
 					}
 				}
@@ -201,12 +162,12 @@ func (s *State) Validate() error {
 				}
 			}
 			for _, d := range s.Client.Routing.Custom.Domains {
-				if !socks5out.IsValidDomainRule(d) {
+				if !IsValidDomainRule(d) {
 					return fmt.Errorf("client.routing.custom: invalid domain rule %q", d)
 				}
 			}
 			for _, ipr := range s.Client.Routing.Custom.IPs {
-				if !socks5out.IsValidIPRule(ipr) {
+				if !IsValidIPRule(ipr) {
 					return fmt.Errorf("client.routing.custom: invalid IP rule %q", ipr)
 				}
 			}
@@ -221,12 +182,12 @@ func (s *State) Validate() error {
 			}
 		}
 		for _, r := range append(append([]string(nil), s.Client.DNS.BlacklistIPs...), s.Client.DNS.WhitelistIPs...) {
-			if !socks5out.IsValidIPRule(r) {
+			if !IsValidIPRule(r) {
 				return fmt.Errorf("client.dns IP list: invalid entry %q", r)
 			}
 		}
 		for _, r := range append(append([]string(nil), s.Client.DNS.BlacklistDomains...), s.Client.DNS.WhitelistDomains...) {
-			if !socks5out.IsValidDomainRule(r) {
+			if !IsValidDomainRule(r) {
 				return fmt.Errorf("client.dns domain list: invalid entry %q", r)
 			}
 		}
@@ -241,9 +202,6 @@ func (s *State) Validate() error {
 		}
 
 		if s.Client.FWD0.Enabled {
-			if err := claimPort("tcp", s.Client.FWD0.Port, "client.fwd0"); err != nil {
-				return err
-			}
 			switch s.Client.FWD0.Protocol {
 			case "", "vless-xhttp", "vmess-tcp":
 			default:
@@ -262,9 +220,6 @@ func (s *State) Validate() error {
 			}
 		}
 		if s.Client.FWD1.Enabled {
-			if err := claimPort("tcp", s.Client.FWD1.Port, "client.fwd1"); err != nil {
-				return err
-			}
 			switch s.Client.FWD1.Protocol {
 			case "", "vless-xhttp", "vmess-tcp":
 			default:
@@ -289,10 +244,10 @@ func (s *State) Validate() error {
 		}
 
 		if s.Client.RproxyC.Enabled {
-			if !socks5out.IsValidAddress(s.Client.RproxyC.TunnelAddress) {
+			if !IsValidAddress(s.Client.RproxyC.TunnelAddress) {
 				return fmt.Errorf("client.rproxyc.tunnel_address: invalid %q", s.Client.RproxyC.TunnelAddress)
 			}
-			if ip, err := netip.ParseAddr(strings.Trim(strings.TrimSpace(s.Client.RproxyC.TunnelAddress), "[]")); err == nil && isRestrictedNodeIP(ip) {
+			if ip, err := netip.ParseAddr(strings.Trim(strings.TrimSpace(s.Client.RproxyC.TunnelAddress), "[]")); err == nil && IsRestrictedPeerIP(ip) {
 				return fmt.Errorf("client.rproxyc.tunnel_address: restricted IP address %q", s.Client.RproxyC.TunnelAddress)
 			}
 			if s.Client.RproxyC.TunnelPort < 1 || s.Client.RproxyC.TunnelPort > 65535 {
@@ -306,7 +261,7 @@ func (s *State) Validate() error {
 			default:
 				return fmt.Errorf("client.rproxyc.security must be tls or none, got %q", s.Client.RproxyC.Security)
 			}
-			if s.Client.RproxyC.ServerName != "" && !socks5out.IsValidAddress(s.Client.RproxyC.ServerName) {
+			if s.Client.RproxyC.ServerName != "" && !IsValidAddress(s.Client.RproxyC.ServerName) {
 				return fmt.Errorf("client.rproxyc.server_name: invalid %q", s.Client.RproxyC.ServerName)
 			}
 			if hasControlChar(s.Client.RproxyC.PinnedPeerCertSha256) {
@@ -319,17 +274,14 @@ func (s *State) Validate() error {
 				if !isValidNetProto(m.Proto) {
 					return fmt.Errorf("client.rproxyc.mappings[%d]: invalid proto %q", i, m.Proto)
 				}
-				if !socks5out.IsValidAddress(m.IntIP) {
+				if !IsValidAddress(m.IntIP) {
 					return fmt.Errorf("client.rproxyc.mappings[%d]: invalid int_ip %q", i, m.IntIP)
 				}
 			}
 		}
 
 		if s.Client.WireGuard.Enabled {
-			if err := claimPort("udp", s.Client.WireGuard.ListenPort, "wireguard"); err != nil {
-				return err
-			}
-			if !socks5out.IsValidAddress(s.Client.WireGuard.EndpointHost) {
+			if !IsValidAddress(s.Client.WireGuard.EndpointHost) {
 				return fmt.Errorf("client.wireguard.endpoint_host: invalid %q", s.Client.WireGuard.EndpointHost)
 			}
 			if !wgKeyRe.MatchString(s.Client.WireGuard.ServerPrivateKey) || !wgKeyRe.MatchString(s.Client.WireGuard.ServerPublicKey) {
@@ -338,7 +290,7 @@ func (s *State) Validate() error {
 			var wgServerAddr netip.Addr
 			subRaw := strings.TrimSpace(s.Client.WireGuard.SubnetCIDR)
 			if subRaw == "" {
-				subRaw = "172.16.66.1/24"
+				subRaw = DefaultWGSubnet
 			}
 			if pfx, err := netip.ParsePrefix(subRaw); err == nil {
 				wgServerAddr = pfx.Addr()
@@ -391,7 +343,7 @@ func (s *State) Validate() error {
 		}
 
 		if s.Client.DDNS.Enabled {
-			if !socks5out.IsValidAddress(s.Client.DDNS.Domain) || !strings.Contains(s.Client.DDNS.Domain, ".") {
+			if !IsValidAddress(s.Client.DDNS.Domain) || !strings.Contains(s.Client.DDNS.Domain, ".") {
 				return fmt.Errorf("client.ddns.domain: invalid %q", s.Client.DDNS.Domain)
 			}
 			if strings.TrimSpace(s.Client.DDNS.CFToken) == "" || hasControlChar(s.Client.DDNS.CFToken) {
@@ -416,21 +368,8 @@ func (s *State) Validate() error {
 		if s.Role == RoleLanding && s.Server.EnableDoH {
 			return errors.New("landing role does not deploy DoH server (server.enable_doh must be false)")
 		}
-		if !socks5out.IsValidAddress(s.Server.Domain) {
+		if !IsValidAddress(s.Server.Domain) {
 			return fmt.Errorf("server.domain: invalid %q", s.Server.Domain)
-		}
-		if err := claimPort("tcp", s.Server.ListenPort, "server-main"); err != nil {
-			return err
-		}
-		if s.Server.TLSMode == "nginx" {
-			if err := claimPort("tcp", 9890, "xray-nginx-upstream"); err != nil {
-				return err
-			}
-			if s.Server.EnableDoH {
-				if err := claimPort("tcp", 9853, "dex-doh"); err != nil {
-					return err
-				}
-			}
 		}
 		if len(s.Server.UUIDs) == 0 {
 			return errors.New("server.uuids: at least one UUID is required")
@@ -470,10 +409,7 @@ func (s *State) Validate() error {
 		if fwd.Engine == "haproxy" && fwd.Proto != "tcp" {
 			return fmt.Errorf("relay.forwards[%d]: haproxy engine supports tcp only", i)
 		}
-		if err := claimPort(fwd.Proto, fwd.ListenPort, fmt.Sprintf("relay.forward(%s)", fwd.ID)); err != nil {
-			return err
-		}
-		if !socks5out.IsValidAddress(fwd.TargetHost) {
+		if !IsValidAddress(fwd.TargetHost) {
 			return fmt.Errorf("relay.forwards[%d]: invalid target_host %q", i, fwd.TargetHost)
 		}
 		if fwd.TargetPort < 1 || fwd.TargetPort > 65535 {
@@ -483,9 +419,6 @@ func (s *State) Validate() error {
 
 	// RproxyS (Option 22)
 	if s.RproxyS.Enabled {
-		if err := claimPort("tcp", s.RproxyS.ListenPort, "rproxys.tunnel"); err != nil {
-			return err
-		}
 		switch s.RproxyS.Security {
 		case "", "tls", "none":
 		default:
@@ -512,9 +445,6 @@ func (s *State) Validate() error {
 			}
 			if m.Port == 53 || m.Port == 4711 {
 				return fmt.Errorf("rproxys.mappings[%d]: port %d is reserved", i, m.Port)
-			}
-			if err := claimPort(m.Proto, m.Port, fmt.Sprintf("rproxys.mapping:%d", m.Port)); err != nil {
-				return err
 			}
 			if u := strings.TrimSpace(m.UUID); u != "" {
 				if !uuidRe.MatchString(u) {
@@ -545,25 +475,14 @@ func (s *State) Validate() error {
 		}
 		extraTags[ex.Tag] = struct{}{}
 		if domTrim := strings.TrimSpace(ex.Domain); domTrim != "" {
-			if !socks5out.IsValidAddress(domTrim) {
+			if !IsValidAddress(domTrim) {
 				return fmt.Errorf("extra %q: invalid domain %q", ex.Tag, ex.Domain)
 			}
 		}
-		protoNet := "tcp"
-		if ex.Protocol == "dokodemo" {
-			if ex.Network != "" && !isValidNetProto(ex.Network) {
-				return fmt.Errorf("extra %q: invalid network %q", ex.Tag, ex.Network)
-			}
-			protoNet = ex.Network
-			if protoNet == "" {
-				protoNet = "tcp,udp"
-			}
+		if ex.Protocol == "dokodemo" && ex.Network != "" && !isValidNetProto(ex.Network) {
+			return fmt.Errorf("extra %q: invalid network %q", ex.Tag, ex.Network)
 		}
-		if !ex.ViaNginx {
-			if err := claimPort(protoNet, ex.ListenPort, "extra:"+ex.Tag); err != nil {
-				return err
-			}
-		} else {
+		if ex.ViaNginx {
 			if s.Role == RoleClient || s.Role == RoleLanding {
 				return fmt.Errorf("extra %q: via_nginx is not supported on %s role", ex.Tag, s.Role)
 			}
@@ -614,7 +533,7 @@ func (s *State) Validate() error {
 				return fmt.Errorf("extra %q: invalid socks5 credentials", ex.Tag)
 			}
 		case "dokodemo":
-			if !socks5out.IsValidAddress(ex.TargetAddr) || ex.TargetPort < 1 || ex.TargetPort > 65535 {
+			if !IsValidAddress(ex.TargetAddr) || ex.TargetPort < 1 || ex.TargetPort > 65535 {
 				return fmt.Errorf("extra %q: invalid dokodemo target", ex.Tag)
 			}
 		default:
@@ -701,7 +620,7 @@ func validateServerExits(s *State) error {
 			return fmt.Errorf("%s %q: domain or IP rules are required for non-default exits", kind, name)
 		}
 		for _, d := range domains {
-			if !socks5out.IsValidDomainRule(d) {
+			if !IsValidDomainRule(d) {
 				return fmt.Errorf("%s %q: invalid domain rule %q", kind, name, d)
 			}
 			if prev, exists := seenDomains[d]; exists {
@@ -710,7 +629,7 @@ func validateServerExits(s *State) error {
 			seenDomains[d] = name
 		}
 		for _, ipr := range ips {
-			if !socks5out.IsValidIPRule(ipr) {
+			if !IsValidIPRule(ipr) {
 				return fmt.Errorf("%s %q: invalid IP rule %q", kind, name, ipr)
 			}
 			if prev, exists := seenIPs[ipr]; exists {
@@ -733,7 +652,7 @@ func validateServerExits(s *State) error {
 		if !prof.Enabled {
 			continue
 		}
-		if !socks5out.IsValidAddress(prof.Address) {
+		if !IsValidAddress(prof.Address) {
 			return fmt.Errorf("socks5 profile %q: invalid address %q", prof.Name, prof.Address)
 		}
 		if prof.Port < 1 || prof.Port > 65535 {
@@ -779,13 +698,13 @@ func validateServerExits(s *State) error {
 		if !up.Enabled {
 			continue
 		}
-		if !socks5out.IsValidAddress(up.Address) {
+		if !IsValidAddress(up.Address) {
 			return fmt.Errorf("upstream exit %q: invalid address %q", up.Name, up.Address)
 		}
 		if up.Port < 1 || up.Port > 65535 {
 			return fmt.Errorf("upstream exit %q: invalid port %d", up.Name, up.Port)
 		}
-		if up.TLSSNI != "" && !socks5out.IsValidAddress(up.TLSSNI) {
+		if up.TLSSNI != "" && !IsValidAddress(up.TLSSNI) {
 			return fmt.Errorf("upstream exit %q: invalid tls_sni %q", up.Name, up.TLSSNI)
 		}
 
@@ -802,45 +721,45 @@ func validateServerExits(s *State) error {
 			}
 		}
 
-		switch up.Protocol {
-		case "vless-xhttp", "vless-ws", "vmess-ws":
-			if !uuidRe.MatchString(up.UUID) {
-				return fmt.Errorf("upstream exit %q: invalid UUID %q", up.Name, up.UUID)
-			}
-			if up.Path != "" && !pathRe.MatchString(up.Path) {
-				return fmt.Errorf("upstream exit %q: invalid path %q", up.Name, up.Path)
-			}
-		case "vmess-tcp":
-			if !uuidRe.MatchString(up.UUID) {
-				return fmt.Errorf("upstream exit %q: invalid UUID %q", up.Name, up.UUID)
-			}
-			if up.Path != "" && !pathRe.MatchString(up.Path) {
-				return fmt.Errorf("upstream exit %q: invalid path %q", up.Name, up.Path)
-			}
-		case "vless-reality":
-			if !uuidRe.MatchString(up.UUID) {
-				return fmt.Errorf("upstream exit %q: invalid UUID %q", up.Name, up.UUID)
-			}
-			if strings.TrimSpace(up.RealityPubKey) == "" {
-				return fmt.Errorf("upstream exit %q: missing reality_pubkey", up.Name)
-			}
-			if !shortIDRe.MatchString(up.RealityShortID) || len(up.RealityShortID)%2 != 0 {
-				return fmt.Errorf("upstream exit %q: invalid reality_shortid %q", up.Name, up.RealityShortID)
-			}
-		case "socks5":
-			if (up.Username == "") != (up.Password == "") {
-				return fmt.Errorf("upstream exit %q: username and password must be provided together", up.Name)
-			}
-			if hasControlChar(up.Username) || hasControlChar(up.Password) {
-				return fmt.Errorf("upstream exit %q: credentials contain control characters", up.Name)
-			}
-		default:
-			return fmt.Errorf("upstream exit %q: unsupported protocol %q", up.Name, up.Protocol)
+		if err := validateOutboundProtocol("upstream exit", up.Name, up.ToOutboundNode(), true); err != nil {
+			return err
 		}
 
 		if err := checkSplitRules("upstream_outbounds", up.Name, up.Domains, up.IPs); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func validateOutboundProtocol(kind, name string, n OutboundNode, checkCredControl bool) error {
+	switch n.Protocol {
+	case "vless-xhttp", "vless-ws", "vmess-ws", "vmess-tcp":
+		if !uuidRe.MatchString(n.UUID) {
+			return fmt.Errorf("%s %q: invalid UUID %q", kind, name, n.UUID)
+		}
+		if n.Path != "" && !pathRe.MatchString(n.Path) {
+			return fmt.Errorf("%s %q: invalid path %q", kind, name, n.Path)
+		}
+	case "vless-reality":
+		if !uuidRe.MatchString(n.UUID) {
+			return fmt.Errorf("%s %q: invalid UUID %q", kind, name, n.UUID)
+		}
+		if strings.TrimSpace(n.RealityPubKey) == "" {
+			return fmt.Errorf("%s %q: missing reality_pubkey", kind, name)
+		}
+		if !shortIDRe.MatchString(n.RealityShortID) || len(n.RealityShortID)%2 != 0 {
+			return fmt.Errorf("%s %q: invalid reality_shortid %q", kind, name, n.RealityShortID)
+		}
+	case "socks5":
+		if (n.Username == "") != (n.Password == "") {
+			return fmt.Errorf("%s %q: username and password must be set together or both empty", kind, name)
+		}
+		if checkCredControl && (hasControlChar(n.Username) || hasControlChar(n.Password)) {
+			return fmt.Errorf("%s %q: credentials contain control characters", kind, name)
+		}
+	default:
+		return fmt.Errorf("%s %q: unsupported protocol %q", kind, name, n.Protocol)
 	}
 	return nil
 }
@@ -861,15 +780,15 @@ func isValidHostsKey(dom string) bool {
 		return false
 	}
 	if rest, ok := strings.CutPrefix(dom, "domain:"); ok {
-		return socks5out.IsValidAddress(rest)
+		return IsValidAddress(rest)
 	}
 	if rest, ok := strings.CutPrefix(dom, "full:"); ok {
-		return socks5out.IsValidAddress(rest)
+		return IsValidAddress(rest)
 	}
 	if rest, ok := strings.CutPrefix(dom, "*."); ok {
-		return rest != "" && socks5out.IsValidAddress(rest)
+		return rest != "" && IsValidAddress(rest)
 	}
-	return socks5out.IsValidAddress(dom)
+	return IsValidAddress(dom)
 }
 
 func isValidNetProto(proto string) bool {
@@ -914,16 +833,105 @@ func validateNotifyConfig(cfg NotifyConfig) error {
 	return nil
 }
 
-func isRestrictedNodeIP(ip netip.Addr) bool {
-	return ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsMulticast()
-}
-
 func isReservedClientDoHPath(p string) bool {
 	switch p {
 	case "", "/", "/api", "/index.html", "/app.js", "/style.css", "/favicon.ico":
 		return true
 	}
 	return strings.HasPrefix(p, "/api/")
+}
+
+// forEachStaticPortClaim iterates all non-ViaNginx host ports owned by s.
+// Both Validate() and AllocateViaNginxInternalPorts() share this single enumeration source.
+func forEachStaticPortClaim(s *State, allRolesAuth bool, claim func(proto string, port int, owner string) error) error {
+	if s.Auth.ListenAddr != "" {
+		if _, portStr, err := net.SplitHostPort(s.Auth.ListenAddr); err == nil {
+			if p, perr := strconv.Atoi(portStr); perr == nil && p >= 1 && p <= 65535 {
+				if allRolesAuth || s.Role == RoleClient || s.Role == RoleServer {
+					if err := claim("tcp", p, "web-ui"); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	switch s.Role {
+	case RoleClient:
+		if err := claim("tcp,udp", DefaultLocalDNSPort, "mosdns"); err != nil {
+			return err
+		}
+		if err := claim("tcp,udp", DefaultTProxyPort, "xray-tproxy"); err != nil {
+			return err
+		}
+		if s.Client.FWD0.Enabled {
+			if err := claim("tcp", s.Client.FWD0.Port, "client.fwd0"); err != nil {
+				return err
+			}
+		}
+		if s.Client.FWD1.Enabled {
+			if err := claim("tcp", s.Client.FWD1.Port, "client.fwd1"); err != nil {
+				return err
+			}
+		}
+		if s.Client.WireGuard.Enabled {
+			if err := claim("udp", s.Client.WireGuard.ListenPort, "wireguard"); err != nil {
+				return err
+			}
+		}
+	case RoleServer, RoleLanding:
+		if err := claim("tcp", s.Server.ListenPort, "server-main"); err != nil {
+			return err
+		}
+		if s.Server.TLSMode == "nginx" {
+			if err := claim("tcp", DefaultServerXrayPort, "xray-nginx-upstream"); err != nil {
+				return err
+			}
+			if s.Server.EnableDoH {
+				if err := claim("tcp", DefaultServerDoHPort, "dex-doh"); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	for _, fwd := range s.Relay.Forwards {
+		proto := fwd.Proto
+		if proto == "" {
+			proto = "tcp"
+		}
+		if err := claim(proto, fwd.ListenPort, fmt.Sprintf("relay.forward(%s)", fwd.ID)); err != nil {
+			return err
+		}
+	}
+	if s.RproxyS.Enabled {
+		if err := claim("tcp", s.RproxyS.ListenPort, "rproxys.tunnel"); err != nil {
+			return err
+		}
+		for _, m := range s.RproxyS.Mappings {
+			proto := m.Proto
+			if proto == "" {
+				proto = "tcp"
+			}
+			if err := claim(proto, m.Port, fmt.Sprintf("rproxys.mapping:%d", m.Port)); err != nil {
+				return err
+			}
+		}
+	}
+	for _, ex := range s.ExtraInbounds {
+		if ex.ViaNginx {
+			continue
+		}
+		protoNet := "tcp"
+		if ex.Protocol == "dokodemo" {
+			protoNet = ex.Network
+			if protoNet == "" {
+				protoNet = "tcp,udp"
+			}
+		}
+		if err := claim(protoNet, ex.ListenPort, "extra:"+ex.Tag); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ExtraInternalPort returns the preferred loopback port Xray binds to when an ExtraInbound is fronted by Nginx.
@@ -943,57 +951,12 @@ func AllocateViaNginxInternalPorts(s *State) map[string]int {
 	}
 
 	used := make(map[int]bool)
-	if s.Auth.ListenAddr != "" {
-		if _, portStr, err := net.SplitHostPort(s.Auth.ListenAddr); err == nil {
-			if p, perr := strconv.Atoi(portStr); perr == nil && p >= 1 && p <= 65535 {
-				used[p] = true
-			}
+	_ = forEachStaticPortClaim(s, true, func(proto string, port int, _ string) error {
+		if port > 0 && strings.Contains(proto, "tcp") {
+			used[port] = true
 		}
-	}
-	switch s.Role {
-	case RoleClient:
-		used[53] = true
-		used[9896] = true
-		if s.Client.FWD0.Enabled && s.Client.FWD0.Port > 0 {
-			used[s.Client.FWD0.Port] = true
-		}
-		if s.Client.FWD1.Enabled && s.Client.FWD1.Port > 0 {
-			used[s.Client.FWD1.Port] = true
-		}
-	case RoleServer, RoleLanding:
-		if s.Server.ListenPort > 0 {
-			used[s.Server.ListenPort] = true
-		}
-		if s.Server.TLSMode == "nginx" {
-			used[9890] = true
-			if s.Server.EnableDoH {
-				used[9853] = true
-			}
-		}
-	}
-	for _, fwd := range s.Relay.Forwards {
-		if fwd.ListenPort > 0 && strings.Contains(fwd.Proto, "tcp") {
-			used[fwd.ListenPort] = true
-		}
-	}
-	if s.RproxyS.Enabled {
-		if s.RproxyS.ListenPort > 0 {
-			used[s.RproxyS.ListenPort] = true
-		}
-		for _, m := range s.RproxyS.Mappings {
-			if m.Port > 0 && strings.Contains(m.Proto, "tcp") {
-				used[m.Port] = true
-			}
-		}
-	}
-	for _, ex := range s.ExtraInbounds {
-		if ex.ViaNginx || ex.ListenPort <= 0 {
-			continue
-		}
-		if ex.Protocol != "dokodemo" || ex.Network == "" || strings.Contains(ex.Network, "tcp") {
-			used[ex.ListenPort] = true
-		}
-	}
+		return nil
+	})
 
 	for _, ex := range s.ExtraInbounds {
 		if !ex.ViaNginx {

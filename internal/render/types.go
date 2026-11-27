@@ -14,7 +14,6 @@ import (
 	"strings"
 
 	"github.com/stuinxo/dex/internal/cryptoext"
-	"github.com/stuinxo/dex/internal/socks5out"
 	"github.com/stuinxo/dex/internal/state"
 )
 
@@ -171,7 +170,7 @@ func ExtractDomainHost(rule string) string {
 	r = strings.TrimPrefix(r, "full:")
 	r = strings.TrimPrefix(r, "*.")
 	r = strings.Trim(r, "[]")
-	if socks5out.IsValidAddress(r) {
+	if state.IsValidAddress(r) {
 		return r
 	}
 	return ""

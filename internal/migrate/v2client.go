@@ -581,7 +581,7 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 				if cp == "" || cpu == "" {
 					continue
 				}
-				pName := sanitizePeerName(strVal(m["mark"]))
+				pName := state.SanitizeSafeName(strVal(m["mark"]), "")
 				if pName == "" {
 					pName = fmt.Sprintf("client%d", i+1)
 				}
@@ -688,20 +688,6 @@ func normalizeDoHURL(raw string) string {
 		return "https://" + raw + "/dq"
 	}
 	return "https://" + raw
-}
-
-func sanitizePeerName(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	cleaned := strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
-			return r
-		}
-		return '_'
-	}, raw)
-	return strings.Trim(cleaned, "_")
 }
 
 func normalizeProto(p string) string {

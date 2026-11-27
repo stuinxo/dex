@@ -110,16 +110,8 @@ MTU = 1420
 			peer.Name, peer.PublicKey, normalizePeerAllowedIP(peer.IP))
 
 		baseName := fmt.Sprintf("peer-%d", i+1)
-		if peer.Name != "" {
-			safe := strings.Trim(strings.Map(func(r rune) rune {
-				if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
-					return r
-				}
-				return '_'
-			}, peer.Name), "_")
-			if safe != "" {
-				baseName = "peer-" + safe
-			}
+		if safe := state.SanitizeSafeName(peer.Name, ""); safe != "" {
+			baseName = "peer-" + safe
 		}
 		peerFileName := baseName + ".conf"
 		for suffix := i + 1; seenPeerFiles[peerFileName]; suffix++ {
