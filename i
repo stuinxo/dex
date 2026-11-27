@@ -48,7 +48,9 @@ detect_os() {
     die "Unsupported OS: requires apt (Debian/Ubuntu) or apk (Alpine)."
   fi
 
-  if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+  if [ -n "${DEX_OS_INIT:-}" ]; then
+    OS_INIT="$DEX_OS_INIT"
+  elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     OS_INIT="systemd"
   elif command -v rc-service >/dev/null 2>&1; then
     OS_INIT="openrc"
@@ -579,7 +581,7 @@ main() {
               || die "Failed to install server Debian/Ubuntu packages."
             ;;
         esac
-        rm -f /etc/nginx/sites-enabled/default
+        rm -f "${DEX_NGINX_DEFAULT_SITE:-/etc/nginx/sites-enabled/default}" 2>/dev/null || true
       fi
       ensure_ntp
       install_xray_core

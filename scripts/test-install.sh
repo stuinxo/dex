@@ -246,6 +246,8 @@ EOF
 chmod +x "$STUB_BIN_A"/*
 
 if PATH="$STUB_BIN_A:/usr/bin:/bin" \
+   DEX_OS_INIT="openrc" \
+   DEX_NGINX_DEFAULT_SITE="$E2E_ALPINE/nginx-default" \
    DEX_STATE_DIR="$STATE_A" \
    DEX_INSTALL_BIN="$DST_BIN_A/dex" \
    DEX_XRAY_BIN="$DST_BIN_A/xray" \
@@ -418,17 +420,21 @@ printf 'stub-geo\n' > "$STATE_A/rules/geoip.dat"
 printf 'stub-geo\n' > "$STATE_A/rules/geosite.dat"
 : > "$E2E_ALPINE/apk.log"
 if PATH="$STUB_BIN_A:/usr/bin:/bin" \
+   DEX_OS_INIT="openrc" \
    DEX_STATE_DIR="$STATE_A" \
    DEX_INSTALL_BIN="$DST_BIN_A/dex" \
    DEX_XRAY_BIN="$DST_BIN_A/xray" \
    DEX_BIN="$E2E_ALPINE/dex.elf" \
+   XRAY_ZIP="$E2E_ALPINE/Xray-linux-64.zip" \
    sh "$INSTALL_SCRIPT" -r >"$E2E_ALPINE/relay.log" 2>&1 \
    && grep -q 'apk add --no-cache haproxy' "$E2E_ALPINE/apk.log" \
    && PATH="$STUB_BIN_A:/usr/bin:/bin" \
+      DEX_OS_INIT="openrc" \
       DEX_STATE_DIR="$STATE_A" \
       DEX_INSTALL_BIN="$DST_BIN_A/dex" \
       DEX_XRAY_BIN="$DST_BIN_A/xray" \
       DEX_BIN="$E2E_ALPINE/dex.elf" \
+      XRAY_ZIP="$E2E_ALPINE/Xray-linux-64.zip" \
       sh "$INSTALL_SCRIPT" -l >"$E2E_ALPINE/landing.log" 2>&1 \
    && grep -q "dex -l" "$E2E_ALPINE/landing.log"; then
   pass "Install script supports -r and -l shorthand role flags"
