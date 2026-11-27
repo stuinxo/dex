@@ -713,7 +713,7 @@ func TestRenderNFTablesWireGuardSubnetAndBypass(t *testing.T) {
 		ServerPublicKey:  "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
 	}
 
-	data, clientNeeded, _, err := RenderNFTables(s, RenderOptions{PhysicalNICs: []string{"eth0"}})
+	data, clientNeeded, _, _, err := RenderNFTables(s, RenderOptions{PhysicalNICs: []string{"eth0"}})
 	if err != nil {
 		t.Fatalf("RenderNFTables: %v", err)
 	}
@@ -757,7 +757,7 @@ func TestRenderNFTablesWireGuardSubnetAndBypass(t *testing.T) {
 
 	// Fallback when SubnetCIDR is invalid/empty
 	s.Client.WireGuard.SubnetCIDR = "not-a-cidr"
-	fallbackData, _, _, err := RenderNFTables(s, RenderOptions{PhysicalNICs: []string{"eth0"}})
+	fallbackData, _, _, _, err := RenderNFTables(s, RenderOptions{PhysicalNICs: []string{"eth0"}})
 	if err != nil {
 		t.Fatalf("RenderNFTables fallback: %v", err)
 	}
@@ -1346,7 +1346,7 @@ func TestV004SysctlMemoryTiersFlowtableNginxPoolHAProxyXrayPolicyAndUnits(t *tes
 
 	// 2. Flowtable active on client without WireGuard AND on relay with nft forward
 	c.Client.WireGuard.Enabled = false
-	nftClient, cNeed, _, err := RenderNFTables(c, RenderOptions{PhysicalNICs: []string{"eth0", "eth1"}})
+	nftClient, cNeed, _, _, err := RenderNFTables(c, RenderOptions{PhysicalNICs: []string{"eth0", "eth1"}})
 	if err != nil || !cNeed {
 		t.Fatalf("RenderNFTables client no-WG failed: err=%v cNeed=%v", err, cNeed)
 	}
@@ -1614,7 +1614,7 @@ func TestIPv6InboundAndDualStackRendering(t *testing.T) {
 		}
 	}
 
-	nftDual, _, rNeed, err := RenderNFTables(rel, roptsDual)
+	nftDual, _, rNeed, _, err := RenderNFTables(rel, roptsDual)
 	if err != nil || !rNeed {
 		t.Fatalf("RenderNFTables dual-stack relay: err=%v rNeed=%v", err, rNeed)
 	}
@@ -1623,9 +1623,209 @@ func TestIPv6InboundAndDualStackRendering(t *testing.T) {
 		"meta nfproto ipv6 tcp dport 10002 dnat ip6 to [2001:db8::7]:8443",
 		"ip daddr 198.51.100.7 udp dport 8443 masquerade",
 		"ip6 daddr 2001:db8::7 udp dport 8443 masquerade",
+		"tcp flags & (syn|rst) == syn tcp option maxseg size set rt mtu",
 	} {
 		if !strings.Contains(string(nftDual), want) {
 			t.Errorf("dual-stack nft relay missing %q:\n%s", want, string(nftDual))
 		}
+	}
+}
+
+func TestVPSHardeningChainedExitsAndRoleSysctl(t *testing.T) {
+	// 1. Server with encrypted chained upstream exit + anti-abuse + Nginx default_server ssl_reject_handshake + HostFirewall (Tailscale + CF origin lock)
+	srv := state.NewDefaultState(state.RoleServer)
+	srv.System.EnableIPv6 = true
+	srv.System.Firewall = state.HostFirewallConfig{
+		Enabled:              true,
+		MgmtInterfaces:       []string{"tailscale0"},
+		MgmtSources:          []string{"100.64.0.0/10"},
+		CloudflareOriginLock: true,
+	}
+	srv.Server.Domain = "transit.example.com"
+	srv.Server.ListenPort = 443
+	srv.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	srv.Server.UpstreamOutbounds = []state.UpstreamExitProfile{
+		{
+			Name:           "default",
+			Enabled:        true,
+			Protocol:       "vless-reality",
+			Address:        "verizon-home.example.net",
+			Port:           443,
+			UUID:           "22222222-2222-4222-8222-222222222222",
+			TLSSNI:         "www.apple.com",
+			RealityPubKey:  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			RealityShortID: "abcd1234",
+		},
+		{
+			Name:     "ai",
+			Enabled:  true,
+			Protocol: "vless-xhttp",
+			Address:  "us-res.example.net",
+			Port:     443,
+			UUID:     "33333333-3333-4333-8333-333333333333",
+			Domains:  []string{"geosite:openai"},
+		},
+	}
+
+	bundle, err := RenderAll(srv, RenderOptions{MemMB: 1024})
+	if err != nil {
+		t.Fatalf("RenderAll hardened server: %v", err)
+	}
+	if !bundle.NFTHostFWNeeded {
+		t.Fatalf("expected NFTHostFWNeeded=true")
+	}
+
+	// Verify Xray chained exit + anti-abuse rules
+	xf, ok := findFile(bundle, "xray.json")
+	if !ok {
+		t.Fatalf("missing xray.json")
+	}
+	var xcfg map[string]any
+	if err := json.Unmarshal(xf.Content, &xcfg); err != nil {
+		t.Fatalf("unmarshal xray.json: %v", err)
+	}
+	outbounds := xcfg["outbounds"].([]any)
+	firstOb := outbounds[0].(map[string]any)
+	if firstOb["tag"] != "upstream-exit" || firstOb["protocol"] != "vless" {
+		t.Fatalf("expected global default upstream-exit (vless-reality) at outbounds[0], got %+v", firstOb)
+	}
+	xfStr := string(xf.Content)
+	for _, want := range []string{`"anti-abuse-bt"`, `"bittorrent"`, `"anti-abuse-smtp"`, `"upstream-domain-ai"`, `"upstream-exit-ai"`} {
+		if !strings.Contains(xfStr, want) {
+			t.Errorf("xray.json missing %s", want)
+		}
+	}
+
+	// Verify anti-abuse opt-out
+	srvNoAbuse := state.NewDefaultState(state.RoleLanding)
+	srvNoAbuse.Server.Domain = "land.example.com"
+	srvNoAbuse.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	srvNoAbuse.Server.DisableAntiAbuse = true
+	xrayNoAbuse, _, err := RenderXray(srvNoAbuse, RenderOptions{})
+	if err != nil {
+		t.Fatalf("RenderXray DisableAntiAbuse: %v", err)
+	}
+	if strings.Contains(string(xrayNoAbuse), "anti-abuse-bt") {
+		t.Errorf("expected anti-abuse rules omitted when DisableAntiAbuse=true")
+	}
+
+	// Verify Nginx default_server anti-probe blocks
+	ngf, ok := findFile(bundle, "nginx-dex.conf")
+	if !ok {
+		t.Fatalf("missing nginx-dex.conf")
+	}
+	ngStr := string(ngf.Content)
+	for _, want := range []string{
+		"listen 80 default_server;",
+		"return 444;",
+		"listen 443 ssl default_server;",
+		"listen [::]:443 ssl default_server;",
+		"ssl_reject_handshake on;",
+	} {
+		if !strings.Contains(ngStr, want) {
+			t.Errorf("nginx-dex.conf missing %q:\n%s", want, ngStr)
+		}
+	}
+
+	// Verify dex_host_fw nftables table (Tailscale mgmt, no public SSH, CF origin lock on 80/443)
+	nf, ok := findFile(bundle, "nftables.conf")
+	if !ok {
+		t.Fatalf("missing nftables.conf")
+	}
+	nftStr := string(nf.Content)
+	for _, want := range []string{
+		"table inet dex_host_fw {",
+		"policy drop;",
+		`iifname "tailscale0" accept`,
+		"ip saddr { 100.64.0.0/10 } accept",
+		"set cf_v4 {",
+		"set cf_v6 {",
+		"ip saddr @cf_v4 tcp dport { 80, 443 } accept",
+		"ip6 saddr @cf_v6 tcp dport { 80, 443 } accept",
+	} {
+		if !strings.Contains(nftStr, want) {
+			t.Errorf("nftables.conf missing %q:\n%s", want, nftStr)
+		}
+	}
+	if strings.Contains(nftStr, "tcp dport 22 accept") {
+		t.Errorf("expected public SSH closed when allow_public_ssh=false:\n%s", nftStr)
+	}
+
+	// Verify systemd dex-nft.service cleans up dex_host_fw
+	nftUnit, ok := findFile(bundle, "systemd/dex-nft.service")
+	if !ok || !strings.Contains(string(nftUnit.Content), "dex_host_fw") {
+		t.Fatalf("expected systemd/dex-nft.service with dex_host_fw cleanup")
+	}
+
+	// Verify role-aware sysctl: VPS uses fq (no cake), Client uses fq + cake
+	sfSrv, ok := RenderSysctl(srv, RenderOptions{MemMB: 1024})
+	if !ok {
+		t.Fatalf("expected RenderSysctl for server")
+	}
+	if !strings.Contains(string(sfSrv.Content), "net.core.default_qdisc = fq\n") || strings.Contains(string(sfSrv.Content), "net.core.default_qdisc = cake") {
+		t.Errorf("expected server sysctl to use fq without cake:\n%s", string(sfSrv.Content))
+	}
+	modSrv, _ := RenderModulesLoad(srv, RenderOptions{})
+	if strings.Contains(string(modSrv.Content), "sch_cake") {
+		t.Errorf("expected server modules-load to omit sch_cake:\n%s", string(modSrv.Content))
+	}
+}
+
+func TestBuildDoHURLAndRoleGating(t *testing.T) {
+	// 1. Server role (nginx + EnableDoH) -> https://domain/dq
+	srv := state.NewDefaultState(state.RoleServer)
+	srv.Server.Domain = "srv.example.com"
+	srv.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	if got := BuildDoHURL(srv, "host1"); got != "https://srv.example.com/dq" {
+		t.Fatalf("server BuildDoHURL = %q, want https://srv.example.com/dq", got)
+	}
+	srv.Server.PublicPort = 8443
+	if got := BuildDoHURL(srv, "host1"); got != "https://srv.example.com:8443/dq" {
+		t.Fatalf("server custom port BuildDoHURL = %q", got)
+	}
+
+	// 2. Client role -> uses Cert.Domain / DDNS.Domain / LAN IP + DoHServerPath, and does NOT spawn standalone dex-doh unit
+	cli := state.NewDefaultState(state.RoleClient)
+	cli.Client.DNS.DoHServerPath = "/dq-abc123"
+	cli.Client.DDNS.Domain = "home.example.com"
+	if got := BuildDoHURL(cli, "gw"); got != "https://home.example.com/dq-abc123" {
+		t.Fatalf("client DDNS BuildDoHURL = %q, want https://home.example.com/dq-abc123", got)
+	}
+	cli.Auth.ListenAddr = "[2001:db8::1]:9443"
+	cli.Client.DDNS.Domain = ""
+	if got := BuildDoHURL(cli, "gw"); got != "https://[2001:db8::1]:9443/dq-abc123" {
+		t.Fatalf("client IPv6 custom port BuildDoHURL = %q", got)
+	}
+	cliBundle, err := RenderAll(cli, RenderOptions{})
+	if err != nil {
+		t.Fatalf("RenderAll client: %v", err)
+	}
+	if cliBundle.DoHNeeded {
+		t.Fatalf("expected client DoH to run in-process via dex-daemon (DoHNeeded=false)")
+	}
+	cli.Client.DNS.EnableDoHServer = false
+	if got := BuildDoHURL(cli, "gw"); got != "" {
+		t.Fatalf("expected disabled client BuildDoHURL empty, got %q", got)
+	}
+
+	// 3. Landing and Relay roles never expose DoH URL or DoHNeeded
+	land := state.NewDefaultState(state.RoleLanding)
+	land.Server.Domain = "land.example.com"
+	land.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	if got := BuildDoHURL(land, "land"); got != "" {
+		t.Fatalf("expected landing BuildDoHURL empty, got %q", got)
+	}
+	landBundle, err := RenderAll(land, RenderOptions{})
+	if err != nil || landBundle.DoHNeeded {
+		t.Fatalf("expected landing DoHNeeded=false, err=%v", err)
+	}
+
+	rel := state.NewDefaultState(state.RoleRelay)
+	if got := BuildDoHURL(rel, "relay"); got != "" {
+		t.Fatalf("expected relay BuildDoHURL empty, got %q", got)
+	}
+	relBundle, err := RenderAll(rel, RenderOptions{})
+	if err != nil || relBundle.DoHNeeded {
+		t.Fatalf("expected relay DoHNeeded=false, err=%v", err)
 	}
 }

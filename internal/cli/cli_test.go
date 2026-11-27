@@ -16,6 +16,7 @@ import (
 
 	"github.com/stuinxo/dex/internal/cert"
 	"github.com/stuinxo/dex/internal/reconcile"
+	"github.com/stuinxo/dex/internal/render"
 	"github.com/stuinxo/dex/internal/state"
 )
 
@@ -594,5 +595,138 @@ func TestHardeningCLIInitForceDLModeNodeDelMenuPortRelayAndServices(t *testing.T
 	v6St, err := state.NewStore(v6Dir).Load()
 	if err != nil || !v6St.System.EnableIPv6 {
 		t.Fatalf("expected System.EnableIPv6=true after init --ipv6, err=%v st=%+v", err, v6St)
+	}
+
+	// 9. Role-based DoH CLI: client dns show/set works; landing/relay reject --enable-doh=true
+	if code := RunWithExecutor([]string{"--state-dir", v6Dir, "server", "set", "--enable-doh=true"}, &fakeOpsExec{}, strings.NewReader(""), &v6Out, &v6Err); code == 0 {
+		t.Fatalf("expected landing role to reject server set --enable-doh=true")
+	}
+
+	cliDoHDir := filepath.Join(dir, "cli-doh")
+	var cdOut, cdErr bytes.Buffer
+	if code := RunWithExecutor([]string{"--state-dir", cliDoHDir, "init", "--role", "client"}, &fakeOpsExec{}, strings.NewReader(""), &cdOut, &cdErr); code != 0 {
+		t.Fatalf("client init failed: code=%d err=%q", code, cdErr.String())
+	}
+	cdOut.Reset()
+	if code := RunWithExecutor([]string{"--state-dir", cliDoHDir, "dns", "show"}, &fakeOpsExec{}, strings.NewReader(""), &cdOut, &cdErr); code != 0 || !strings.Contains(cdOut.String(), "EnableDoHServer:  true") {
+		t.Fatalf("expected dns show EnableDoHServer=true, code=%d out=%q err=%q", code, cdOut.String(), cdErr.String())
+	}
+	if code := RunWithExecutor([]string{"--state-dir", cliDoHDir, "dns", "set", "--doh-path", "/dq-myhome"}, &fakeOpsExec{}, strings.NewReader(""), &cdOut, &cdErr); code != 0 {
+		t.Fatalf("dns set --doh-path failed: code=%d err=%q", code, cdErr.String())
+	}
+	cliDoHSt, _ := state.NewStore(cliDoHDir).Load()
+	if cliDoHSt.Client.DNS.DoHServerPath != "/dq-myhome" {
+		t.Fatalf("expected DoHServerPath=/dq-myhome, got %q", cliDoHSt.Client.DNS.DoHServerPath)
+	}
+	if code := RunWithExecutor([]string{"--state-dir", cliDoHDir, "dns", "set", "--regen-doh-path"}, &fakeOpsExec{}, strings.NewReader(""), &cdOut, &cdErr); code != 0 {
+		t.Fatalf("dns set --regen-doh-path failed: code=%d err=%q", code, cdErr.String())
+	}
+	cliDoHSt2, _ := state.NewStore(cliDoHDir).Load()
+	if cliDoHSt2.Client.DNS.DoHServerPath == "/dq-myhome" || !strings.HasPrefix(cliDoHSt2.Client.DNS.DoHServerPath, "/dq-") {
+		t.Fatalf("expected regenerated /dq-xxxxxx path, got %q", cliDoHSt2.Client.DNS.DoHServerPath)
+	}
+
+	// 10. Client DoH shorthand normalization in init/dns set and menuInitWizard mandatory DoH prompt
+	if code := RunWithExecutor([]string{"--state-dir", cliDoHDir, "dns", "set", "--doh", "lax.example.com:2096, https://dec.example.com:2087/dq"}, &fakeOpsExec{}, strings.NewReader(""), &cdOut, &cdErr); code != 0 {
+		t.Fatalf("dns set --doh failed: code=%d err=%q", code, cdErr.String())
+	}
+	cliDoHSt3, _ := state.NewStore(cliDoHDir).Load()
+	wantDoH := []string{"https://lax.example.com:2096/dq", "https://dec.example.com:2087/dq"}
+	if !reflect.DeepEqual(cliDoHSt3.Client.DNS.DoHServers, wantDoH) {
+		t.Fatalf("expected normalized DoHServers=%v, got %v", wantDoH, cliDoHSt3.Client.DNS.DoHServers)
+	}
+
+	wizStore := state.NewStore(filepath.Join(dir, "wiz-client-doh"))
+	var wOut, wErr bytes.Buffer
+	sampleSrvURI := "vless://11111111-1111-4111-8111-111111111111@lax.example.com:2096?encryption=none&security=tls&sni=lax.example.com&type=xhttp&path=%2Fabc12345&mode=packet-up#LAX"
+	// Menu: 1 (init wizard) -> 1 (Client) -> "" (empty node rejected) -> sampleSrvURI (auto-extracts https://lax.example.com:2096/dq without second prompt!) -> q (exit)
+	if code := runInteractiveMenu(wizStore, &fakeOpsExec{}, strings.NewReader("1\n1\n\n"+sampleSrvURI+"\nq\n"), &wOut, &wErr); code != 0 {
+		t.Fatalf("wizard menu failed: code=%d err=%q", code, wErr.String())
+	}
+	wizSt, err := wizStore.Load()
+	if err != nil || wizSt.Client.ActiveNode() == nil || wizSt.Client.ActiveNode().Address != "lax.example.com" || !reflect.DeepEqual(wizSt.Client.DNS.DoHServers, []string{"https://lax.example.com:2096/dq"}) {
+		t.Fatalf("expected wizard client node+DoHServers=[https://lax.example.com:2096/dq], err=%v got=%+v out=%q", err, wizSt, wOut.String())
+	}
+
+	// 11. Role shorthand flags (-c, -s, -r, -l) + Server->Client bootstrap handoff
+	scDirS := filepath.Join(dir, "short-s")
+	var sInitOut bytes.Buffer
+	if code := RunWithExecutor([]string{"--state-dir", scDirS, "-s", "srv.example.com", "--port", "2096"}, &fakeOpsExec{}, strings.NewReader(""), &sInitOut, &wErr); code != 0 {
+		t.Fatalf("dex -s shorthand failed: code=%d err=%q", code, wErr.String())
+	}
+	stS, err := state.NewStore(scDirS).Load()
+	if err != nil || stS.Role != state.RoleServer || stS.Server.Domain != "srv.example.com" || stS.Server.ListenPort != 2096 {
+		t.Fatalf("unexpected dex -s state: err=%v st=%+v", err, stS)
+	}
+	sOutStr := sInitOut.String()
+	if !strings.Contains(sOutStr, "Main Node URI:") || !strings.Contains(sOutStr, "https://srv.example.com:2096/dq") || !strings.Contains(sOutStr, "Client Install:") || !strings.Contains(sOutStr, "Client Init:    dex -c 'vless://") || strings.Contains(sOutStr, "--apply\n") {
+		t.Fatalf("expected server init output to include Node URI, DoH URL, and omit --apply in Client Init command, got:\n%s", sOutStr)
+	}
+	if !shouldAutoApplyInit(reconcile.OSExecutor{}, true, false, false, false) {
+		t.Fatalf("expected top-level -c/-s/-r/-l to auto-apply on OSExecutor by default")
+	}
+	if shouldAutoApplyInit(reconcile.OSExecutor{}, true, false, false, true) || shouldAutoApplyInit(reconcile.OSExecutor{}, true, true, false, false) {
+		t.Fatalf("expected --no-apply or --apply=false to skip auto-apply")
+	}
+	if shouldAutoApplyInit(reconcile.OSExecutor{}, false, false, false, false) {
+		t.Fatalf("expected explicit 'dex init' without --apply to stay opt-in")
+	}
+
+	// Feed Server's generated Main Node URI directly into 'dex -c' (auto-deriving DoH) and with explicit --doh
+	srvMainURI := render.BuildServerMainURI(stS)
+	scDirC := filepath.Join(dir, "short-c")
+	if code := RunWithExecutor([]string{"--state-dir", scDirC, "-c", "--node", srvMainURI, "--doh", "https://srv.example.com:2096/dq"}, &fakeOpsExec{}, strings.NewReader(""), &wOut, &wErr); code != 0 {
+		t.Fatalf("dex -c --node --doh failed: code=%d err=%q", code, wErr.String())
+	}
+	if stC, err := state.NewStore(scDirC).Load(); err != nil || stC.Role != state.RoleClient || stC.Client.ActiveNode() == nil || stC.Client.ActiveNode().UUID != stS.Server.UUIDs[0] || !reflect.DeepEqual(stC.Client.DNS.DoHServers, []string{"https://srv.example.com:2096/dq"}) {
+		t.Fatalf("unexpected dex -c state: err=%v st=%+v", err, stC)
+	}
+
+	scDirCAuto := filepath.Join(dir, "short-c-auto-doh")
+	if code := RunWithExecutor([]string{"--state-dir", scDirCAuto, "-c", srvMainURI}, &fakeOpsExec{}, strings.NewReader(""), &wOut, &wErr); code != 0 {
+		t.Fatalf("dex -c positional URI failed: code=%d err=%q", code, wErr.String())
+	}
+	if stCA, err := state.NewStore(scDirCAuto).Load(); err != nil || stCA.Client.ActiveNode() == nil || !reflect.DeepEqual(stCA.Client.DNS.DoHServers, []string{"https://srv.example.com:2096/dq"}) {
+		t.Fatalf("expected auto-derived DoH from Server URI, err=%v st=%+v", err, stCA)
+	}
+
+	scDirL := filepath.Join(dir, "short-l")
+	if code := RunWithExecutor([]string{"--state-dir", scDirL, "init", "-l", "--domain", "land.example.com"}, &fakeOpsExec{}, strings.NewReader(""), &wOut, &wErr); code != 0 {
+		t.Fatalf("dex init -l shorthand failed: code=%d err=%q", code, wErr.String())
+	}
+	if stL, err := state.NewStore(scDirL).Load(); err != nil || stL.Role != state.RoleLanding || stL.Server.Domain != "land.example.com" {
+		t.Fatalf("unexpected dex init -l state: err=%v st=%+v", err, stL)
+	}
+
+	scDirR := filepath.Join(dir, "short-r")
+	if code := RunWithExecutor([]string{"--state-dir", scDirR, "-r"}, &fakeOpsExec{}, strings.NewReader("n\n"), &wOut, &wErr); code != 0 {
+		t.Fatalf("dex -r interactive wizard failed: code=%d err=%q", code, wErr.String())
+	}
+	if stR, err := state.NewStore(scDirR).Load(); err != nil || stR.Role != state.RoleRelay {
+		t.Fatalf("unexpected dex -r state: err=%v st=%+v", err, stR)
+	}
+
+	scDirWizC := filepath.Join(dir, "short-wiz-c")
+	hkURI := "vless://22222222-2222-4222-8222-222222222222@hk.example.com:443?encryption=none&security=tls&sni=hk.example.com&type=xhttp&path=%2Fhk123456#HK"
+	if code := RunWithExecutor([]string{"--state-dir", scDirWizC, "-c"}, &fakeOpsExec{}, strings.NewReader(hkURI+"\n"), &wOut, &wErr); code != 0 {
+		t.Fatalf("dex -c interactive wizard failed: code=%d err=%q", code, wErr.String())
+	}
+	if stWC, err := state.NewStore(scDirWizC).Load(); err != nil || stWC.Client.ActiveNode() == nil || !reflect.DeepEqual(stWC.Client.DNS.DoHServers, []string{"https://hk.example.com/dq"}) {
+		t.Fatalf("unexpected dex -c wizard state: err=%v st=%+v", err, stWC)
+	}
+
+	// Reality URI in wizard has no TLS /dq -> prompts explicitly for self-hosted DoH
+	scDirWizR := filepath.Join(dir, "short-wiz-reality")
+	realURI := "vless://33333333-3333-4333-8333-333333333333@203.0.113.9:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=abcd1234&sid=0102&type=tcp#REAL"
+	if code := RunWithExecutor([]string{"--state-dir", scDirWizR, "-c"}, &fakeOpsExec{}, strings.NewReader(realURI+"\nsrv.example.com:2096\n"), &wOut, &wErr); code != 0 {
+		t.Fatalf("dex -c reality wizard failed: code=%d err=%q", code, wErr.String())
+	}
+	if stWR, err := state.NewStore(scDirWizR).Load(); err != nil || !reflect.DeepEqual(stWR.Client.DNS.DoHServers, []string{"https://srv.example.com:2096/dq"}) {
+		t.Fatalf("unexpected dex -c reality wizard state: err=%v st=%+v", err, stWR)
+	}
+
+	var conflictErr bytes.Buffer
+	if code := RunWithExecutor([]string{"--state-dir", filepath.Join(dir, "conflict"), "init", "-s", "-c"}, &fakeOpsExec{}, strings.NewReader(""), &wOut, &conflictErr); code == 0 {
+		t.Fatalf("expected conflicting role flags to fail")
 	}
 }

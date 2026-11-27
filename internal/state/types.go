@@ -1,6 +1,8 @@
 package state
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 )
@@ -29,15 +31,46 @@ type State struct {
 }
 
 type SystemConfig struct {
-	Hostname        string `json:"hostname,omitempty"`
-	LANInterface    string `json:"lan_interface,omitempty"`
-	LANAddrCIDR     string `json:"lan_addr_cidr,omitempty"`
-	GatewayIP       string `json:"gateway_ip,omitempty"`
-	EnableIPv6      bool   `json:"enable_ipv6"`
-	EnableFlowtable bool   `json:"enable_flowtable"`
-	AutoTuneSysctl  bool   `json:"auto_tune_sysctl"`
-	AutoUpdateRules bool   `json:"auto_update_rules"`
-	AutoUpdateCore  bool   `json:"auto_update_core"`
+	Hostname        string             `json:"hostname,omitempty"`
+	LANInterface    string             `json:"lan_interface,omitempty"`
+	LANAddrCIDR     string             `json:"lan_addr_cidr,omitempty"`
+	GatewayIP       string             `json:"gateway_ip,omitempty"`
+	EnableIPv6      bool               `json:"enable_ipv6"`
+	EnableFlowtable bool               `json:"enable_flowtable"`
+	AutoTuneSysctl  bool               `json:"auto_tune_sysctl"`
+	AutoUpdateRules bool               `json:"auto_update_rules"`
+	AutoUpdateCore  bool               `json:"auto_update_core"`
+	Firewall        HostFirewallConfig `json:"firewall,omitempty"`
+	Notify          NotifyConfig       `json:"notify,omitempty"`
+}
+
+// NotifyConfig configures lightweight alert notifications (Webhook / Telegram).
+type NotifyConfig struct {
+	Enabled          bool   `json:"enabled"`
+	WebhookURL       string `json:"webhook_url,omitempty"`
+	TelegramBotToken string `json:"telegram_bot_token,omitempty"`
+	TelegramChatID   string `json:"telegram_chat_id,omitempty"`
+	NotifyFailover   bool   `json:"notify_failover"`
+	NotifyDDNS       bool   `json:"notify_ddns"`
+}
+
+// HostFirewallConfig controls optional declarative host-level nftables hardening (dex_host_fw)
+// for VPS roles (server / landing / relay), enabling management/data-plane separation.
+type HostFirewallConfig struct {
+	Enabled              bool     `json:"enabled"`
+	SSHPort              int      `json:"ssh_port,omitempty"`
+	MgmtInterfaces       []string `json:"mgmt_interfaces,omitempty"`
+	MgmtSources          []string `json:"mgmt_sources,omitempty"`
+	AllowPublicSSH       bool     `json:"allow_public_ssh,omitempty"`
+	CloudflareOriginLock bool     `json:"cloudflare_origin_lock,omitempty"`
+}
+
+// EffectiveSSHPort returns the configured SSH port, defaulting to 22.
+func (f HostFirewallConfig) EffectiveSSHPort() int {
+	if f.SSHPort > 0 {
+		return f.SSHPort
+	}
+	return 22
 }
 
 type AuthConfig struct {
@@ -117,6 +150,29 @@ type DNSConfig struct {
 	WhitelistIPs     []string          `json:"whitelist_ips,omitempty"`
 	BlockAds         bool              `json:"block_ads"`
 	BlockExternal53  bool              `json:"block_external_53"`
+	EnableDoHServer  bool              `json:"enable_doh_server"`
+	DoHServerPath    string            `json:"doh_server_path,omitempty"`
+}
+
+// GenerateDefaultClientDoHPath returns a random path like "/dq-8f3a2c" to avoid public scanner abuse.
+func GenerateDefaultClientDoHPath() string {
+	var b [3]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "/dq"
+	}
+	return "/dq-" + hex.EncodeToString(b[:])
+}
+
+// EffectiveDoHPath returns the normalized HTTP path for the client DoH endpoint, defaulting to "/dq".
+func (d DNSConfig) EffectiveDoHPath() string {
+	p := strings.TrimSpace(d.DoHServerPath)
+	if p == "" {
+		return "/dq"
+	}
+	if !strings.HasPrefix(p, "/") {
+		return "/" + p
+	}
+	return p
 }
 
 type FWD0Config struct {
@@ -198,17 +254,61 @@ type DDNSConfig struct {
 }
 
 type ServerConfig struct {
-	Protocol        string          `json:"protocol,omitempty"` // vless-xhttp (default) | vmess-ws | vless-ws
-	TLSMode         string          `json:"tls_mode"`           // direct | nginx
-	Domain          string          `json:"domain,omitempty"`
-	ConnectHost     string          `json:"connect_host,omitempty"`
-	ListenPort      int             `json:"listen_port"`
-	PublicPort      int             `json:"public_port,omitempty"`
-	Path            string          `json:"path,omitempty"`
-	UUIDs           []string        `json:"uuids,omitempty"`
-	EnableDoH       bool            `json:"enable_doh"`
-	CamouflageDir   string          `json:"camouflage_dir,omitempty"`
-	Socks5Outbounds []Socks5Profile `json:"socks5_outbounds,omitempty"`
+	Protocol          string                `json:"protocol,omitempty"` // vless-xhttp (default) | vmess-ws | vless-ws
+	TLSMode           string                `json:"tls_mode"`           // direct | nginx
+	Domain            string                `json:"domain,omitempty"`
+	ConnectHost       string                `json:"connect_host,omitempty"`
+	ListenPort        int                   `json:"listen_port"`
+	PublicPort        int                   `json:"public_port,omitempty"`
+	Path              string                `json:"path,omitempty"`
+	UUIDs             []string              `json:"uuids,omitempty"`
+	EnableDoH         bool                  `json:"enable_doh"`
+	DisableAntiAbuse  bool                  `json:"disable_anti_abuse,omitempty"`
+	CamouflageDir     string                `json:"camouflage_dir,omitempty"`
+	Socks5Outbounds   []Socks5Profile       `json:"socks5_outbounds,omitempty"`
+	UpstreamOutbounds []UpstreamExitProfile `json:"upstream_outbounds,omitempty"`
+}
+
+// EffectiveAntiAbuse reports whether server/landing anti-abuse blocking (BitTorrent, SMTP 25) is enabled.
+func (s ServerConfig) EffectiveAntiAbuse() bool {
+	return !s.DisableAntiAbuse
+}
+
+// UpstreamExitProfile defines a chained outbound exit (e.g. transit VPS -> residential landing VPS)
+// supporting encrypted protocols (vless-reality, vless-xhttp, vless-ws, vmess-ws, vmess-tcp) or socks5.
+type UpstreamExitProfile struct {
+	Name           string   `json:"name"`
+	Enabled        bool     `json:"enabled"`
+	Protocol       string   `json:"protocol"` // vless-xhttp | vless-reality | vless-ws | vmess-ws | vmess-tcp | socks5
+	Address        string   `json:"address"`
+	Port           int      `json:"port"`
+	UUID           string   `json:"uuid,omitempty"`
+	TLSSNI         string   `json:"tls_sni,omitempty"`
+	Path           string   `json:"path,omitempty"`
+	RealityPubKey  string   `json:"reality_pubkey,omitempty"`
+	RealityShortID string   `json:"reality_shortid,omitempty"`
+	Username       string   `json:"username,omitempty"`
+	Password       string   `json:"password,omitempty"`
+	Domains        []string `json:"domains,omitempty"`
+	IPs            []string `json:"ips,omitempty"`
+}
+
+// ToOutboundNode converts an UpstreamExitProfile into an OutboundNode for Xray outbound rendering.
+func (u UpstreamExitProfile) ToOutboundNode() OutboundNode {
+	return OutboundNode{
+		ID:             u.Name,
+		Name:           u.Name,
+		Protocol:       u.Protocol,
+		Address:        u.Address,
+		Port:           u.Port,
+		UUID:           u.UUID,
+		TLSSNI:         u.TLSSNI,
+		Path:           u.Path,
+		RealityPubKey:  u.RealityPubKey,
+		RealityShortID: u.RealityShortID,
+		Username:       u.Username,
+		Password:       u.Password,
+	}
 }
 
 // EffectiveProtocol returns the server main inbound protocol, defaulting to vless-xhttp.
@@ -286,19 +386,23 @@ func NewDefaultState(role string) *State {
 	if role == "" {
 		role = RoleClient
 	}
-	listen := ":8443"
+	listen := "127.0.0.1:8443"
 	switch role {
 	case RoleClient:
 		listen = ":443"
-	case RoleServer:
+	case RoleServer, RoleLanding, RoleRelay:
 		listen = "127.0.0.1:8443"
 	}
 	tlsMode := "nginx"
-	enableDoH := true
+	enableServerDoH := role == RoleServer
+	enableClientDoH := role == RoleClient
+	clientDoHPath := ""
+	if enableClientDoH {
+		clientDoHPath = GenerateDefaultClientDoHPath()
+	}
 	listenPort := 443
 	if role == RoleLanding {
 		tlsMode = "direct"
-		enableDoH = false
 	}
 	return &State{
 		Version: CurrentSchemaVersion,
@@ -320,9 +424,11 @@ func NewDefaultState(role string) *State {
 				ServiceMap: make(map[string]string),
 			},
 			DNS: DNSConfig{
-				ChinaServers: append([]string(nil), DefaultChinaDNS...),
-				DoHServers:   append([]string(nil), DefaultDoHServers...),
-				Hosts:        make(map[string]string),
+				ChinaServers:    append([]string(nil), DefaultChinaDNS...),
+				DoHServers:      append([]string(nil), DefaultDoHServers...),
+				Hosts:           make(map[string]string),
+				EnableDoHServer: enableClientDoH,
+				DoHServerPath:   clientDoHPath,
 			},
 			WireGuard: WireGuardConfig{
 				ListenPort: 51820,
@@ -335,7 +441,7 @@ func NewDefaultState(role string) *State {
 		Server: ServerConfig{
 			TLSMode:    tlsMode,
 			ListenPort: listenPort,
-			EnableDoH:  enableDoH,
+			EnableDoH:  enableServerDoH,
 		},
 	}
 }

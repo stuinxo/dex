@@ -37,6 +37,35 @@ var baseReservedIPv6 = []string{
 	"ff00::/8",
 }
 
+// Official Cloudflare edge IPv4/IPv6 ranges (https://www.cloudflare.com/ips/)
+var cloudflareIPv4CIDRs = []string{
+	"173.245.48.0/20",
+	"103.21.244.0/22",
+	"103.22.200.0/22",
+	"103.31.4.0/22",
+	"141.101.64.0/18",
+	"108.162.192.0/18",
+	"190.93.240.0/20",
+	"188.114.96.0/20",
+	"197.234.240.0/22",
+	"198.41.128.0/17",
+	"162.158.0.0/15",
+	"104.16.0.0/13",
+	"104.24.0.0/14",
+	"172.64.0.0/13",
+	"131.0.72.0/22",
+}
+
+var cloudflareIPv6CIDRs = []string{
+	"2400:cb00::/32",
+	"2606:4700::/32",
+	"2803:f800::/32",
+	"2405:b500::/32",
+	"2405:8100::/32",
+	"2a06:98c0::/29",
+	"2c0f:f248::/32",
+}
+
 func splitIPsByFamily(entries []string) (v4 []string, v6 []string) {
 	seen4 := make(map[string]struct{})
 	seen6 := make(map[string]struct{})
@@ -109,9 +138,9 @@ func writeNFTSet(b *strings.Builder, name, nftType string, elems []string, inter
 	b.WriteString("    }\n")
 }
 
-// RenderNFTables generates dual-stack nftables rulesets for dex_client and dex_relay tables
+// RenderNFTables generates dual-stack nftables rulesets for dex_client, dex_relay, and dex_host_fw tables
 // without wiping unrelated system tables (`flush ruleset` is intentionally avoided).
-func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeeded bool, relayNeeded bool, err error) {
+func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeeded bool, relayNeeded bool, hostFWNeeded bool, err error) {
 	opts = opts.WithDefaults()
 	var b strings.Builder
 
@@ -396,7 +425,7 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 			}
 		}
 		if !targetV4.IsValid() && !targetV6.IsValid() {
-			return nil, clientNeeded, relayNeeded, fmt.Errorf("cannot resolve target %q for nft forward rule %q", fwd.TargetHost, fwd.ID)
+			return nil, clientNeeded, relayNeeded, hostFWNeeded, fmt.Errorf("cannot resolve target %q for nft forward rule %q", fwd.TargetHost, fwd.ID)
 		}
 
 		for _, proto := range strings.Split(fwd.Proto, ",") {
@@ -428,7 +457,7 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 		for _, r := range outRules {
 			b.WriteString(r + "\n")
 		}
-		b.WriteString("    }\n    chain forward {\n        type filter hook forward priority 0; policy accept;\n    }\n")
+		b.WriteString("    }\n    chain forward {\n        type filter hook forward priority 0; policy accept;\n        tcp flags & (syn|rst) == syn tcp option maxseg size set rt mtu\n    }\n")
 		b.WriteString("    chain postrouting {\n        type nat hook postrouting priority 100; policy accept;\n")
 		for _, r := range postRules {
 			b.WriteString(r + "\n")
@@ -436,8 +465,151 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 		b.WriteString("    }\n}\n")
 	}
 
-	if !clientNeeded && !relayNeeded {
-		return nil, false, false, nil
+	// Host firewall hardening (VPS roles: server / landing / relay) — management & data-plane isolation
+	if s.Role != state.RoleClient && s.System.Firewall.Enabled {
+		hostFWNeeded = true
+		fw := s.System.Firewall
+		b.WriteString("\ntable inet dex_host_fw {}\ndelete table inet dex_host_fw\ntable inet dex_host_fw {\n")
+		if fw.CloudflareOriginLock {
+			writeNFTSet(&b, "cf_v4", "ipv4_addr", cloudflareIPv4CIDRs, true)
+			writeNFTSet(&b, "cf_v6", "ipv6_addr", cloudflareIPv6CIDRs, true)
+		}
+		b.WriteString("    chain input {\n        type filter hook input priority 0; policy drop;\n")
+		b.WriteString("        iifname \"lo\" accept\n")
+		b.WriteString("        ct state established,related accept\n")
+		b.WriteString("        ct state invalid counter drop\n")
+		b.WriteString("        meta l4proto icmp icmp type { echo-request, destination-unreachable, time-exceeded, parameter-problem } accept\n")
+		b.WriteString("        meta l4proto ipv6-icmp icmpv6 type { echo-request, destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept\n")
+
+		// Management plane access (e.g. tailscale0 / wg0 or admin CIDR) — covers SSH and loopback/private Web UI
+		if len(fw.MgmtInterfaces) > 0 {
+			quoted := make([]string, 0, len(fw.MgmtInterfaces))
+			seenIf := make(map[string]struct{}, len(fw.MgmtInterfaces))
+			for _, rawIf := range fw.MgmtInterfaces {
+				iface := strings.TrimSpace(rawIf)
+				if iface == "" {
+					continue
+				}
+				if _, dup := seenIf[iface]; dup {
+					continue
+				}
+				seenIf[iface] = struct{}{}
+				quoted = append(quoted, fmt.Sprintf("%q", iface))
+			}
+			sort.Strings(quoted)
+			if len(quoted) == 1 {
+				fmt.Fprintf(&b, "        iifname %s accept\n", quoted[0])
+			} else if len(quoted) > 1 {
+				fmt.Fprintf(&b, "        iifname { %s } accept\n", strings.Join(quoted, ", "))
+			}
+		}
+		mgmtV4, mgmtV6 := splitIPsByFamily(fw.MgmtSources)
+		sort.Strings(mgmtV4)
+		sort.Strings(mgmtV6)
+		if len(mgmtV4) > 0 {
+			fmt.Fprintf(&b, "        ip saddr { %s } accept\n", strings.Join(mgmtV4, ", "))
+		}
+		if len(mgmtV6) > 0 {
+			fmt.Fprintf(&b, "        ip6 saddr { %s } accept\n", strings.Join(mgmtV6, ", "))
+		}
+
+		// Public SSH only if explicitly enabled; otherwise restricted to management plane above
+		if fw.AllowPublicSSH {
+			fmt.Fprintf(&b, "        tcp dport %d accept\n", fw.EffectiveSSHPort())
+		}
+
+		// Business service ports (data plane)
+		openTCP := make(map[int]struct{})
+		openUDP := make(map[int]struct{})
+		cfLockedTCP := make(map[int]struct{})
+		addPorts := func(proto string, port int) {
+			if port <= 0 {
+				return
+			}
+			for _, p := range strings.Split(proto, ",") {
+				switch strings.TrimSpace(p) {
+				case "tcp":
+					openTCP[port] = struct{}{}
+				case "udp":
+					openUDP[port] = struct{}{}
+				}
+			}
+		}
+
+		if s.Role == state.RoleServer || s.Role == state.RoleLanding {
+			mainPort := s.Server.ListenPort
+			if mainPort <= 0 {
+				mainPort = 443
+			}
+			if fw.CloudflareOriginLock {
+				cfLockedTCP[mainPort] = struct{}{}
+			} else {
+				openTCP[mainPort] = struct{}{}
+			}
+			if s.Role == state.RoleServer && s.Server.TLSMode == "nginx" && mainPort == 443 {
+				if fw.CloudflareOriginLock && s.Cert.Mode != "acme_http" {
+					cfLockedTCP[80] = struct{}{}
+				} else {
+					openTCP[80] = struct{}{}
+				}
+			}
+		}
+		for _, fwd := range s.Relay.Forwards {
+			addPorts(fwd.Proto, fwd.ListenPort)
+		}
+		if s.RproxyS.Enabled {
+			addPorts("tcp", s.RproxyS.ListenPort)
+			for _, m := range s.RproxyS.Mappings {
+				addPorts(m.Proto, m.Port)
+			}
+		}
+		for _, ex := range s.ExtraInbounds {
+			proto := "tcp"
+			if ex.Protocol == "dokodemo" {
+				proto = ex.Network
+				if strings.TrimSpace(proto) == "" {
+					proto = "tcp,udp"
+				}
+			}
+			addPorts(proto, ex.ListenPort)
+		}
+
+		emitSortedPorts := func(portMap map[int]struct{}, emit func(ports string)) {
+			if len(portMap) == 0 {
+				return
+			}
+			ports := make([]int, 0, len(portMap))
+			for p := range portMap {
+				ports = append(ports, p)
+			}
+			sort.Ints(ports)
+			strs := make([]string, len(ports))
+			for i, p := range ports {
+				strs[i] = fmt.Sprintf("%d", p)
+			}
+			if len(strs) == 1 {
+				emit(strs[0])
+			} else {
+				emit("{ " + strings.Join(strs, ", ") + " }")
+			}
+		}
+
+		emitSortedPorts(cfLockedTCP, func(ports string) {
+			fmt.Fprintf(&b, "        ip saddr @cf_v4 tcp dport %s accept\n", ports)
+			fmt.Fprintf(&b, "        ip6 saddr @cf_v6 tcp dport %s accept\n", ports)
+		})
+		emitSortedPorts(openTCP, func(ports string) {
+			fmt.Fprintf(&b, "        tcp dport %s accept\n", ports)
+		})
+		emitSortedPorts(openUDP, func(ports string) {
+			fmt.Fprintf(&b, "        udp dport %s accept\n", ports)
+		})
+
+		b.WriteString("    }\n}\n")
+	}
+
+	if !clientNeeded && !relayNeeded && !hostFWNeeded {
+		return nil, false, false, false, nil
 	}
 
 	var out strings.Builder
@@ -462,5 +634,5 @@ func RenderNFTables(s *state.State, opts RenderOptions) (data []byte, clientNeed
 	}
 
 	out.WriteString(b.String())
-	return []byte(out.String()), clientNeeded, relayNeeded, nil
+	return []byte(out.String()), clientNeeded, relayNeeded, hostFWNeeded, nil
 }

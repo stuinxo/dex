@@ -41,9 +41,13 @@ func RenderSysctl(s *state.State, opts RenderOptions) (RenderedFile, bool) {
 	b.WriteString("fs.inotify.max_user_instances = 8192\n")
 	b.WriteString("fs.inotify.max_user_watches = 65536\n")
 
-	// Queuing & congestion control (fq fallback line before cake ensures systemd-sysctl boot persistence on stripped kernels)
+	// Queuing & congestion control:
+	// - Client bypass gateway uses CAKE (with fq fallback) to combat LAN bufferbloat.
+	// - VPS roles (server/landing/relay) use fq, BBR's native pacing qdisc, for lower CPU overhead and higher high-BDP throughput.
 	b.WriteString("net.core.default_qdisc = fq\n")
-	b.WriteString("net.core.default_qdisc = cake\n")
+	if s.Role == state.RoleClient {
+		b.WriteString("net.core.default_qdisc = cake\n")
+	}
 	b.WriteString("net.ipv4.tcp_congestion_control = bbr\n")
 	b.WriteString("net.core.somaxconn = 65535\n")
 	b.WriteString("net.core.netdev_max_backlog = 65536\n")
@@ -121,10 +125,14 @@ func RenderModulesLoad(s *state.State, opts RenderOptions) (RenderedFile, bool) 
 	if !s.System.AutoTuneSysctl || opts.IsContainer {
 		return RenderedFile{}, false
 	}
+	mods := "tcp_bbr\nnf_conntrack\n"
+	if s.Role == state.RoleClient {
+		mods = "tcp_bbr\nsch_cake\nnf_conntrack\n"
+	}
 	return RenderedFile{
 		RelName:    "modules-99-dex.conf",
 		TargetPath: "/etc/modules-load.d/99-dex.conf",
-		Content:    []byte("tcp_bbr\nsch_cake\nnf_conntrack\n"),
+		Content:    []byte(mods),
 		Mode:       0o644,
 	}, true
 }

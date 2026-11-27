@@ -28,6 +28,7 @@ import (
 	"github.com/stuinxo/dex/internal/cert"
 	"github.com/stuinxo/dex/internal/cryptoext"
 	"github.com/stuinxo/dex/internal/daemon"
+	"github.com/stuinxo/dex/internal/doh"
 	"github.com/stuinxo/dex/internal/migrate"
 	"github.com/stuinxo/dex/internal/reconcile"
 	"github.com/stuinxo/dex/internal/render"
@@ -70,6 +71,8 @@ type Server struct {
 	Exec      reconcile.SystemExecutor
 	Hub       *daemon.TaskHub
 	DDNS      *daemon.CloudflareDDNS
+	Notifier  *daemon.Notifier
+	Metrics   *daemon.NodeMetricsTracker
 	ApplyOpts reconcile.ApplyOptions
 	StartedAt time.Time
 
@@ -82,12 +85,22 @@ type Server struct {
 	ReloadCertFn        func(ctx context.Context)
 	CertReloadCmd       string
 	CertRunner          cert.ACMERunner
+	ClientDoHUpstreams  []string
 
 	sessMu   sync.RWMutex
 	sessions map[string]*sessionRecord
 
 	rlMu     sync.Mutex
 	failures map[string][]time.Time
+
+	dohMu           sync.RWMutex
+	dohStateModNano int64
+	dohStateSize    int64
+	dohLoaded       bool
+	dohEnabled      bool
+	dohPath         string
+	dohUpstreamsKey string
+	dohHandler      *doh.Handler
 
 	handler http.Handler
 }
@@ -104,12 +117,15 @@ func NewServer(store *state.Store, exec reconcile.SystemExecutor, hub *daemon.Ta
 		ddns = daemon.NewCloudflareDDNS(hub)
 	}
 	s := &Server{
-		Store:     store,
-		Exec:      exec,
-		Hub:       hub,
-		DDNS:      ddns,
-		ApplyOpts: applyOpts,
-		StartedAt: time.Now(),
+		Store:              store,
+		Exec:               exec,
+		Hub:                hub,
+		DDNS:               ddns,
+		Notifier:           daemon.NewNotifier(hub),
+		Metrics:            daemon.NewNodeMetricsTracker(60),
+		ApplyOpts:          applyOpts,
+		StartedAt:          time.Now(),
+		ClientDoHUpstreams: []string{"127.0.0.1:53"},
 		ProbeNodeFn: func(ctx context.Context, n state.OutboundNode) daemon.ProbeNodeResult {
 			return daemon.ProbeNodeHealth(ctx, n, 5*time.Second, false)
 		},
@@ -122,7 +138,78 @@ func NewServer(store *state.Store, exec reconcile.SystemExecutor, hub *daemon.Ta
 	return s
 }
 
+// InvalidateDoHCache forces the next DoH path lookup to reload state.json immediately.
+func (s *Server) InvalidateDoHCache() {
+	s.dohMu.Lock()
+	s.dohLoaded = false
+	s.dohMu.Unlock()
+}
+
+func (s *Server) matchClientDoH(reqPath string) *doh.Handler {
+	if s.Store == nil || reqPath == "" || reqPath == "/" || strings.HasPrefix(reqPath, "/api/") {
+		return nil
+	}
+	var modNano, fSize int64
+	if fi, err := os.Stat(s.Store.StatePath()); err == nil {
+		modNano = fi.ModTime().UnixNano()
+		fSize = fi.Size()
+	}
+	ups := s.ClientDoHUpstreams
+	if len(ups) == 0 {
+		ups = []string{"127.0.0.1:53"}
+	}
+	upsKey := strings.Join(ups, ",")
+
+	s.dohMu.RLock()
+	if s.dohLoaded && s.dohStateModNano == modNano && s.dohStateSize == fSize && s.dohUpstreamsKey == upsKey {
+		enabled := s.dohEnabled
+		path := s.dohPath
+		h := s.dohHandler
+		s.dohMu.RUnlock()
+		if enabled && reqPath == path {
+			return h
+		}
+		return nil
+	}
+	s.dohMu.RUnlock()
+
+	st, err := s.Store.Load()
+	enabled := err == nil && st != nil && st.Role == state.RoleClient && st.Client.DNS.EnableDoHServer
+	path := ""
+	if enabled {
+		path = st.Client.DNS.EffectiveDoHPath()
+	}
+
+	s.dohMu.Lock()
+	if enabled && (s.dohHandler == nil || s.dohPath != path || s.dohUpstreamsKey != upsKey) {
+		s.dohHandler = doh.NewHandler(doh.Config{
+			Path:          path,
+			Upstreams:     append([]string(nil), ups...),
+			Timeout:       5 * time.Second,
+			MaxConcurrent: 128,
+		})
+	}
+	s.dohEnabled = enabled
+	s.dohPath = path
+	s.dohUpstreamsKey = upsKey
+	s.dohStateModNano = modNano
+	s.dohStateSize = fSize
+	s.dohLoaded = true
+	h := s.dohHandler
+	s.dohMu.Unlock()
+
+	if enabled && reqPath == path {
+		return h
+	}
+	return nil
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h := s.matchClientDoH(r.URL.Path); h != nil {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		h.ServeHTTP(w, r)
+		return
+	}
 	s.handler.ServeHTTP(w, r)
 }
 
@@ -141,6 +228,8 @@ func (s *Server) buildRouter() http.Handler {
 	mux.HandleFunc("PUT /api/v1/state", s.requireAuth(true, s.handlePutState))
 	mux.HandleFunc("POST /api/v1/nodes/select", s.requireAuth(true, s.handleSelectNode))
 	mux.HandleFunc("POST /api/v1/nodes/probe", s.requireAuth(true, s.handleProbeNodes))
+	mux.HandleFunc("GET /api/v1/metrics/nodes", s.requireAuth(false, s.handleNodeMetrics))
+	mux.HandleFunc("POST /api/v1/notify/test", s.requireAuth(true, s.handleNotifyTest))
 	mux.HandleFunc("POST /api/v1/nodes/parse-uri", s.requireAuth(true, s.handleParseNodeURI))
 	mux.HandleFunc("POST /api/v1/connectivity", s.requireAuth(true, s.handleConnectivity))
 	mux.HandleFunc("POST /api/v1/proxy/stop", s.requireAuth(true, s.handleProxyStop))
@@ -789,43 +878,36 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, _ *session
 		serverMainURI = render.BuildServerMainURI(st)
 	}
 	hostname, _ := os.Hostname()
-	dohURL := ""
-	if st.Role == state.RoleServer && st.Server.TLSMode == "nginx" && st.Server.EnableDoH {
-		dohHost := firstNonEmptyStr(st.Server.Domain, st.Server.EffectiveConnectHost(), hostname, "localhost")
-		if st.Server.EffectivePublicPort() == 443 {
-			dohURL = fmt.Sprintf("https://%s/dq", dohHost)
-		} else {
-			dohURL = fmt.Sprintf("https://%s:%d/dq", dohHost, st.Server.EffectivePublicPort())
-		}
-	}
+	dohURL := render.BuildDoHURL(st, hostname)
 
 	kernelRel := ""
 	if kb, kerr := os.ReadFile("/proc/sys/kernel/osrelease"); kerr == nil {
 		kernelRel = strings.TrimSpace(string(kb))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version":          version.Summary(),
-		"role":             st.Role,
-		"hostname":         hostname,
-		"device_alias":     st.System.Hostname,
-		"arch":             runtime.GOOS + "/" + runtime.GOARCH,
-		"kernel":           kernelRel,
-		"net_opt":          reconcile.ReadKernelNetOpt(),
-		"mem_mb":           s.Exec.DetectMemMB(),
-		"init_system":      initSys,
-		"is_container":     s.Exec.DetectIsContainer(),
-		"uptime_sec":       readHostUptimeSec(s.StartedAt),
-		"proxy_paused":     proxyPaused,
-		"services":         svcs,
-		"active_node_id":   st.Client.ActiveNodeID,
-		"node_uris":        nodeURIs,
-		"extra_uris":       extraURIs,
-		"fwd0_uri":         render.BuildFWDURI(st, "fwd0", ""),
-		"fwd1_uri":         render.BuildFWDURI(st, "fwd1", ""),
-		"doh_url":          dohURL,
-		"server_main_uri":  serverMainURI,
-		"node_sm_services": state.NodeSMServices,
-		"cert":             certSummary,
+		"version":              version.Summary(),
+		"role":                 st.Role,
+		"hostname":             hostname,
+		"device_alias":         st.System.Hostname,
+		"arch":                 runtime.GOOS + "/" + runtime.GOARCH,
+		"kernel":               kernelRel,
+		"net_opt":              reconcile.ReadKernelNetOpt(),
+		"mem_mb":               s.Exec.DetectMemMB(),
+		"init_system":          initSys,
+		"is_container":         s.Exec.DetectIsContainer(),
+		"uptime_sec":           readHostUptimeSec(s.StartedAt),
+		"proxy_paused":         proxyPaused,
+		"services":             svcs,
+		"active_node_id":       st.Client.ActiveNodeID,
+		"node_uris":            nodeURIs,
+		"extra_uris":           extraURIs,
+		"fwd0_uri":             render.BuildFWDURI(st, "fwd0", ""),
+		"fwd1_uri":             render.BuildFWDURI(st, "fwd1", ""),
+		"doh_url":              dohURL,
+		"server_main_uri":      serverMainURI,
+		"client_bootstrap_cmd": render.BuildClientBootstrapCommand(st, hostname),
+		"node_sm_services":     state.NodeSMServices,
+		"cert":                 certSummary,
 	})
 }
 
@@ -835,8 +917,10 @@ func redactStateForAPI(st *state.State) (*state.State, map[string]bool) {
 		return st, nil
 	}
 	secrets := map[string]bool{
-		"has_cert_cf_token": clone.Cert.CFToken != "",
-		"has_ddns_cf_token": clone.Client.DDNS.CFToken != "",
+		"has_cert_cf_token":         clone.Cert.CFToken != "",
+		"has_ddns_cf_token":         clone.Client.DDNS.CFToken != "",
+		"has_notify_webhook_url":    clone.System.Notify.WebhookURL != "",
+		"has_notify_telegram_token": clone.System.Notify.TelegramBotToken != "",
 	}
 	clone.Auth.PasswordHash = ""
 	if clone.Cert.CFToken != "" {
@@ -844,6 +928,12 @@ func redactStateForAPI(st *state.State) (*state.State, map[string]bool) {
 	}
 	if clone.Client.DDNS.CFToken != "" {
 		clone.Client.DDNS.CFToken = secretKeepSentinel
+	}
+	if clone.System.Notify.WebhookURL != "" {
+		clone.System.Notify.WebhookURL = secretKeepSentinel
+	}
+	if clone.System.Notify.TelegramBotToken != "" {
+		clone.System.Notify.TelegramBotToken = secretKeepSentinel
 	}
 	return clone, secrets
 }
@@ -883,6 +973,12 @@ func (s *Server) handlePutState(w http.ResponseWriter, r *http.Request, _ *sessi
 		if incoming.Client.DDNS.CFToken == "" || incoming.Client.DDNS.CFToken == secretKeepSentinel {
 			incoming.Client.DDNS.CFToken = cur.Client.DDNS.CFToken
 		}
+		if incoming.System.Notify.WebhookURL == "" || incoming.System.Notify.WebhookURL == secretKeepSentinel {
+			incoming.System.Notify.WebhookURL = cur.System.Notify.WebhookURL
+		}
+		if incoming.System.Notify.TelegramBotToken == "" || incoming.System.Notify.TelegramBotToken == secretKeepSentinel {
+			incoming.System.Notify.TelegramBotToken = cur.System.Notify.TelegramBotToken
+		}
 	}
 	for i := range incoming.ExtraInbounds {
 		ex := &incoming.ExtraInbounds[i]
@@ -917,6 +1013,15 @@ func (s *Server) handlePutState(w http.ResponseWriter, r *http.Request, _ *sessi
 			}
 		}
 	}
+	if incoming.Role == state.RoleClient && incoming.Client.DNS.EnableDoHServer && strings.TrimSpace(incoming.Client.DNS.DoHServerPath) == "" {
+		incoming.Client.DNS.DoHServerPath = state.GenerateDefaultClientDoHPath()
+	}
+	if incoming.Role != state.RoleServer {
+		incoming.Server.EnableDoH = false
+	}
+	if incoming.Role != state.RoleClient {
+		incoming.Client.DNS.EnableDoHServer = false
+	}
 	if err := incoming.Validate(); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -946,6 +1051,7 @@ func (s *Server) handlePutState(w http.ResponseWriter, r *http.Request, _ *sessi
 		writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
+	s.InvalidateDoHCache()
 	s.Hub.Log("INFO", "apply", fmt.Sprintf("reconciled role=%s (%d files)", updated.Role, len(applyRes.FilesWritten)))
 	if listenChanged {
 		s.Hub.Log("INFO", "daemon", fmt.Sprintf("web listen_addr changed to %s; restarting dex-daemon", updated.Auth.ListenAddr))
@@ -1115,11 +1221,81 @@ func (s *Server) handleProbeNodes(w http.ResponseWriter, r *http.Request, _ *ses
 		}
 	}
 	wg.Wait()
+	if s.Metrics != nil {
+		for _, r := range results {
+			s.Metrics.Record(r)
+		}
+	}
 	resp := map[string]any{"results": results}
 	if req.IncludeDoH {
 		resp["doh_results"] = dohResults
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleNodeMetrics(w http.ResponseWriter, _ *http.Request, _ *sessionRecord) {
+	st, err := s.Store.Load()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var nodes []state.OutboundNode
+	if st.Role == state.RoleClient {
+		nodes = st.Client.Nodes
+	}
+	var summaries []daemon.NodeMetricsSummary
+	if s.Metrics != nil {
+		summaries = s.Metrics.Summaries(nodes)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"nodes": summaries,
+	})
+}
+
+func (s *Server) handleNotifyTest(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
+	var req struct {
+		WebhookURL       string `json:"webhook_url"`
+		TelegramBotToken string `json:"telegram_bot_token"`
+		TelegramChatID   string `json:"telegram_chat_id"`
+	}
+	_ = decodeJSONBody(r, &req, 8192)
+
+	st, err := s.Store.Load()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	cfg := st.System.Notify
+	if wh := strings.TrimSpace(req.WebhookURL); wh != "" && wh != secretKeepSentinel {
+		cfg.WebhookURL = wh
+	}
+	if tok := strings.TrimSpace(req.TelegramBotToken); tok != "" && tok != secretKeepSentinel {
+		cfg.TelegramBotToken = tok
+	}
+	if chat := strings.TrimSpace(req.TelegramChatID); chat != "" {
+		cfg.TelegramChatID = chat
+	}
+
+	notifier := s.Notifier
+	if notifier == nil {
+		notifier = daemon.NewNotifier(s.Hub)
+	}
+	host := strings.TrimSpace(st.System.Hostname)
+	if host == "" {
+		host = st.Auth.ServerName
+	}
+	ev := daemon.AlertEvent{
+		Event:    "test",
+		Severity: "info",
+		Host:     host,
+		Title:    "DEX Test Notification",
+		Message:  fmt.Sprintf("notification channel test succeeded (role=%s)", st.Role),
+	}
+	if err := notifier.Send(r.Context(), cfg, ev); err != nil {
+		writeJSONError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleParseNodeURI(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {

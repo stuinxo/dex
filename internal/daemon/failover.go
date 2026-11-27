@@ -142,11 +142,14 @@ type FailoverController struct {
 	ProbeEgress      func(ctx context.Context) bool
 	ProbeNode        func(ctx context.Context, n state.OutboundNode) ProbeNodeResult
 	SwitchNode       func(ctx context.Context, nodeID string) error
+	OnEvent          func(ctx context.Context, ev AlertEvent)
+	Metrics          *NodeMetricsTracker
 	Hub              *TaskHub
 
 	failCount          int
 	recoverCounts      map[string]int
 	autoSwitchedNodeID string
+	allDownAlerted     bool
 }
 
 // NewFailoverController creates a FailoverController with standard 3-strike thresholds.
@@ -168,6 +171,31 @@ func (f *FailoverController) log(level, msg string) {
 	if f.Hub != nil {
 		f.Hub.Log(level, "failover", msg)
 	}
+}
+
+func (f *FailoverController) emitEvent(ctx context.Context, st *state.State, event, severity, title, msg string) {
+	if f.OnEvent == nil {
+		return
+	}
+	f.OnEvent(ctx, AlertEvent{
+		Event:     event,
+		Severity:  severity,
+		Host:      defaultEventHost(st),
+		Title:     title,
+		Message:   msg,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+func (f *FailoverController) probeNodeTracked(ctx context.Context, n state.OutboundNode) ProbeNodeResult {
+	res := f.ProbeNode(ctx, n)
+	if res.NodeID == "" {
+		res.NodeID = n.ID
+	}
+	if f.Metrics != nil {
+		f.Metrics.Record(res)
+	}
+	return res
 }
 
 // Step runs one inspection cycle against the current state snapshot.
@@ -209,7 +237,7 @@ func (f *FailoverController) Step(ctx context.Context, st *state.State) {
 	if activeIdx > 0 {
 		for i := 0; i < activeIdx; i++ {
 			cand := st.Client.Nodes[i]
-			res := f.ProbeNode(ctx, cand)
+			res := f.probeNodeTracked(ctx, cand)
 			if res.Healthy {
 				f.recoverCounts[cand.ID]++
 				f.log("INFO", fmt.Sprintf("higher-priority node [%s] %s healthy (%d/%d)",
@@ -218,13 +246,16 @@ func (f *FailoverController) Step(ctx context.Context, st *state.State) {
 					if err := f.SwitchNode(ctx, cand.ID); err != nil {
 						f.log("ERROR", fmt.Sprintf("failback switch to %s failed: %v", cand.ID, err))
 					} else {
-						f.log("INFO", fmt.Sprintf("FAILBACK switched active node to [%s] %s", cand.ID, cand.Name))
+						msg := fmt.Sprintf("FAILBACK switched active node from [%s] %s to [%s] %s", active.ID, active.Name, cand.ID, cand.Name)
+						f.log("INFO", msg)
+						f.emitEvent(ctx, st, "failback", "info", "DEX Node Failback", msg)
 						if cand.Protocol == "vless-reality" {
 							f.autoSwitchedNodeID = cand.ID
 						} else {
 							f.autoSwitchedNodeID = ""
 						}
 						f.failCount = 0
+						f.allDownAlerted = false
 						for k := range f.recoverCounts {
 							delete(f.recoverCounts, k)
 						}
@@ -243,6 +274,7 @@ func (f *FailoverController) Step(ctx context.Context, st *state.State) {
 			f.log("INFO", fmt.Sprintf("active node [%s] %s egress recovered", active.ID, active.Name))
 		}
 		f.failCount = 0
+		f.allDownAlerted = false
 		return
 	}
 
@@ -258,7 +290,7 @@ func (f *FailoverController) Step(ctx context.Context, st *state.State) {
 		if cand.ID == active.ID {
 			continue
 		}
-		res := f.ProbeNode(ctx, cand)
+		res := f.probeNodeTracked(ctx, cand)
 		if !res.Healthy {
 			f.log("WARN", fmt.Sprintf("backup node [%s] %s unreachable", cand.ID, cand.Name))
 			continue
@@ -267,17 +299,25 @@ func (f *FailoverController) Step(ctx context.Context, st *state.State) {
 			f.log("ERROR", fmt.Sprintf("failover switch to %s failed: %v", cand.ID, err))
 			continue
 		}
-		f.log("WARN", fmt.Sprintf("FAILOVER switched active node from [%s] to [%s] %s", active.ID, cand.ID, cand.Name))
+		msg := fmt.Sprintf("FAILOVER switched active node from [%s] %s to [%s] %s", active.ID, active.Name, cand.ID, cand.Name)
+		f.log("WARN", msg)
+		f.emitEvent(ctx, st, "failover", "warn", "DEX Node Failover", msg)
 		if cand.Protocol == "vless-reality" {
 			f.autoSwitchedNodeID = cand.ID
 		} else {
 			f.autoSwitchedNodeID = ""
 		}
 		f.failCount = 0
+		f.allDownAlerted = false
 		for k := range f.recoverCounts {
 			delete(f.recoverCounts, k)
 		}
 		return
 	}
 	f.log("ERROR", "all backup nodes unreachable; retaining current active node")
+	if !f.allDownAlerted {
+		f.allDownAlerted = true
+		f.emitEvent(ctx, st, "all_down", "error", "DEX All Nodes Unreachable",
+			fmt.Sprintf("active node [%s] %s and all backup nodes are unreachable", active.ID, active.Name))
+	}
 }

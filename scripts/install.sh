@@ -8,6 +8,8 @@ DEX_VERSION="${DEX_VERSION:-latest}"
 DEX_BIN="${DEX_BIN:-}"
 XRAY_ZIP="${XRAY_ZIP:-}"
 MOSDNS_ZIP="${MOSDNS_ZIP:-}"
+DEX_NODE="${DEX_NODE:-}"
+DEX_DOH="${DEX_DOH:-}"
 GH_PROXY="${GH_PROXY:-}"
 USER_GH_PROXY="${GH_PROXY:-}"
 case "$USER_GH_PROXY" in
@@ -17,9 +19,9 @@ esac
 STICKY_MIRROR=""
 GH_MIRRORS="${GH_MIRRORS:-https://gh-proxy.com/ https://ghproxy.net/ https://ghfast.top/}"
 STATE_DIR="${DEX_STATE_DIR:-/etc/dex}"
-INSTALL_BIN="/usr/local/bin/dex"
-XRAY_BIN="/usr/local/bin/xray"
-MOSDNS_BIN="/usr/local/bin/mosdns"
+INSTALL_BIN="${DEX_INSTALL_BIN:-/usr/local/bin/dex}"
+XRAY_BIN="${DEX_XRAY_BIN:-/usr/local/bin/xray}"
+MOSDNS_BIN="${DEX_MOSDNS_BIN:-/usr/local/bin/mosdns}"
 
 say()  { printf '%s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*" >&2; }
@@ -172,7 +174,7 @@ install_dex_binary() {
   is_elf "$tmp_bin" || die "Downloaded dex binary is not a valid Linux ELF executable."
   chmod 0755 "$tmp_bin"
   mv -f "$tmp_bin" "$INSTALL_BIN"
-  ln -sf "$INSTALL_BIN" /usr/local/bin/de_GWD
+  ln -sf "$INSTALL_BIN" "$(dirname "$INSTALL_BIN")/de_GWD"
   trap - EXIT
   say "[+] Installed dex to $INSTALL_BIN"
 }
@@ -379,19 +381,163 @@ ensure_ntp() {
   esac
 }
 
+suggest_doh_from_uri() {
+  u_first=$(printf '%s' "${1:-}" | awk -F'[,;]' '{print $1}')
+  case "$u_first" in
+    vless://*)
+      case "$u_first" in
+        *security=tls*) ;;
+        *) return 0 ;;
+      esac
+      hp=$(printf '%s' "${u_first#*@}" | sed 's/[?#/].*$//')
+      port=""
+      case "$hp" in
+        \[*\]:*) port="${hp##*:}" ;;
+        *:*) port="${hp##*:}" ;;
+      esac
+      sni=$(printf '%s' "$u_first" | sed -n 's/.*[?&]sni=\([^&#]*\).*/\1/p')
+      host="$sni"
+      if [ -z "$host" ]; then
+        case "$hp" in
+          \[*\]:*) host="${hp%:*}" ;;
+          *:*) host="${hp%:*}" ;;
+          *) host="$hp" ;;
+        esac
+      fi
+      [ -n "$host" ] || return 0
+      if [ -n "$port" ] && [ "$port" != "443" ]; then
+        printf 'https://%s:%s/dq' "$host" "$port"
+      else
+        printf 'https://%s/dq' "$host"
+      fi
+      ;;
+    vmess://*)
+      b64="${u_first#vmess://}"
+      json=$(printf '%s' "$b64" | base64 -d 2>/dev/null || printf '%s' "$b64" | base64 -D 2>/dev/null || printf '%s\n' "$b64" | openssl base64 -d -A 2>/dev/null || true)
+      case "$json" in
+        *'"tls":"tls"'*) ;;
+        *) return 0 ;;
+      esac
+      sni=$(printf '%s' "$json" | sed -n 's/.*"sni"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      [ -n "$sni" ] || sni=$(printf '%s' "$json" | sed -n 's/.*"host"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      [ -n "$sni" ] || sni=$(printf '%s' "$json" | sed -n 's/.*"add"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      port=$(printf '%s' "$json" | sed -n 's/.*"port"[[:space:]]*:[[:space:]]*"\{0,1\}\([0-9][0-9]*\)"\{0,1\}.*/\1/p')
+      [ -n "$sni" ] || return 0
+      if [ -n "$port" ] && [ "$port" != "443" ]; then
+        printf 'https://%s:%s/dq' "$sni" "$port"
+      else
+        printf 'https://%s/dq' "$sni"
+      fi
+      ;;
+  esac
+}
+
 main() {
+  if [ "${1:-}" = "--" ]; then
+    shift
+  fi
+  case "${1:-}" in
+    -h|--help|help)
+      say "Usage: curl -Lso- dex.stuinx.net | sh -s -- [-c|-s|-r|-l | client|server|relay|landing] [options]"
+      return 0
+      ;;
+  esac
+
   need_root
   detect_arch
   detect_os
   install_base_pkgs
   install_dex_binary
 
-  if [ "${1:-}" = "--" ]; then
+  role="${1:-}"
+  if [ $# -gt 0 ]; then
     shift
   fi
-  role="${1:-}"
+  case "$role" in
+    client|-c|--client|c) role="client" ;;
+    server|-s|--server|s) role="server" ;;
+    relay|-r|--relay|r)   role="relay" ;;
+    landing|-l|--landing|l) role="landing" ;;
+  esac
   case "$role" in
     client)
+      arg_node=""
+      arg_doh=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --node)
+            [ $# -ge 2 ] || die "Missing value for --node"
+            arg_node="$2"
+            shift 2
+            ;;
+          --node=*)
+            arg_node="${1#--node=}"
+            shift
+            ;;
+          --doh)
+            [ $# -ge 2 ] || die "Missing value for --doh"
+            arg_doh="$2"
+            shift 2
+            ;;
+          --doh=*)
+            arg_doh="${1#--doh=}"
+            shift
+            ;;
+          --)
+            shift
+            ;;
+          -*)
+            die "Unknown client option: $1"
+            ;;
+          vless://*|vmess://*|socks5://*)
+            if [ -z "$arg_node" ]; then
+              arg_node="$1"
+            else
+              arg_node="${arg_node},$1"
+            fi
+            shift
+            ;;
+          *)
+            if [ -z "$arg_doh" ]; then
+              arg_doh="$1"
+            else
+              arg_doh="${arg_doh},$1"
+            fi
+            shift
+            ;;
+        esac
+      done
+      client_node="${DEX_NODE:-$arg_node}"
+      client_doh="${DEX_DOH:-$arg_doh}"
+      if [ ! -s "${STATE_DIR}/state.json" ]; then
+        if [ "${DEX_NO_PROMPT:-0}" != "1" ] && ( : </dev/tty ) 2>/dev/null; then
+          while [ -z "$client_node" ]; do
+            printf '请输入 Server 节点链接 (必填，粘贴 Server 输出的 vless:// 或 vmess://): ' >/dev/tty
+            IFS= read -r client_node </dev/tty || die "Aborted: Server node URI is required for client installation."
+            client_node=$(printf '%s' "$client_node" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          done
+          def_doh=$(suggest_doh_from_uri "$client_node")
+          if [ -z "$client_doh" ] && [ -n "$def_doh" ]; then
+            client_doh="$def_doh"
+            say "[+] 已从节点链接自动获取自建 DoH: $client_doh"
+          fi
+          while [ -z "$client_doh" ]; do
+            printf '请输入自建 DoH 地址 (当前节点非 TLS 服务端，需手动填入，如 srv.example.com:443，多个逗号分隔): ' >/dev/tty
+            IFS= read -r client_doh </dev/tty || die "Aborted: self-hosted DoH is required for client installation."
+            client_doh=$(printf '%s' "$client_doh" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          done
+        else
+          if [ -z "$client_doh" ] && [ -n "$client_node" ]; then
+            client_doh=$(suggest_doh_from_uri "$client_node")
+          fi
+          if [ -z "$client_node" ] && [ "${DEX_ALLOW_NO_NODE:-0}" != "1" ]; then
+            die "Client install requires Server node URI: pass 'sh -s -- -c <vless://...>' (shown on Server)."
+          fi
+          if [ -z "$client_doh" ] && [ "${DEX_ALLOW_DEFAULT_DOH:-0}" != "1" ]; then
+            die "Client install requires self-hosted DoH: pass 'sh -s -- -c <vless://...> --doh <https://.../dq>' or set DEX_DOH=<url>."
+          fi
+        fi
+      fi
       case "$OS_PKG" in
         apk) apk add --no-cache wireguard-tools >/dev/null 2>&1 || true ;;
         apt)
@@ -403,9 +549,19 @@ main() {
       install_xray_core
       install_mosdns_and_rules
       if [ -s "${STATE_DIR}/state.json" ]; then
-        "$INSTALL_BIN" apply
+        if [ -n "$client_node" ]; then
+          "$INSTALL_BIN" node add --from-uri "$client_node"
+        fi
+        if [ -n "$client_doh" ]; then
+          "$INSTALL_BIN" dns set --doh "$client_doh" --apply
+        else
+          "$INSTALL_BIN" apply
+        fi
       else
-        "$INSTALL_BIN" init --role client --apply
+        set -- init --role client
+        [ -n "$client_node" ] && set -- "$@" --node "$client_node"
+        [ -n "$client_doh" ] && set -- "$@" --doh "$client_doh"
+        "$INSTALL_BIN" "$@" --apply
       fi
       say "[+] Client Web UI listening on :443 (HTTPS) with :80 -> HTTPS redirect."
       ;;
@@ -430,7 +586,15 @@ main() {
       mkdir -p "${STATE_DIR}/rules"
       fetch_verified_rule_dat "geoip.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" "${STATE_DIR}/rules/geoip.dat"
       fetch_verified_rule_dat "geosite.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" "${STATE_DIR}/rules/geosite.dat"
-      say "[+] Ready. Run 'dex init --role $role --domain <dom> --apply' or 'dex' for interactive menu."
+      role_flag="-s"
+      [ "$role" = "landing" ] && role_flag="-l"
+      if [ $# -gt 0 ]; then
+        "$INSTALL_BIN" "$role_flag" "$@"
+      elif [ ! -s "${STATE_DIR}/state.json" ] && [ "${DEX_NO_MENU:-0}" != "1" ] && [ "${DEX_NO_PROMPT:-0}" != "1" ] && [ -t 1 ] && ( : </dev/tty ) 2>/dev/null; then
+        exec "$INSTALL_BIN" "$role_flag" </dev/tty
+      else
+        say "[+] Ready. Run 'dex $role_flag' or 'dex $role_flag <domain>' (or 'dex' for interactive menu)."
+      fi
       ;;
     relay)
       say "[*] Installing relay packages (haproxy)..."
@@ -448,20 +612,26 @@ main() {
       mkdir -p "${STATE_DIR}/rules"
       fetch_verified_rule_dat "geoip.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" "${STATE_DIR}/rules/geoip.dat"
       fetch_verified_rule_dat "geosite.dat" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" "${STATE_DIR}/rules/geosite.dat"
-      say "[+] Ready. Run 'dex init --role relay --apply' or 'dex' for interactive menu."
+      if [ $# -gt 0 ]; then
+        "$INSTALL_BIN" -r "$@"
+      elif [ ! -s "${STATE_DIR}/state.json" ] && [ "${DEX_NO_MENU:-0}" != "1" ] && [ "${DEX_NO_PROMPT:-0}" != "1" ] && [ -t 1 ] && ( : </dev/tty ) 2>/dev/null; then
+        exec "$INSTALL_BIN" -r </dev/tty
+      else
+        say "[+] Ready. Run 'dex -r' (or 'dex' for interactive menu)."
+      fi
       ;;
     "")
       if [ "${DEX_NO_MENU:-0}" != "1" ] && [ -t 1 ] && ( : </dev/tty ) 2>/dev/null; then
         say "[+] DEX installed. Opening interactive menu..."
         exec "$INSTALL_BIN" </dev/tty
       else
-        say "[+] DEX installed. Run 'dex' to open menu, or pass a role: curl -Lso- dex.stuinx.net | sh -s [client|server|landing|relay]"
+        say "[+] DEX installed. Run 'dex' to open menu, or pass a role: curl -Lso- dex.stuinx.net | sh -s -- [-c|-s|-r|-l]"
       fi
       ;;
     *)
-      die "Usage: curl -Lso- github.com/${DEX_REPO}/raw/main/i | sh -s [client|server|landing|relay]"
+      die "Usage: curl -Lso- github.com/${DEX_REPO}/raw/main/i | sh -s -- [-c|-s|-r|-l | client|server|relay|landing]"
       ;;
   esac
 }
 
-main "$@"
+[ "${DEX_INSTALL_LIB_ONLY:-0}" = "1" ] || main "$@"

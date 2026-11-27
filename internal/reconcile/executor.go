@@ -149,8 +149,27 @@ func (e OSExecutor) DetectIsContainer() bool {
 	if _, err := os.Stat("/run/.containerenv"); err == nil {
 		return true
 	}
+	if os.Getenv("container") != "" {
+		return true
+	}
+	if hasContainerEnvFile("/proc/1/environ") {
+		return true
+	}
 	if e.HasCommand("systemd-detect-virt") {
 		if _, err := e.RunCommand(context.Background(), nil, "systemd-detect-virt", "--container", "--quiet"); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func hasContainerEnvFile(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	for _, entry := range strings.Split(string(data), "\x00") {
+		if val, ok := strings.CutPrefix(entry, "container="); ok && strings.TrimSpace(val) != "" {
 			return true
 		}
 	}

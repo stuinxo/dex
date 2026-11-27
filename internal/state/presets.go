@@ -65,8 +65,8 @@ var DefaultChinaDNS = []string{
 	"114.114.114.114",
 }
 
-// DefaultDoHServers lists default encrypted global DNS upstreams.
+// DefaultDoHServers lists fallback encrypted global DNS upstreams (IP literals avoid bootstrap DNS poisoning).
 var DefaultDoHServers = []string{
-	"https://dns.google/dns-query",
-	"https://cloudflare-dns.com/dns-query",
+	"https://1.1.1.1/dns-query",
+	"https://8.8.8.8/dns-query",
 }

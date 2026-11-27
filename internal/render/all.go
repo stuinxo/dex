@@ -58,11 +58,12 @@ func RenderAll(s *state.State, opts RenderOptions) (*RenderBundle, error) {
 		})
 	}
 
-	if nftBytes, cNeed, rNeed, err := RenderNFTables(s, opts); err != nil {
+	if nftBytes, cNeed, rNeed, fwNeed, err := RenderNFTables(s, opts); err != nil {
 		return nil, fmt.Errorf("render nftables: %w", err)
-	} else if cNeed || rNeed {
+	} else if cNeed || rNeed || fwNeed {
 		bundle.NFTClientNeeded = cNeed
 		bundle.NFTRelayNeeded = rNeed
+		bundle.NFTHostFWNeeded = fwNeed
 		bundle.Files = append(bundle.Files, RenderedFile{
 			RelName:      "nftables.conf",
 			TargetPath:   filepath.Join(opts.GeneratedDir, "nftables.conf"),

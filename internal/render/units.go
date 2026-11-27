@@ -85,7 +85,7 @@ start_pre() {
 			})
 		}
 
-		if b.NFTClientNeeded || b.NFTRelayNeeded {
+		if b.NFTClientNeeded || b.NFTRelayNeeded || b.NFTHostFWNeeded {
 			tproxyStart := ""
 			tproxyStop := ""
 			if b.NFTClientNeeded {
@@ -119,7 +119,8 @@ stop() {
   nft delete table inet dex_filter 2>/dev/null || true
   nft delete table inet dex_nat 2>/dev/null || true
   nft delete table inet dex_flow 2>/dev/null || true
-  nft delete table inet dex_relay 2>/dev/null || true%s
+  nft delete table inet dex_relay 2>/dev/null || true
+  nft delete table inet dex_host_fw 2>/dev/null || true%s
   eend 0
 }
 `, nftConf, nftConf, tproxyStart, tproxyStop)
@@ -238,7 +239,7 @@ WantedBy=multi-user.target
 		})
 	}
 
-	if b.NFTClientNeeded || b.NFTRelayNeeded {
+	if b.NFTClientNeeded || b.NFTRelayNeeded || b.NFTHostFWNeeded {
 		tproxyStart := ""
 		tproxyStop := ""
 		if b.NFTClientNeeded {
@@ -260,7 +261,7 @@ ConditionFileNotEmpty=%s
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/nft -f %s%s
-ExecStop=/bin/sh -c 'nft delete table inet dex_client 2>/dev/null || true; nft delete table inet dex_filter 2>/dev/null || true; nft delete table inet dex_nat 2>/dev/null || true; nft delete table inet dex_flow 2>/dev/null || true; nft delete table inet dex_relay 2>/dev/null || true'%s
+ExecStop=/bin/sh -c 'nft delete table inet dex_client 2>/dev/null || true; nft delete table inet dex_filter 2>/dev/null || true; nft delete table inet dex_nat 2>/dev/null || true; nft delete table inet dex_flow 2>/dev/null || true; nft delete table inet dex_relay 2>/dev/null || true; nft delete table inet dex_host_fw 2>/dev/null || true'%s
 
 [Install]
 WantedBy=multi-user.target

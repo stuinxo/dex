@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -20,6 +21,7 @@ var (
 	wgKeyRe       = regexp.MustCompile(`^[A-Za-z0-9+/]{42,44}=?$`)
 	shortIDRe     = regexp.MustCompile(`^[0-9a-fA-F]{0,16}$`)
 	pathRe        = regexp.MustCompile(`^/[A-Za-z0-9._~/-]{0,128}$`)
+	ifaceNameRe   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,14}$`)
 )
 
 // Validate checks structural integrity, ports, syntax, self-loops, and cross-references.
@@ -83,6 +85,12 @@ func (s *State) Validate() error {
 		return err
 	}
 	if err := validateCleanAbsPath("cert.key_file", s.Cert.KeyFile); err != nil {
+		return err
+	}
+	if err := validateNotifyConfig(s.System.Notify); err != nil {
+		return err
+	}
+	if err := validateHostFirewall(s); err != nil {
 		return err
 	}
 
@@ -220,6 +228,15 @@ func (s *State) Validate() error {
 		for _, r := range append(append([]string(nil), s.Client.DNS.BlacklistDomains...), s.Client.DNS.WhitelistDomains...) {
 			if !socks5out.IsValidDomainRule(r) {
 				return fmt.Errorf("client.dns domain list: invalid entry %q", r)
+			}
+		}
+		if s.Client.DNS.EnableDoHServer || strings.TrimSpace(s.Client.DNS.DoHServerPath) != "" {
+			p := s.Client.DNS.EffectiveDoHPath()
+			if !pathRe.MatchString(p) {
+				return fmt.Errorf("client.dns.doh_server_path: invalid path %q", s.Client.DNS.DoHServerPath)
+			}
+			if isReservedClientDoHPath(p) {
+				return fmt.Errorf("client.dns.doh_server_path: reserved path %q conflicts with Web UI/API", p)
 			}
 		}
 
@@ -396,6 +413,9 @@ func (s *State) Validate() error {
 		if s.Role == RoleLanding && s.Server.TLSMode != "direct" {
 			return errors.New("landing role requires server.tls_mode=direct")
 		}
+		if s.Role == RoleLanding && s.Server.EnableDoH {
+			return errors.New("landing role does not deploy DoH server (server.enable_doh must be false)")
+		}
 		if !socks5out.IsValidAddress(s.Server.Domain) {
 			return fmt.Errorf("server.domain: invalid %q", s.Server.Domain)
 		}
@@ -424,7 +444,7 @@ func (s *State) Validate() error {
 			return fmt.Errorf("server.path: invalid %q", s.Server.Path)
 		}
 
-		if err := validateSocks5Outbounds(s); err != nil {
+		if err := validateServerExits(s); err != nil {
 			return err
 		}
 	}
@@ -605,10 +625,46 @@ func (s *State) Validate() error {
 	return nil
 }
 
-func validateSocks5Outbounds(s *State) error {
-	names := make(map[string]struct{}, len(s.Server.Socks5Outbounds))
+func validateHostFirewall(s *State) error {
+	fw := s.System.Firewall
+	if !fw.Enabled {
+		return nil
+	}
+	if s.Role == RoleClient {
+		return errors.New("system.firewall is only supported on server, landing, and relay roles")
+	}
+	if fw.SSHPort < 0 || fw.SSHPort > 65535 {
+		return fmt.Errorf("system.firewall.ssh_port: invalid port %d", fw.SSHPort)
+	}
+	validIfaces := 0
+	for i, iface := range fw.MgmtInterfaces {
+		iface = strings.TrimSpace(iface)
+		if !ifaceNameRe.MatchString(iface) {
+			return fmt.Errorf("system.firewall.mgmt_interfaces[%d]: invalid interface name %q", i, iface)
+		}
+		validIfaces++
+	}
+	validSources := 0
+	for i, src := range fw.MgmtSources {
+		src = strings.TrimSpace(src)
+		if _, err := netip.ParsePrefix(src); err != nil {
+			if _, err2 := netip.ParseAddr(src); err2 != nil {
+				return fmt.Errorf("system.firewall.mgmt_sources[%d]: invalid IP/CIDR %q", i, src)
+			}
+		}
+		validSources++
+	}
+	if !fw.AllowPublicSSH && validIfaces == 0 && validSources == 0 {
+		return errors.New("system.firewall: anti-lockout guard requires allow_public_ssh=true or at least one mgmt_interfaces/mgmt_sources entry")
+	}
+	return nil
+}
+
+func validateServerExits(s *State) error {
+	names := make(map[string]struct{}, len(s.Server.Socks5Outbounds)+len(s.Server.UpstreamOutbounds))
 	seenDomains := make(map[string]string)
 	seenIPs := make(map[string]string)
+	hasGlobalDefault := false
 
 	var localSocksPorts []int
 	var localDomains []string
@@ -622,6 +678,37 @@ func validateSocks5Outbounds(s *State) error {
 				localDomains = append(localDomains, strings.ToLower(ex.Domain))
 			}
 		}
+	}
+
+	checkSplitRules := func(kind, name string, domains, ips []string) error {
+		if name == "default" && len(domains) == 0 && len(ips) == 0 {
+			if hasGlobalDefault {
+				return fmt.Errorf("%s %q: only one enabled global default exit is allowed across socks5_outbounds and upstream_outbounds", kind, name)
+			}
+			hasGlobalDefault = true
+		}
+		if name != "default" && len(domains) == 0 && len(ips) == 0 {
+			return fmt.Errorf("%s %q: domain or IP rules are required for non-default exits", kind, name)
+		}
+		for _, d := range domains {
+			if !socks5out.IsValidDomainRule(d) {
+				return fmt.Errorf("%s %q: invalid domain rule %q", kind, name, d)
+			}
+			if prev, exists := seenDomains[d]; exists {
+				return fmt.Errorf("%s: duplicate domain rule %q across enabled profiles (%s, %s)", kind, d, prev, name)
+			}
+			seenDomains[d] = name
+		}
+		for _, ipr := range ips {
+			if !socks5out.IsValidIPRule(ipr) {
+				return fmt.Errorf("%s %q: invalid IP rule %q", kind, name, ipr)
+			}
+			if prev, exists := seenIPs[ipr]; exists {
+				return fmt.Errorf("%s: duplicate IP rule %q across enabled profiles (%s, %s)", kind, ipr, prev, name)
+			}
+			seenIPs[ipr] = name
+		}
+		return nil
 	}
 
 	for i, prof := range s.Server.Socks5Outbounds {
@@ -665,26 +752,84 @@ func validateSocks5Outbounds(s *State) error {
 			}
 		}
 
-		if prof.Name != "default" && len(prof.Domains) == 0 && len(prof.IPs) == 0 {
-			return fmt.Errorf("socks5 profile %q: domain or IP rules are required for non-default exits", prof.Name)
+		if err := checkSplitRules("socks5_outbounds", prof.Name, prof.Domains, prof.IPs); err != nil {
+			return err
 		}
-		for _, d := range prof.Domains {
-			if !socks5out.IsValidDomainRule(d) {
-				return fmt.Errorf("socks5 profile %q: invalid domain rule %q", prof.Name, d)
-			}
-			if prev, exists := seenDomains[d]; exists {
-				return fmt.Errorf("socks5_outbounds: duplicate domain rule %q across enabled profiles (%s, %s)", d, prev, prof.Name)
-			}
-			seenDomains[d] = prof.Name
+	}
+
+	for i, up := range s.Server.UpstreamOutbounds {
+		if !profileNameRe.MatchString(up.Name) {
+			return fmt.Errorf("upstream_outbounds[%d]: invalid profile name %q", i, up.Name)
 		}
-		for _, ipr := range prof.IPs {
-			if !socks5out.IsValidIPRule(ipr) {
-				return fmt.Errorf("socks5 profile %q: invalid IP rule %q", prof.Name, ipr)
+		if _, dup := names[up.Name]; dup {
+			return fmt.Errorf("upstream_outbounds: duplicate profile name %q", up.Name)
+		}
+		names[up.Name] = struct{}{}
+
+		if !up.Enabled {
+			continue
+		}
+		if !socks5out.IsValidAddress(up.Address) {
+			return fmt.Errorf("upstream exit %q: invalid address %q", up.Name, up.Address)
+		}
+		if up.Port < 1 || up.Port > 65535 {
+			return fmt.Errorf("upstream exit %q: invalid port %d", up.Name, up.Port)
+		}
+		if up.TLSSNI != "" && !socks5out.IsValidAddress(up.TLSSNI) {
+			return fmt.Errorf("upstream exit %q: invalid tls_sni %q", up.Name, up.TLSSNI)
+		}
+
+		// Self-loop guard against own server main inbound
+		lowerAddr := strings.ToLower(strings.Trim(up.Address, "[]"))
+		if up.Port == s.Server.ListenPort {
+			if isLoopbackOrZero(lowerAddr) {
+				return fmt.Errorf("upstream exit %q: self-loop detected (%s:%d points to local server)", up.Name, up.Address, up.Port)
 			}
-			if prev, exists := seenIPs[ipr]; exists {
-				return fmt.Errorf("socks5_outbounds: duplicate IP rule %q across enabled profiles (%s, %s)", ipr, prev, prof.Name)
+			for _, ld := range localDomains {
+				if lowerAddr == ld {
+					return fmt.Errorf("upstream exit %q: self-loop detected (%s:%d points to local domain)", up.Name, up.Address, up.Port)
+				}
 			}
-			seenIPs[ipr] = prof.Name
+		}
+
+		switch up.Protocol {
+		case "vless-xhttp", "vless-ws", "vmess-ws":
+			if !uuidRe.MatchString(up.UUID) {
+				return fmt.Errorf("upstream exit %q: invalid UUID %q", up.Name, up.UUID)
+			}
+			if up.Path != "" && !pathRe.MatchString(up.Path) {
+				return fmt.Errorf("upstream exit %q: invalid path %q", up.Name, up.Path)
+			}
+		case "vmess-tcp":
+			if !uuidRe.MatchString(up.UUID) {
+				return fmt.Errorf("upstream exit %q: invalid UUID %q", up.Name, up.UUID)
+			}
+			if up.Path != "" && !pathRe.MatchString(up.Path) {
+				return fmt.Errorf("upstream exit %q: invalid path %q", up.Name, up.Path)
+			}
+		case "vless-reality":
+			if !uuidRe.MatchString(up.UUID) {
+				return fmt.Errorf("upstream exit %q: invalid UUID %q", up.Name, up.UUID)
+			}
+			if strings.TrimSpace(up.RealityPubKey) == "" {
+				return fmt.Errorf("upstream exit %q: missing reality_pubkey", up.Name)
+			}
+			if !shortIDRe.MatchString(up.RealityShortID) || len(up.RealityShortID)%2 != 0 {
+				return fmt.Errorf("upstream exit %q: invalid reality_shortid %q", up.Name, up.RealityShortID)
+			}
+		case "socks5":
+			if (up.Username == "") != (up.Password == "") {
+				return fmt.Errorf("upstream exit %q: username and password must be provided together", up.Name)
+			}
+			if hasControlChar(up.Username) || hasControlChar(up.Password) {
+				return fmt.Errorf("upstream exit %q: credentials contain control characters", up.Name)
+			}
+		default:
+			return fmt.Errorf("upstream exit %q: unsupported protocol %q", up.Name, up.Protocol)
+		}
+
+		if err := checkSplitRules("upstream_outbounds", up.Name, up.Domains, up.IPs); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -730,8 +875,45 @@ func hasControlChar(s string) bool {
 	return false
 }
 
+func validateNotifyConfig(cfg NotifyConfig) error {
+	wh := strings.TrimSpace(cfg.WebhookURL)
+	tgTok := strings.TrimSpace(cfg.TelegramBotToken)
+	tgChat := strings.TrimSpace(cfg.TelegramChatID)
+
+	if hasControlChar(wh) {
+		return errors.New("system.notify.webhook_url: invalid control character")
+	}
+	if hasControlChar(tgTok) {
+		return errors.New("system.notify.telegram_bot_token: invalid control character")
+	}
+	if hasControlChar(tgChat) {
+		return errors.New("system.notify.telegram_chat_id: invalid control character")
+	}
+	if wh != "" {
+		u, err := url.Parse(wh)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+			return fmt.Errorf("system.notify.webhook_url: invalid HTTP(S) URL %q", cfg.WebhookURL)
+		}
+	}
+	if (tgTok == "") != (tgChat == "") {
+		return errors.New("system.notify: telegram_bot_token and telegram_chat_id must both be set")
+	}
+	if cfg.Enabled && wh == "" && (tgTok == "" || tgChat == "") {
+		return errors.New("system.notify: at least one channel (webhook_url or telegram) is required when enabled")
+	}
+	return nil
+}
+
 func isRestrictedNodeIP(ip netip.Addr) bool {
 	return ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsMulticast()
+}
+
+func isReservedClientDoHPath(p string) bool {
+	switch p {
+	case "", "/", "/api", "/index.html", "/app.js", "/style.css", "/favicon.ico":
+		return true
+	}
+	return strings.HasPrefix(p, "/api/")
 }
 
 // ExtraInternalPort returns the preferred loopback port Xray binds to when an ExtraInbound is fronted by Nginx.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"net/url"
 	"os"
@@ -112,6 +113,7 @@ type RenderBundle struct {
 	XrayNeeded            bool
 	NFTClientNeeded       bool
 	NFTRelayNeeded        bool
+	NFTHostFWNeeded       bool
 	MosDNSNeeded          bool
 	HAProxyNeeded         bool
 	NginxNeeded           bool
@@ -291,6 +293,155 @@ func BuildServerMainURI(s *state.State) string {
 		TLSSNI:   s.Server.Domain,
 		Path:     NormalizePath(s.Server.Path, uuid),
 	})
+}
+
+func formatHTTPSAuthority(rawHost string, port int) string {
+	h := strings.Trim(strings.TrimSpace(rawHost), "[]")
+	if h == "" {
+		h = "localhost"
+	}
+	if ip, err := netip.ParseAddr(h); err == nil && ip.Is6() {
+		h = "[" + ip.String() + "]"
+	}
+	if port <= 0 || port == 443 {
+		return h
+	}
+	return fmt.Sprintf("%s:%d", h, port)
+}
+
+// BuildDoHURL returns the external RFC 8484 DoH endpoint URL when enabled for server or client roles,
+// and always returns "" for landing and relay roles.
+func BuildDoHURL(s *state.State, fallbackHost string) string {
+	if s == nil {
+		return ""
+	}
+	switch s.Role {
+	case state.RoleServer:
+		if s.Server.TLSMode != "nginx" || !s.Server.EnableDoH {
+			return ""
+		}
+		host := ""
+		for _, cand := range []string{s.Server.Domain, s.Server.EffectiveConnectHost(), fallbackHost, "localhost"} {
+			if strings.TrimSpace(cand) != "" {
+				host = strings.TrimSpace(cand)
+				break
+			}
+		}
+		return "https://" + formatHTTPSAuthority(host, s.Server.EffectivePublicPort()) + "/dq"
+
+	case state.RoleClient:
+		if !s.Client.DNS.EnableDoHServer {
+			return ""
+		}
+		listenHost := ""
+		listenPort := 443
+		if strings.TrimSpace(s.Auth.ListenAddr) != "" {
+			if h, pStr, err := net.SplitHostPort(strings.TrimSpace(s.Auth.ListenAddr)); err == nil {
+				if p, perr := strconv.Atoi(pStr); perr == nil && p >= 1 && p <= 65535 {
+					listenPort = p
+				}
+				hTrim := strings.Trim(strings.TrimSpace(h), "[]")
+				if hTrim != "" && hTrim != "0.0.0.0" && hTrim != "::" {
+					listenHost = hTrim
+				}
+			}
+		}
+		lanIP := ""
+		if strings.TrimSpace(s.System.LANAddrCIDR) != "" {
+			if p, err := netip.ParsePrefix(strings.TrimSpace(s.System.LANAddrCIDR)); err == nil {
+				lanIP = p.Addr().String()
+			}
+		}
+		serverName := strings.TrimSpace(s.Auth.ServerName)
+		if serverName == "dex" {
+			serverName = ""
+		}
+		host := ""
+		for _, cand := range []string{
+			s.Cert.Domain,
+			s.Client.DDNS.Domain,
+			s.Client.WireGuard.EndpointHost,
+			serverName,
+			listenHost,
+			lanIP,
+			fallbackHost,
+			"localhost",
+		} {
+			if strings.TrimSpace(cand) != "" {
+				host = strings.TrimSpace(cand)
+				break
+			}
+		}
+		return "https://" + formatHTTPSAuthority(host, listenPort) + s.Client.DNS.EffectiveDoHPath()
+
+	default:
+		return ""
+	}
+}
+
+func shellSingleQuote(v string) string {
+	return "'" + strings.ReplaceAll(v, "'", "'\\''") + "'"
+}
+
+// DeriveServerDoHFromNode derives a default self-hosted Server DoH URL ("https://<host>[:port]/dq")
+// from an OutboundNode when the node uses a TLS-terminated server protocol (vless-xhttp, vless-ws, vmess-ws).
+// Returns "" for vless-reality and socks5.
+func DeriveServerDoHFromNode(n state.OutboundNode) string {
+	switch n.Protocol {
+	case "vless-xhttp", "vless-ws", "vmess-ws":
+	default:
+		return ""
+	}
+	host := strings.TrimSpace(n.EffectiveSNI())
+	if host == "" {
+		host = strings.TrimSpace(n.Address)
+	}
+	if host == "" {
+		return ""
+	}
+	return "https://" + formatHTTPSAuthority(host, n.Port) + "/dq"
+}
+
+// BuildClientBootstrapCommand returns the one-line client install command pre-populated
+// with this server's primary node URI (Client auto-derives https://<sni>[:port]/dq when Server DoH is enabled).
+func BuildClientBootstrapCommand(s *state.State, fallbackHost string) string {
+	if s == nil || (s.Role != state.RoleServer && s.Role != state.RoleLanding) {
+		return ""
+	}
+	mainURI := BuildServerMainURI(s)
+	if mainURI == "" {
+		return ""
+	}
+	if dohURL := BuildDoHURL(s, fallbackHost); dohURL != "" {
+		if parsed, err := ParseNodeURI(mainURI); err == nil && DeriveServerDoHFromNode(parsed) == dohURL {
+			return fmt.Sprintf("curl -Lso- dex.stuinx.net | sh -s -- -c %s", shellSingleQuote(mainURI))
+		}
+		return fmt.Sprintf("curl -Lso- dex.stuinx.net | sh -s -- -c %s --doh %s",
+			shellSingleQuote(mainURI), shellSingleQuote(dohURL))
+	}
+	return fmt.Sprintf("curl -Lso- dex.stuinx.net | sh -s -- -c %s --doh '<自建DoH地址>'",
+		shellSingleQuote(mainURI))
+}
+
+// BuildClientInitCommand returns the 'dex -c ...' command for an already-installed client binary
+// (top-level '-c' automatically applies configuration on the host).
+func BuildClientInitCommand(s *state.State, fallbackHost string) string {
+	if s == nil || (s.Role != state.RoleServer && s.Role != state.RoleLanding) {
+		return ""
+	}
+	mainURI := BuildServerMainURI(s)
+	if mainURI == "" {
+		return ""
+	}
+	if dohURL := BuildDoHURL(s, fallbackHost); dohURL != "" {
+		if parsed, err := ParseNodeURI(mainURI); err == nil && DeriveServerDoHFromNode(parsed) == dohURL {
+			return fmt.Sprintf("dex -c %s", shellSingleQuote(mainURI))
+		}
+		return fmt.Sprintf("dex -c %s --doh %s",
+			shellSingleQuote(mainURI), shellSingleQuote(dohURL))
+	}
+	return fmt.Sprintf("dex -c %s --doh '<自建DoH地址>'",
+		shellSingleQuote(mainURI))
 }
 
 // BuildFWDURI returns a client share URI for FWD0 ("fwd0") or FWD1 ("fwd1").

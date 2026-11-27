@@ -13,9 +13,13 @@ const CACHE_TTL_SECONDS = 300;
 const RAW_PATHS = new Set(["/", "/dex", "/i", "/install.sh"]);
 const ROLE_PATHS = new Map([
   ["/client", "client"],
+  ["/c", "client"],
   ["/server", "server"],
+  ["/s", "server"],
   ["/landing", "landing"],
+  ["/l", "landing"],
   ["/relay", "relay"],
+  ["/r", "relay"],
 ]);
 
 function textResponse(body, status, extraHeaders = {}) {
@@ -64,8 +68,8 @@ export default {
     let body = await upstream.text();
     if (role) {
       const patched = body.replace(
-        /(^|\n)main "\$@"[ \t]*\r?\n?$/,
-        `$1if [ "$#" -eq 0 ]; then main "${role}"; else main "$@"; fi\n`,
+        /(^|\n)(\[ "\$\{DEX_INSTALL_LIB_ONLY:-0\}" = "1" \] \|\| )?main "\$@"[ \t]*\r?\n?$/,
+        `$1$2{\n  case "\${1:-}" in\n    ""|-h|--help|help|client|-c|--client|c|server|-s|--server|s|landing|-l|--landing|l|relay|-r|--relay|r) ;;\n    *) set -- "${role}" "$@" ;;\n  esac\n  if [ "$#" -eq 0 ]; then main "${role}"; else main "$@"; fi\n}\n`,
       );
       if (patched === body) {
         return textResponse("Upstream script entry point not found\n", 502);

@@ -3,9 +3,12 @@ package web
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -989,5 +992,158 @@ func TestV004WebStatusNetOptAndSystemNetSwitches(t *testing.T) {
 	xrayBytes, err := os.ReadFile(filepath.Join(srvRoot, "etc", "dex", "generated", "xray.json"))
 	if err != nil || !strings.Contains(string(xrayBytes), `"listen": "::"`) {
 		t.Fatalf("expected xray.json reconciled with dual-stack listen ::, err=%v content=%s", err, string(xrayBytes))
+	}
+}
+
+func startMockUDPDNS(t *testing.T) string {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket udp: %v", err)
+	}
+	t.Cleanup(func() { _ = pc.Close() })
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, addr, rerr := pc.ReadFrom(buf)
+			if rerr != nil {
+				return
+			}
+			if n < 12 {
+				continue
+			}
+			// Build minimal valid DNS response echoing TXID + QR=1, ANCOUNT=0, RCODE=0
+			resp := make([]byte, n)
+			copy(resp, buf[:n])
+			resp[2] = 0x81
+			resp[3] = 0x80
+			binary.BigEndian.PutUint16(resp[6:8], 0)
+			_, _ = pc.WriteTo(resp, addr)
+		}
+	}()
+	return pc.LocalAddr().String()
+}
+
+func buildMinimalDNSQuery(txid uint16) []byte {
+	// 12-byte header + QNAME(example.com) + QTYPE(A) + QCLASS(IN)
+	pkt := make([]byte, 12)
+	binary.BigEndian.PutUint16(pkt[0:2], txid)
+	pkt[2] = 0x01 // RD
+	binary.BigEndian.PutUint16(pkt[4:6], 1)
+	pkt = append(pkt, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0)
+	pkt = append(pkt, 0, 1, 0, 1)
+	return pkt
+}
+
+func TestClientInProcessDoHEndpointAndHotSwap(t *testing.T) {
+	mockDNS := startMockUDPDNS(t)
+	srv, store, _ := setupTestWeb(t, false)
+	srv.ClientDoHUpstreams = []string{mockDNS}
+
+	st, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Client.DNS.EnableDoHServer || !strings.HasPrefix(st.Client.DNS.DoHServerPath, "/dq-") {
+		t.Fatalf("expected default client DoH enabled with /dq-xxxxxx path, got %+v", st.Client.DNS)
+	}
+	origPath := st.Client.DNS.DoHServerPath
+
+	// 1. Unauthenticated RFC 8484 GET on secret path succeeds; /dq returns 404 (not open to scanners)
+	qWire := buildMinimalDNSQuery(0x4242)
+	qB64 := base64.RawURLEncoding.EncodeToString(qWire)
+
+	wrongRec := httptest.NewRecorder()
+	srv.ServeHTTP(wrongRec, httptest.NewRequest(http.MethodGet, "/dq?dns="+qB64, nil))
+	if wrongRec.Code != http.StatusNotFound {
+		t.Fatalf("expected /dq to return 404 when secret path is %q, got %d", origPath, wrongRec.Code)
+	}
+
+	getRec := httptest.NewRecorder()
+	srv.ServeHTTP(getRec, httptest.NewRequest(http.MethodGet, origPath+"?dns="+qB64, nil))
+	if getRec.Code != http.StatusOK || getRec.Header().Get("Content-Type") != "application/dns-message" {
+		t.Fatalf("expected 200 application/dns-message on %s, got %d (%s)", origPath, getRec.Code, getRec.Body.String())
+	}
+	if len(getRec.Body.Bytes()) < 12 || binary.BigEndian.Uint16(getRec.Body.Bytes()[:2]) != 0x4242 {
+		t.Fatalf("unexpected DNS response wire bytes: %x", getRec.Body.Bytes())
+	}
+
+	// 2. Unauthenticated RFC 8484 POST also succeeds
+	postReq := httptest.NewRequest(http.MethodPost, origPath, bytes.NewReader(buildMinimalDNSQuery(0x5151)))
+	postReq.Header.Set("Content-Type", "application/dns-message")
+	postRec := httptest.NewRecorder()
+	srv.ServeHTTP(postRec, postReq)
+	if postRec.Code != http.StatusOK || binary.BigEndian.Uint16(postRec.Body.Bytes()[:2]) != 0x5151 {
+		t.Fatalf("expected POST DoH 200 with TXID 0x5151, got %d", postRec.Code)
+	}
+
+	// 3. Authenticate and hot-swap path to /dq via PUT /api/v1/state (zero restart)
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"password":"myPass123"}`))
+	loginReq.Header.Set("Content-Type", "application/json")
+	loginRec := httptest.NewRecorder()
+	srv.ServeHTTP(loginRec, loginReq)
+	if loginRec.Code != http.StatusOK {
+		t.Fatalf("login failed: %d", loginRec.Code)
+	}
+	var loginBody map[string]any
+	_ = json.Unmarshal(loginRec.Body.Bytes(), &loginBody)
+	csrf, _ := loginBody["csrf_token"].(string)
+	cookies := loginRec.Result().Cookies()
+
+	st.Client.DNS.DoHServerPath = "/dq"
+	st.Client.DDNS.Domain = "home-gw.example.com"
+	rawBody, _ := json.Marshal(st)
+	putReq := httptest.NewRequest(http.MethodPut, "/api/v1/state", bytes.NewReader(rawBody))
+	putReq.Header.Set("Content-Type", "application/json")
+	putReq.Header.Set("X-CSRF-Token", csrf)
+	for _, c := range cookies {
+		putReq.AddCookie(c)
+	}
+	putRec := httptest.NewRecorder()
+	srv.ServeHTTP(putRec, putReq)
+	if putRec.Code != http.StatusOK {
+		t.Fatalf("PUT /api/v1/state failed: %d %s", putRec.Code, putRec.Body.String())
+	}
+
+	// Old path must now 404, new /dq must 200 immediately, and /api/v1/status must report https://home-gw.example.com/dq
+	oldRec := httptest.NewRecorder()
+	srv.ServeHTTP(oldRec, httptest.NewRequest(http.MethodGet, origPath+"?dns="+qB64, nil))
+	if oldRec.Code != http.StatusNotFound {
+		t.Fatalf("expected old path %s to return 404 after hot-swap, got %d", origPath, oldRec.Code)
+	}
+	newRec := httptest.NewRecorder()
+	srv.ServeHTTP(newRec, httptest.NewRequest(http.MethodGet, "/dq?dns="+qB64, nil))
+	if newRec.Code != http.StatusOK {
+		t.Fatalf("expected new path /dq to return 200 immediately, got %d", newRec.Code)
+	}
+
+	statReq := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	for _, c := range cookies {
+		statReq.AddCookie(c)
+	}
+	statRec := httptest.NewRecorder()
+	srv.ServeHTTP(statRec, statReq)
+	if !strings.Contains(statRec.Body.String(), `"doh_url":"https://home-gw.example.com/dq"`) {
+		t.Fatalf("expected status doh_url=https://home-gw.example.com/dq, got %s", statRec.Body.String())
+	}
+
+	// 4. Disabling enable_doh_server shuts off /dq immediately
+	st.Client.DNS.EnableDoHServer = false
+	rawOff, _ := json.Marshal(st)
+	offReq := httptest.NewRequest(http.MethodPut, "/api/v1/state", bytes.NewReader(rawOff))
+	offReq.Header.Set("Content-Type", "application/json")
+	offReq.Header.Set("X-CSRF-Token", csrf)
+	for _, c := range cookies {
+		offReq.AddCookie(c)
+	}
+	offRec := httptest.NewRecorder()
+	srv.ServeHTTP(offRec, offReq)
+	if offRec.Code != http.StatusOK {
+		t.Fatalf("disable client DoH failed: %d %s", offRec.Code, offRec.Body.String())
+	}
+	disabledRec := httptest.NewRecorder()
+	srv.ServeHTTP(disabledRec, httptest.NewRequest(http.MethodGet, "/dq?dns="+qB64, nil))
+	if disabledRec.Code != http.StatusNotFound {
+		t.Fatalf("expected /dq to return 404 when disabled, got %d", disabledRec.Code)
 	}
 }

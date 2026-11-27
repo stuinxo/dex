@@ -82,6 +82,14 @@ func RunWithExecutor(args []string, exec reconcile.SystemExecutor, stdin io.Read
 		return 0
 	case "menu":
 		return runInteractiveMenu(store, exec, stdin, stdout, stderr)
+	case "-c", "--client":
+		return dispatchRoleFlag(store, exec, state.RoleClient, rest, stdin, stdout, stderr)
+	case "-s", "--server":
+		return dispatchRoleFlag(store, exec, state.RoleServer, rest, stdin, stdout, stderr)
+	case "-r", "--relay":
+		return dispatchRoleFlag(store, exec, state.RoleRelay, rest, stdin, stdout, stderr)
+	case "-l", "--landing":
+		return dispatchRoleFlag(store, exec, state.RoleLanding, rest, stdin, stdout, stderr)
 	case "init":
 		return cmdInit(store, exec, rest, stdout, stderr)
 	case "apply":
@@ -92,6 +100,8 @@ func RunWithExecutor(args []string, exec reconcile.SystemExecutor, stdin io.Read
 		return cmdStatus(store, exec, stdout, stderr)
 	case "server":
 		return cmdServer(store, exec, rest, stdout, stderr)
+	case "dns":
+		return cmdDNS(store, exec, rest, stdout, stderr)
 	case "node":
 		return cmdNode(store, exec, rest, stdout, stderr)
 	case "cert":
@@ -112,6 +122,8 @@ func RunWithExecutor(args []string, exec reconcile.SystemExecutor, stdin io.Read
 		return cmdRules(store, exec, rest, stdout, stderr)
 	case "update":
 		return cmdUpdate(store, exec, rest, stdout, stderr)
+	case "kernel":
+		return cmdKernel(store, exec, rest, stdout, stderr)
 	case "migrate":
 		return cmdMigrate(store, exec, rest, stdout, stderr)
 	case "daemon":
@@ -130,6 +142,13 @@ func printUsage(w io.Writer) {
 
 Usage:
   dex [--state-dir DIR] [command] [flags]
+  dex [-c|-s|-r|-l] [flags]
+
+Role Shortcuts:
+  -c, --client          Initialize & apply client role (wizard if no args, e.g. dex -c 'vless://...')
+  -s, --server          Initialize & apply server role (wizard if no args, e.g. dex -s srv.example.com)
+  -r, --relay           Initialize & apply relay role (wizard if no args, or pass --no-apply to skip apply)
+  -l, --landing         Initialize & apply landing role (wizard if no args, e.g. dex -l land.example.com)
 
 Commands:
   menu                  Open interactive numbered menu (default when no args)
@@ -137,6 +156,7 @@ Commands:
   apply                 Validate, render, pre-flight check, and reconcile configs
   status                Show role, active node, certificate, and service health
   server <subcmd>       Inspect or update server/landing configuration (show|set)
+  dns <subcmd>          Inspect or update client DNS & DoH server (show|set)
   node <subcmd>         Manage client outbound nodes (list|add|edit|move|del|select|probe|show)
   cert <subcmd>         Manage TLS certificates (self-sign|import|issue|inspect|reload)
   wg <subcmd>           Manage WireGuard VPN (enable|disable|keygen-server|peer-add|peer-regen|peer-del|show)
@@ -147,6 +167,7 @@ Commands:
   extra <subcmd>        Manage Option 55 extra inbounds (list|add-reality|add-xhttp|add-vless-ws|add-vmess-ws|add-dokodemo|add-socks5|del|disable-all)
   rules <subcmd>        Inspect or hot-update GeoIP/Domain rule files (status|update)
   update                Upgrade dex, xray, mosdns, and/or rule datasets cleanly
+  kernel <subcmd>       Inspect kernel or install Zabbly mainline kernel (status|zabbly)
   migrate               Import v2 0conf, v2 server, des, or dexs state (--cleanup-v2 --apply)
   daemon                Run embedded Web UI (client :443 + :80->HTTPS redirect; server 127.0.0.1:8443) + failover + DDNS loops
   serve-doh             Run standalone RFC 8484 DoH forwarding server
@@ -191,10 +212,136 @@ func isIPv6OnlyHost() bool {
 	return hasGlobalV6 && !hasNonLoopbackV4
 }
 
+func shouldAutoApplyInit(exec reconcile.SystemExecutor, defaultApply, applyExplicit, applyVal, noApplyVal bool) bool {
+	if noApplyVal {
+		return false
+	}
+	if applyExplicit {
+		return applyVal
+	}
+	if defaultApply {
+		_, isOS := exec.(reconcile.OSExecutor)
+		return isOS
+	}
+	return false
+}
+
+func dispatchRoleFlag(store *state.Store, exec reconcile.SystemExecutor, role string, rest []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(rest) == 0 {
+		return runRoleInitWizard(store, exec, role, stdin, stdout, stderr)
+	}
+	return cmdInitWithDefaultApply(store, exec, append([]string{"--role", role}, rest...), true, stdout, stderr)
+}
+
+func reorderInitArgs(args []string) []string {
+	var flags, pos []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			pos = append(pos, args[i+1:]...)
+			break
+		}
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			pos = append(pos, a)
+			continue
+		}
+		flags = append(flags, a)
+		if strings.Contains(a, "=") {
+			continue
+		}
+		name := strings.TrimLeft(a, "-")
+		switch name {
+		case "role", "domain", "connect-host", "port", "public-port", "tls-mode", "password", "uuid", "doh", "node":
+			if i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+		}
+	}
+	return append(flags, pos...)
+}
+
+func isShareNodeURI(raw string) bool {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	return strings.HasPrefix(s, "vless://") || strings.HasPrefix(s, "vmess://") || strings.HasPrefix(s, "socks5://")
+}
+
+func parseNodeURIList(raw string) ([]state.OutboundNode, error) {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\r'
+	})
+	var nodes []state.OutboundNode
+	for i, f := range fields {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
+		n, err := render.ParseNodeURI(f)
+		if err != nil {
+			return nil, fmt.Errorf("invalid node URI %q: %w", f, err)
+		}
+		if n.ID == "" {
+			n.ID = fmt.Sprintf("node-%d", i+1)
+		}
+		if n.Name == "" {
+			n.Name = n.Address
+		}
+		nodes = append(nodes, n)
+	}
+	if len(nodes) == 0 {
+		return nil, errors.New("at least one valid node URI (vless:// or vmess://) is required")
+	}
+	return nodes, nil
+}
+
+func printServerClientBootstrapInfo(w io.Writer, store *state.Store, st *state.State) {
+	if st == nil || (st.Role != state.RoleServer && st.Role != state.RoleLanding) {
+		return
+	}
+	hostname, _ := os.Hostname()
+	mainURI := render.BuildServerMainURI(st)
+	dohURL := render.BuildDoHURL(st, hostname)
+	installCmd := render.BuildClientBootstrapCommand(st, hostname)
+	initCmd := render.BuildClientInitCommand(st, hostname)
+
+	fmt.Fprintln(w, "\n── Client 对接必要信息 ──────────────────────────────────────")
+	fmt.Fprintf(w, "Main Node URI:  %s\n", mainURI)
+	if dohURL != "" {
+		fmt.Fprintf(w, "DoH URL:        %s\n", dohURL)
+	} else {
+		fmt.Fprintln(w, "DoH URL:        (本角色未启用 DoH，Client 需另填其它 Server 的自建 DoH)")
+	}
+	if installCmd != "" {
+		fmt.Fprintf(w, "Client Install: %s\n", installCmd)
+	}
+	if initCmd != "" {
+		fmt.Fprintf(w, "Client Init:    %s\n", initCmd)
+	}
+	if store != nil {
+		certFile, keyFile := resolveActiveCertPaths(store, st)
+		if cb, err1 := os.ReadFile(certFile); err1 == nil {
+			if kb, err2 := os.ReadFile(keyFile); err2 == nil {
+				if rep, ierr := cert.InspectPair(cb, kb); ierr == nil && rep.SelfSigned {
+					fmt.Fprintln(w, "[!] 证书提示: 当前仍为自签证书；Client 的 Xray 与 DoH 均强制校验 CA 证书，请先执行 'dex cert issue ...' (或菜单 3 -> 2) 签发/导入正式证书。")
+				}
+			}
+		}
+	}
+	fmt.Fprintln(w, "─────────────────────────────────────────────────────────────")
+}
+
 func cmdInit(store *state.Store, exec reconcile.SystemExecutor, args []string, stdout, stderr io.Writer) int {
+	return cmdInitWithDefaultApply(store, exec, args, false, stdout, stderr)
+}
+
+func cmdInitWithDefaultApply(store *state.Store, exec reconcile.SystemExecutor, args []string, defaultApply bool, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	role := fs.String("role", state.RoleClient, "role: client|server|landing|relay")
+	shortClient := fs.Bool("c", false, "shorthand for --role client")
+	shortServer := fs.Bool("s", false, "shorthand for --role server")
+	shortRelay := fs.Bool("r", false, "shorthand for --role relay")
+	shortLanding := fs.Bool("l", false, "shorthand for --role landing")
 	domain := fs.String("domain", "", "domain name")
 	connectHost := fs.String("connect-host", "", "external host/IP for clients")
 	port := fs.Int("port", 0, "listen port")
@@ -202,20 +349,93 @@ func cmdInit(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 	tlsMode := fs.String("tls-mode", "", "server tls_mode: nginx|direct")
 	pw := fs.String("password", "", "web UI password (random 16-char if omitted)")
 	uuid := fs.String("uuid", "", "primary UUID (auto-generated if omitted)")
+	nodeURIs := fs.String("node", "", "initial Server node URI(s) (vless:// or vmess://), comma-separated (client role)")
 	doh := fs.String("doh", "", "custom DoH URL(s), comma-separated (client role)")
 	enableIPv6 := fs.Bool("ipv6", false, "enable IPv6 dual-stack inbound/forwarding")
-	doApply := fs.Bool("apply", false, "apply configuration immediately")
+	doApply := fs.Bool("apply", false, "apply configuration immediately (default true when invoked via -c/-s/-r/-l)")
+	noApply := fs.Bool("no-apply", false, "only write state without applying configuration")
 	force := fs.Bool("force", false, "overwrite existing state file")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(reorderInitArgs(args)); err != nil {
 		return 2
 	}
 
 	ipv6Explicit := false
+	roleExplicit := false
+	applyExplicit := false
 	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "ipv6" {
+		switch f.Name {
+		case "ipv6":
 			ipv6Explicit = true
+		case "role":
+			roleExplicit = true
+		case "apply":
+			applyExplicit = true
 		}
 	})
+	effectiveApply := shouldAutoApplyInit(exec, defaultApply, applyExplicit, *doApply, *noApply)
+
+	shortCount := 0
+	shortRole := ""
+	if *shortClient {
+		shortCount++
+		shortRole = state.RoleClient
+	}
+	if *shortServer {
+		shortCount++
+		shortRole = state.RoleServer
+	}
+	if *shortRelay {
+		shortCount++
+		shortRole = state.RoleRelay
+	}
+	if *shortLanding {
+		shortCount++
+		shortRole = state.RoleLanding
+	}
+	if shortCount > 1 {
+		fmt.Fprintln(stderr, "cannot combine multiple role flags (-c, -s, -r, -l)")
+		return 2
+	}
+	if shortRole != "" {
+		if roleExplicit && *role != shortRole {
+			fmt.Fprintf(stderr, "conflicting --role %q and shorthand role %q\n", *role, shortRole)
+			return 2
+		}
+		*role = shortRole
+	}
+
+	if fs.NArg() > 0 {
+		switch {
+		case *role == state.RoleClient:
+			var posNodes, posDoHs []string
+			for _, a := range fs.Args() {
+				if isShareNodeURI(a) {
+					posNodes = append(posNodes, a)
+				} else {
+					posDoHs = append(posDoHs, a)
+				}
+			}
+			if len(posNodes) > 0 {
+				if strings.TrimSpace(*nodeURIs) != "" {
+					fmt.Fprintf(stderr, "unexpected argument(s): %s\n", strings.Join(posNodes, " "))
+					return 2
+				}
+				*nodeURIs = strings.Join(posNodes, ",")
+			}
+			if len(posDoHs) > 0 {
+				if strings.TrimSpace(*doh) != "" {
+					fmt.Fprintf(stderr, "unexpected argument(s): %s\n", strings.Join(posDoHs, " "))
+					return 2
+				}
+				*doh = strings.Join(posDoHs, ",")
+			}
+		case (*role == state.RoleServer || *role == state.RoleLanding) && strings.TrimSpace(*domain) == "" && fs.NArg() == 1:
+			*domain = fs.Arg(0)
+		default:
+			fmt.Fprintf(stderr, "unexpected argument(s): %s\n", strings.Join(fs.Args(), " "))
+			return 2
+		}
+	}
 
 	if _, err := os.Stat(store.StatePath()); err == nil && !*force {
 		fmt.Fprintf(stderr, "state file already exists at %s; use 'dex apply' to apply configuration or pass '--force' to overwrite\n", store.StatePath())
@@ -281,21 +501,45 @@ func cmdInit(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 		if *domain != "" {
 			st.Auth.ServerName = *domain
 		}
-		if strings.TrimSpace(*doh) != "" {
-			var list []string
-			for _, u := range strings.Split(*doh, ",") {
-				u = strings.TrimSpace(u)
-				if u != "" {
-					list = append(list, u)
+		if strings.TrimSpace(*nodeURIs) != "" {
+			nodes, nerr := parseNodeURIList(*nodeURIs)
+			if nerr != nil {
+				fmt.Fprintf(stderr, "invalid --node: %v\n", nerr)
+				return 1
+			}
+			st.Client.Nodes = nodes
+			st.Client.ActiveNodeID = nodes[0].ID
+			if strings.TrimSpace(*doh) == "" {
+				var derived []string
+				seen := make(map[string]struct{})
+				for _, n := range nodes {
+					if d := render.DeriveServerDoHFromNode(n); d != "" {
+						if _, dup := seen[d]; !dup {
+							seen[d] = struct{}{}
+							derived = append(derived, d)
+						}
+					}
+				}
+				if len(derived) > 0 {
+					st.Client.DNS.DoHServers = derived
 				}
 			}
-			if len(list) > 0 {
-				st.Client.DNS.DoHServers = list
+		}
+		if strings.TrimSpace(*doh) != "" {
+			list, perr := parseAndNormalizeDoHList(*doh)
+			if perr != nil {
+				fmt.Fprintf(stderr, "invalid --doh: %v\n", perr)
+				return 1
 			}
+			st.Client.DNS.DoHServers = list
 		}
 	}
 
-	if err := cert.EnsureSelfSigned(store.DefaultCert(), store.DefaultKey(), st.Auth.ServerName); err != nil {
+	certCN := st.Auth.ServerName
+	if (st.Role == state.RoleServer || st.Role == state.RoleLanding) && strings.TrimSpace(st.Server.Domain) != "" {
+		certCN = strings.TrimSpace(st.Server.Domain)
+	}
+	if err := cert.EnsureSelfSigned(store.DefaultCert(), store.DefaultKey(), certCN); err != nil {
 		fmt.Fprintf(stderr, "ensure cert: %v\n", err)
 		return 1
 	}
@@ -311,16 +555,28 @@ func cmdInit(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 	if *pw == "" {
 		fmt.Fprintf(stdout, "Initial Web Password: %s\n", rawPW)
 	}
-	if st.Role == state.RoleServer || st.Role == state.RoleLanding {
-		fmt.Fprintf(stdout, "Main Node URI: %s\n", render.BuildServerMainURI(st))
+	if st.Role == state.RoleClient {
+		if active := st.Client.ActiveNode(); active != nil {
+			fmt.Fprintf(stdout, "Active Node: %s (%s:%d)\n", active.ID, active.Address, active.Port)
+		}
+		fmt.Fprintf(stdout, "Upstream DoH: %s\n", strings.Join(st.Client.DNS.DoHServers, ", "))
 	}
 
-	if *doApply {
+	if effectiveApply {
+		if _, isOS := exec.(reconcile.OSExecutor); isOS {
+			if err := bootstrapRoleRuntimeDeps(context.Background(), store, exec, st.Role, OpsConfig{}, stdout); err != nil {
+				fmt.Fprintf(stderr, "bootstrap runtime dependencies failed: %v\n", err)
+				return 1
+			}
+		}
 		if _, err := reconcile.Reconcile(context.Background(), store, exec, reconcile.ApplyOptions{}); err != nil {
 			fmt.Fprintf(stderr, "apply failed: %v\n", err)
 			return 1
 		}
 		fmt.Fprintln(stdout, "Configuration reconciled successfully.")
+	}
+	if st.Role == state.RoleServer || st.Role == state.RoleLanding {
+		printServerClientBootstrapInfo(stdout, store, st)
 	}
 	return 0
 }
@@ -498,6 +754,10 @@ func cmdStatus(store *state.Store, exec reconcile.SystemExecutor, stdout, stderr
 		fmt.Fprintf(stdout, "Domain: %s | Mode: %s | Protocol: %s | Port: %d (pub %d)\n",
 			st.Server.Domain, st.Server.TLSMode, st.Server.EffectiveProtocol(), st.Server.ListenPort, st.Server.EffectivePublicPort())
 	}
+	hostname, _ := os.Hostname()
+	if dohURL := render.BuildDoHURL(st, hostname); dohURL != "" {
+		fmt.Fprintf(stdout, "DoH URL: %s\n", dohURL)
+	}
 	fmt.Fprintf(stdout, "Relay Forwards: %d | RproxyS: %v | Extra Inbounds: %d\n",
 		len(st.Relay.Forwards), st.RproxyS.Enabled, len(st.ExtraInbounds))
 	if sum := serviceStatusSummary(exec, st); sum != "" {
@@ -541,8 +801,15 @@ func cmdServer(store *state.Store, exec reconcile.SystemExecutor, args []string,
 		if st.Server.CamouflageDir != "" {
 			fmt.Fprintf(stdout, "CamouflageDir:    %s\n", st.Server.CamouflageDir)
 		}
+		hostname, _ := os.Hostname()
 		if uri := render.BuildServerMainURI(st); uri != "" {
 			fmt.Fprintf(stdout, "MainURI:          %s\n", uri)
+		}
+		if dohURL := render.BuildDoHURL(st, hostname); dohURL != "" {
+			fmt.Fprintf(stdout, "DoHURL:           %s\n", dohURL)
+		}
+		if cmd := render.BuildClientBootstrapCommand(st, hostname); cmd != "" {
+			fmt.Fprintf(stdout, "ClientInstall:    %s\n", cmd)
 		}
 		return 0
 	}
@@ -641,6 +908,9 @@ func cmdServer(store *state.Store, exec reconcile.SystemExecutor, args []string,
 			cur.Server.UUIDs = next
 		}
 		if setFlags["enable-doh"] {
+			if *enableDoH && cur.Role != state.RoleServer {
+				return fmt.Errorf("DoH server is only supported on server and client roles (current role=%s)", cur.Role)
+			}
 			cur.Server.EnableDoH = *enableDoH
 		}
 		if setFlags["camouflage-dir"] {
@@ -653,6 +923,122 @@ func cmdServer(store *state.Store, exec reconcile.SystemExecutor, args []string,
 		return 1
 	}
 	fmt.Fprintln(stdout, "Server configuration updated.")
+	return 0
+}
+
+func parseAndNormalizeDoHList(raw string) ([]string, error) {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	})
+	seen := make(map[string]struct{}, len(fields))
+	var out []string
+	for _, f := range fields {
+		norm := render.NormalizeDoHUpstream(f)
+		if norm == "" {
+			continue
+		}
+		host := render.ExtractDoHHost(norm)
+		if host == "" || !socks5out.IsValidAddress(host) {
+			return nil, fmt.Errorf("invalid DoH server %q", f)
+		}
+		if _, dup := seen[norm]; !dup {
+			seen[norm] = struct{}{}
+			out = append(out, norm)
+		}
+	}
+	if len(out) == 0 {
+		return nil, errors.New("at least one DoH server is required")
+	}
+	return out, nil
+}
+
+func cmdDNS(store *state.Store, exec reconcile.SystemExecutor, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] == "show" {
+		st, err := store.Load()
+		if err != nil {
+			fmt.Fprintf(stderr, "load state: %v\n", err)
+			return 1
+		}
+		hostname, _ := os.Hostname()
+		fmt.Fprintf(stdout, "Role:             %s\n", st.Role)
+		fmt.Fprintf(stdout, "EnableDoHServer:  %v\n", st.Client.DNS.EnableDoHServer)
+		fmt.Fprintf(stdout, "DoHServerPath:    %s\n", st.Client.DNS.EffectiveDoHPath())
+		if u := render.BuildDoHURL(st, hostname); u != "" {
+			fmt.Fprintf(stdout, "DoHServerURL:     %s\n", u)
+		}
+		fmt.Fprintf(stdout, "BlockAds:         %v\n", st.Client.DNS.BlockAds)
+		fmt.Fprintf(stdout, "BlockExternal53:  %v\n", st.Client.DNS.BlockExternal53)
+		fmt.Fprintf(stdout, "ChinaServers:     %s\n", strings.Join(st.Client.DNS.ChinaServers, ", "))
+		fmt.Fprintf(stdout, "DoHUpstreams:     %s\n", strings.Join(st.Client.DNS.DoHServers, ", "))
+		return 0
+	}
+
+	sub := args[0]
+	rest := args[1:]
+	if sub != "set" {
+		fmt.Fprintf(stderr, "unknown dns subcommand %q (expected show|set)\n", sub)
+		return 2
+	}
+
+	fs := flag.NewFlagSet("dns set", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	enableDoHSrv := fs.Bool("enable-doh-server", false, "enable client RFC 8484 DoH endpoint")
+	dohPath := fs.String("doh-path", "", "client DoH HTTP path (e.g. /dq-xxxxxx or /dq)")
+	regenDoHPath := fs.Bool("regen-doh-path", false, "regenerate random /dq-xxxxxx path")
+	dohUpstreams := fs.String("doh", "", "upstream self-hosted DoH server(s), comma-separated")
+	blockAds := fs.Bool("block-ads", false, "enable MosDNS ad-blocking")
+	block53 := fs.Bool("block-53", false, "block external inbound port 53")
+	doApply := fs.Bool("apply", false, "apply immediately")
+	if err := fs.Parse(rest); err != nil {
+		return 2
+	}
+
+	setFlags := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		setFlags[f.Name] = true
+	})
+
+	defRole := existingRoleOr(store, state.RoleClient)
+	mut := func(cur *state.State) error {
+		if cur.Role != state.RoleClient {
+			return fmt.Errorf("dns command requires client role (current role=%s)", cur.Role)
+		}
+		if setFlags["enable-doh-server"] {
+			cur.Client.DNS.EnableDoHServer = *enableDoHSrv
+			if *enableDoHSrv && strings.TrimSpace(cur.Client.DNS.DoHServerPath) == "" {
+				cur.Client.DNS.DoHServerPath = state.GenerateDefaultClientDoHPath()
+			}
+		}
+		if setFlags["doh-path"] {
+			p := strings.TrimSpace(*dohPath)
+			if p != "" && !strings.HasPrefix(p, "/") {
+				p = "/" + p
+			}
+			cur.Client.DNS.DoHServerPath = p
+		}
+		if *regenDoHPath {
+			cur.Client.DNS.DoHServerPath = state.GenerateDefaultClientDoHPath()
+		}
+		if setFlags["doh"] {
+			list, perr := parseAndNormalizeDoHList(*dohUpstreams)
+			if perr != nil {
+				return perr
+			}
+			cur.Client.DNS.DoHServers = list
+		}
+		if setFlags["block-ads"] {
+			cur.Client.DNS.BlockAds = *blockAds
+		}
+		if setFlags["block-53"] {
+			cur.Client.DNS.BlockExternal53 = *block53
+		}
+		return nil
+	}
+	if err := applyOrSave(store, exec, defRole, *doApply, mut); err != nil {
+		fmt.Fprintf(stderr, "dns set failed: %v\n", err)
+		return 1
+	}
+	fmt.Fprintln(stdout, "Client DNS configuration updated.")
 	return 0
 }
 
@@ -726,13 +1112,11 @@ func cmdNode(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 				strings.Join(st.Server.UUIDs, ", "),
 				render.NormalizePath(st.Server.Path, firstOrEmpty(st.Server.UUIDs)),
 				mainURI)
-			if st.Role == state.RoleServer && st.Server.TLSMode == "nginx" && st.Server.EnableDoH {
-				dohHost := firstNonEmpty(st.Server.Domain, st.Server.EffectiveConnectHost(), "localhost")
-				if st.Server.EffectivePublicPort() == 443 {
-					fmt.Fprintf(stdout, "DoH URL:  https://%s/dq\n", dohHost)
-				} else {
-					fmt.Fprintf(stdout, "DoH URL:  https://%s:%d/dq\n", dohHost, st.Server.EffectivePublicPort())
-				}
+			if u := render.BuildDoHURL(st, "localhost"); u != "" {
+				fmt.Fprintf(stdout, "DoH URL:  %s\n", u)
+			}
+			if cmd := render.BuildClientBootstrapCommand(st, "localhost"); cmd != "" {
+				fmt.Fprintf(stdout, "Client Install:\n  %s\n", cmd)
 			}
 			for _, ex := range st.ExtraInbounds {
 				if uri := buildExtraShareURI(st, ex); uri != "" {
@@ -763,6 +1147,9 @@ func cmdNode(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 			target.EffectiveSNI(), uri)
 		if len(st.Client.DNS.DoHServers) > 0 {
 			fmt.Fprintf(stdout, "DoH:      %s\n", strings.Join(st.Client.DNS.DoHServers, ", "))
+		}
+		if u := render.BuildDoHURL(st, "localhost"); u != "" {
+			fmt.Fprintf(stdout, "DoH URL:  %s\n", u)
 		}
 		if u0 := render.BuildFWDURI(st, "fwd0", ""); u0 != "" {
 			fmt.Fprintf(stdout, "FWD0 URI: %s\n", u0)
@@ -2625,6 +3012,8 @@ func cmdDaemon(store *state.Store, exec reconcile.SystemExecutor, args []string,
 	hub := daemon.NewTaskHub(300)
 	runner := daemon.NewRunner(store, exec, hub)
 	webSrv := web.NewServer(store, exec, hub, runner.DDNS, reconcile.ApplyOptions{})
+	webSrv.Notifier = runner.Notifier
+	webSrv.Metrics = runner.Metrics
 	webSrv.CertReloadCmd = buildCertReloadCmd(store.Dir)
 	webSrv.UpdateRulesFn = func(ctx context.Context, includeAds bool, w io.Writer) error {
 		return UpdateRules(ctx, store, exec, OpsConfig{}, includeAds, false, w)

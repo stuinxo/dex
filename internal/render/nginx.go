@@ -46,6 +46,19 @@ func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, 
 	var b strings.Builder
 	b.WriteString("# Managed declaratively by dex v4. Do not edit manually.\n\n")
 	seenListenPorts := make(map[int]bool)
+	seenDefaultSSLPort := make(map[int]bool)
+
+	writeDefaultSSLReject := func(port int) {
+		if seenDefaultSSLPort[port] {
+			return
+		}
+		seenDefaultSSLPort[port] = true
+		fmt.Fprintf(&b, "server {\n  listen %d ssl default_server;\n", port)
+		if s.System.EnableIPv6 {
+			fmt.Fprintf(&b, "  listen [::]:%d ssl default_server;\n", port)
+		}
+		b.WriteString("  server_name _;\n  ssl_reject_handshake on;\n}\n\n")
+	}
 
 	if hasMainNginx {
 		domain := s.Server.Domain
@@ -64,18 +77,28 @@ func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, 
 		}
 
 		if port == 443 {
+			listen80Default := "  listen 80 default_server;"
 			listen80 := "  listen 80;"
 			if s.System.EnableIPv6 {
+				listen80Default += "\n  listen [::]:80 default_server;"
 				listen80 += "\n  listen [::]:80;"
 			}
 			fmt.Fprintf(&b, `server {
+%s
+  server_name _;
+  return 444;
+}
+
+server {
 %s
   server_name %s;
   return 301 https://$server_name$request_uri;
 }
 
-`, listen80, domain)
+`, listen80Default, listen80, domain)
 		}
+
+		writeDefaultSSLReject(port)
 
 		b.WriteString(`upstream dex_xray {
   server 127.0.0.1:9890;
@@ -187,6 +210,7 @@ func RenderNginx(s *state.State, opts RenderOptions) (data []byte, needed bool, 
 		}
 		withSockOpts := !seenListenPorts[ex.ListenPort]
 		seenListenPorts[ex.ListenPort] = true
+		writeDefaultSSLReject(ex.ListenPort)
 		upstreamName := fmt.Sprintf("dex_extra_%d", internalPort)
 		fmt.Fprintf(&b, `
 upstream %s {

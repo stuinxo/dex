@@ -19,23 +19,23 @@ import (
 )
 
 type mockExecutor struct {
-	mu             sync.Mutex
-	cmds           []string
-	hasCmd         map[string]bool
+	mu               sync.Mutex
+	cmds             []string
+	hasCmd           map[string]bool
 	failValidation   string // "xray" | "nft" | "haproxy" | "nginx"
 	failHealthSvc    string
 	failReloadSvc    string
 	failDaemonReload bool
 	failResolve      bool
 	nginxVersion     string
-	inactiveSvcs   map[string]bool
-	startedSvcs    []string
-	reloadedSvcs   []string
-	stoppedSvcs    []string
-	physicalNICs   []string
-	physicalNICSet bool
-	onServiceStart func(name string)
-	onServiceStop  func(name string)
+	inactiveSvcs     map[string]bool
+	startedSvcs      []string
+	reloadedSvcs     []string
+	stoppedSvcs      []string
+	physicalNICs     []string
+	physicalNICSet   bool
+	onServiceStart   func(name string)
+	onServiceStop    func(name string)
 }
 
 func (m *mockExecutor) RunCommand(ctx context.Context, env []string, name string, args ...string) (string, error) {
@@ -407,6 +407,7 @@ func TestReconcileSelectiveRestarts(t *testing.T) {
 		Path:     "/xhttp1",
 	}}
 	s.Client.ActiveNodeID = "n1"
+	s.Client.DNS.DoHServers = []string{"https://doh.example.com/dq"}
 	srvPriv, srvPub, err := cryptoext.GenerateWireGuardKeypair()
 	if err != nil {
 		t.Fatalf("GenerateWireGuardKeypair server: %v", err)
@@ -600,6 +601,7 @@ func TestReconcileNFTTableCleanupMatchesRendered(t *testing.T) {
 		UUID:     "11111111-1111-4111-8111-111111111111",
 	}}
 	s.Client.ActiveNodeID = "n1"
+	s.Client.DNS.DoHServers = []string{"https://doh.example.com/dq"}
 	if err := store.Save(s); err != nil {
 		t.Fatalf("Save state: %v", err)
 	}
@@ -657,6 +659,7 @@ func TestReconcileRollbackStopsNewlyStartedServicesBeforeDeletingUnits(t *testin
 		UUID:     "11111111-1111-4111-8111-111111111111",
 	}}
 	s.Client.ActiveNodeID = "n1"
+	s.Client.DNS.DoHServers = []string{"https://doh.example.com/dq"}
 	if err := store.Save(s); err != nil {
 		t.Fatalf("Save state: %v", err)
 	}
@@ -1310,9 +1313,9 @@ func TestReconcileV004SysctlModprobeFallbackAndDropinLifecycle(t *testing.T) {
 		}
 	}
 
-	// Verify modules-load.d and nginx drop-in written
+	// Verify modules-load.d and nginx drop-in written (VPS server role uses fq, so sch_cake is omitted)
 	modPath := filepath.Join(root, "etc", "modules-load.d", "99-dex.conf")
-	if b, err := os.ReadFile(modPath); err != nil || string(b) != "tcp_bbr\nsch_cake\nnf_conntrack\n" {
+	if b, err := os.ReadFile(modPath); err != nil || string(b) != "tcp_bbr\nnf_conntrack\n" {
 		t.Fatalf("unexpected modules-load file: err=%v content=%q", err, string(b))
 	}
 	dropinPath := filepath.Join(root, "etc", "systemd", "system", "nginx.service.d", "dex-limits.conf")
@@ -1356,5 +1359,37 @@ func TestReconcileV004SysctlModprobeFallbackAndDropinLifecycle(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Dir(dropinPath)); !os.IsNotExist(err) {
 		t.Fatalf("expected empty nginx.service.d dir removed, stat err=%v", err)
+	}
+}
+
+func TestHasContainerEnvFile(t *testing.T) {
+	dir := t.TempDir()
+
+	podmanFile := filepath.Join(dir, "environ-podman")
+	if err := os.WriteFile(podmanFile, []byte("PATH=/usr/sbin:/sbin\x00container=podman\x00HOME=/root\x00"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !hasContainerEnvFile(podmanFile) {
+		t.Fatalf("expected container=podman detected")
+	}
+
+	lxcFile := filepath.Join(dir, "environ-lxc")
+	if err := os.WriteFile(lxcFile, []byte("container=lxc\x00"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !hasContainerEnvFile(lxcFile) {
+		t.Fatalf("expected container=lxc detected")
+	}
+
+	emptyFile := filepath.Join(dir, "environ-empty")
+	if err := os.WriteFile(emptyFile, []byte("PATH=/usr/bin\x00container= \x00"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if hasContainerEnvFile(emptyFile) {
+		t.Fatalf("expected empty container= value not detected as container")
+	}
+
+	if hasContainerEnvFile(filepath.Join(dir, "missing")) {
+		t.Fatalf("expected missing file to return false")
 	}
 }

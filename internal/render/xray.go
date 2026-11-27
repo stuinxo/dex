@@ -1086,8 +1086,8 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 		}
 
 		var globalDefaultOb map[string]any
-		var socksRuleList []map[string]any
-		var extraSocksObs []map[string]any
+		var exitRuleList []map[string]any
+		var extraExitObs []map[string]any
 		hasIPRules := false
 
 		for _, prof := range s.Server.Socks5Outbounds {
@@ -1124,10 +1124,10 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 			if prof.Name == "default" && len(prof.Domains) == 0 && len(prof.IPs) == 0 {
 				globalDefaultOb = ob
 			} else {
-				extraSocksObs = append(extraSocksObs, ob)
+				extraExitObs = append(extraExitObs, ob)
 			}
 			if len(prof.Domains) > 0 {
-				socksRuleList = append(socksRuleList, map[string]any{
+				exitRuleList = append(exitRuleList, map[string]any{
 					"type":        "field",
 					"ruleTag":     "socks5-domain-" + prof.Name,
 					"domain":      prof.Domains,
@@ -1136,10 +1136,43 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 			}
 			if len(prof.IPs) > 0 {
 				hasIPRules = true
-				socksRuleList = append(socksRuleList, map[string]any{
+				exitRuleList = append(exitRuleList, map[string]any{
 					"type":        "field",
 					"ruleTag":     "socks5-ip-" + prof.Name,
 					"ip":          prof.IPs,
+					"outboundTag": tag,
+				})
+			}
+		}
+
+		for _, up := range s.Server.UpstreamOutbounds {
+			if !up.Enabled {
+				continue
+			}
+			tag := "upstream-exit-" + up.Name
+			if up.Name == "default" {
+				tag = "upstream-exit"
+			}
+			ob := buildClientOutbound(tag, up.ToOutboundNode(), 0)
+			if up.Name == "default" && len(up.Domains) == 0 && len(up.IPs) == 0 {
+				globalDefaultOb = ob
+			} else {
+				extraExitObs = append(extraExitObs, ob)
+			}
+			if len(up.Domains) > 0 {
+				exitRuleList = append(exitRuleList, map[string]any{
+					"type":        "field",
+					"ruleTag":     "upstream-domain-" + up.Name,
+					"domain":      up.Domains,
+					"outboundTag": tag,
+				})
+			}
+			if len(up.IPs) > 0 {
+				hasIPRules = true
+				exitRuleList = append(exitRuleList, map[string]any{
+					"type":        "field",
+					"ruleTag":     "upstream-ip-" + up.Name,
+					"ip":          up.IPs,
 					"outboundTag": tag,
 				})
 			}
@@ -1150,8 +1183,25 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 		} else {
 			outbounds = append(outbounds, directOb, blockedOb)
 		}
-		outbounds = append(outbounds, extraSocksObs...)
-		rules = append(rules, socksRuleList...)
+		outbounds = append(outbounds, extraExitObs...)
+		if s.Server.EffectiveAntiAbuse() {
+			rules = append(rules,
+				map[string]any{
+					"type":        "field",
+					"ruleTag":     "anti-abuse-bt",
+					"protocol":    []string{"bittorrent"},
+					"outboundTag": "blocked",
+				},
+				map[string]any{
+					"type":        "field",
+					"ruleTag":     "anti-abuse-smtp",
+					"network":     "tcp",
+					"port":        "25",
+					"outboundTag": "blocked",
+				},
+			)
+		}
+		rules = append(rules, exitRuleList...)
 		if hasIPRules {
 			domainStrategy = "IPIfNonMatch"
 		}

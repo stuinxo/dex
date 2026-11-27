@@ -307,10 +307,11 @@
             <!-- SERVER / LANDING SHARE CARD -->
             <div id="overview-server-share" class="card mb-3 hidden">
               <div class="card-header">
-                <span class="card-header-title">服务端分享信息</span>
+                <span class="card-header-title">服务端分享与 Client 对接信息</span>
                 <div class="row-gap">
                   <button id="btn-server-main-qr" type="button" class="btn btn-sm btn-primary">主节点 URI / QR</button>
                   <button id="btn-server-doh-qr" type="button" class="btn btn-sm btn-secondary hidden">DoH 端点 QR</button>
+                  <button id="btn-copy-client-install" type="button" class="btn btn-sm btn-outline-secondary hidden">复制 Client 安装命令</button>
                 </div>
               </div>
               <div class="card-body">
@@ -442,6 +443,23 @@
                   <label class="check-row"><input type="checkbox" id="dns-block53"> 拦截局域网外部 53 端口 (block_external_53)</label>
                   <label class="check-row"><input type="checkbox" id="dns-ipv6"> 启用 IPv6 双栈 (TPROXY + AAAA)</label>
                   <label class="check-row"><input type="checkbox" id="dns-auto-rules"> 定时自动更新规则库 (auto_update_rules)</label>
+                  <label class="check-row"><input type="checkbox" id="dns-enable-doh-server"> 启用本机 DoH 服务端 (供外网手机/电脑接入去广告与分流 DNS)</label>
+                </div>
+                <div id="dns-doh-server-box" class="grid-2 mb">
+                  <label class="field">
+                    <span>本机 DoH 私密路径 (doh_server_path, 如 /dq-xxxxxx 或 /dq)</span>
+                    <div class="row-gap">
+                      <input type="text" id="dns-doh-server-path" class="form-control" placeholder="/dq-xxxxxx">
+                      <button id="btn-gen-client-doh-path" type="button" class="btn btn-sm btn-outline-secondary">随机路径</button>
+                    </div>
+                  </label>
+                  <label class="field">
+                    <span>外网接入 DoH 地址 (需配置公网证书与端口映射/IPv6/Rproxy)</span>
+                    <div class="row-gap">
+                      <input type="text" id="dns-doh-server-url" class="form-control" readonly placeholder="保存后显示 https://.../dq-xxxxxx">
+                      <button id="btn-client-doh-qr" type="button" class="btn btn-sm btn-outline-primary">QR / 复制</button>
+                    </div>
+                  </label>
                 </div>
                 <div id="doh-probe-results" class="conn-grid mb"></div>
                 <div class="grid-2">
@@ -674,7 +692,7 @@
                   </div>
                   <textarea id="srv-uuids" class="form-control" rows="3"></textarea>
                 </div>
-                <label class="check-row mt"><input type="checkbox" id="srv-enable-doh"> 启用 RFC 8484 DoH 服务端点 (/dq, 需 nginx 模式)</label>
+                <label id="srv-enable-doh-wrap" class="check-row mt"><input type="checkbox" id="srv-enable-doh"> 启用 RFC 8484 DoH 服务端点 (/dq, 需 nginx 模式)</label>
               </div>
             </div>
           </section>

@@ -151,11 +151,11 @@ func TestValidationRules(t *testing.T) {
 	if got := NewDefaultState(RoleServer).Auth.ListenAddr; got != "127.0.0.1:8443" {
 		t.Fatalf("server default listen_addr = %q, want 127.0.0.1:8443", got)
 	}
-	if got := NewDefaultState(RoleLanding).Auth.ListenAddr; got != ":8443" {
-		t.Fatalf("landing default listen_addr = %q, want :8443", got)
+	if got := NewDefaultState(RoleLanding).Auth.ListenAddr; got != "127.0.0.1:8443" {
+		t.Fatalf("landing default listen_addr = %q, want 127.0.0.1:8443", got)
 	}
-	if got := NewDefaultState(RoleRelay).Auth.ListenAddr; got != ":8443" {
-		t.Fatalf("relay default listen_addr = %q, want :8443", got)
+	if got := NewDefaultState(RoleRelay).Auth.ListenAddr; got != "127.0.0.1:8443" {
+		t.Fatalf("relay default listen_addr = %q, want 127.0.0.1:8443", got)
 	}
 
 	// Port conflict check
@@ -712,5 +712,156 @@ func TestHardeningAuditRegressions(t *testing.T) {
 	}
 	if err := stRelDup.Validate(); err == nil {
 		t.Fatalf("expected duplicate relay forward ID rejected")
+	}
+}
+
+func TestHostFirewallAndUpstreamExitValidation(t *testing.T) {
+	// 1. HostFirewall rejected on client role
+	c := NewDefaultState(RoleClient)
+	c.System.Firewall = HostFirewallConfig{Enabled: true, AllowPublicSSH: true}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "only supported on server") {
+		t.Fatalf("expected firewall rejected on client role, got %v", err)
+	}
+
+	// 2. HostFirewall anti-lockout guard
+	srv := NewDefaultState(RoleServer)
+	srv.Server.Domain = "srv.example.com"
+	srv.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	srv.System.Firewall = HostFirewallConfig{Enabled: true}
+	if err := srv.Validate(); err == nil || !strings.Contains(err.Error(), "anti-lockout") {
+		t.Fatalf("expected anti-lockout error, got %v", err)
+	}
+
+	// Valid Tailscale management interface + Cloudflare origin lock passes
+	srv.System.Firewall = HostFirewallConfig{
+		Enabled:              true,
+		MgmtInterfaces:       []string{"tailscale0"},
+		MgmtSources:          []string{"100.64.0.0/10", "2001:db8::1"},
+		CloudflareOriginLock: true,
+	}
+	if err := srv.Validate(); err != nil {
+		t.Fatalf("expected valid host firewall config, got %v", err)
+	}
+
+	// Invalid interface name rejected
+	srvBadIf := NewDefaultState(RoleRelay)
+	srvBadIf.System.Firewall = HostFirewallConfig{
+		Enabled:        true,
+		MgmtInterfaces: []string{"bad iface!"},
+	}
+	if err := srvBadIf.Validate(); err == nil || !strings.Contains(err.Error(), "invalid interface") {
+		t.Fatalf("expected invalid interface error, got %v", err)
+	}
+
+	// 3. UpstreamOutbounds validation: valid vless-reality default + split vless-xhttp
+	srvUp := NewDefaultState(RoleServer)
+	srvUp.Server.Domain = "transit.example.com"
+	srvUp.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	srvUp.Server.UpstreamOutbounds = []UpstreamExitProfile{
+		{
+			Name:           "default",
+			Enabled:        true,
+			Protocol:       "vless-reality",
+			Address:        "home.example.net",
+			Port:           443,
+			UUID:           "22222222-2222-4222-8222-222222222222",
+			TLSSNI:         "www.apple.com",
+			RealityPubKey:  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			RealityShortID: "abcd1234",
+		},
+		{
+			Name:     "streaming",
+			Enabled:  true,
+			Protocol: "vless-xhttp",
+			Address:  "us-home.example.net",
+			Port:     443,
+			UUID:     "33333333-3333-4333-8333-333333333333",
+			Domains:  []string{"geosite:netflix"},
+		},
+	}
+	if err := srvUp.Validate(); err != nil {
+		t.Fatalf("expected valid upstream_outbounds, got %v", err)
+	}
+
+	// Duplicate global default across socks5_outbounds and upstream_outbounds rejected
+	srvUp.Server.Socks5Outbounds = []Socks5Profile{{
+		Name:    "default",
+		Enabled: true,
+		Address: "socks.example.net",
+		Port:    1080,
+	}}
+	if err := srvUp.Validate(); err == nil {
+		t.Fatalf("expected conflict when both socks5_outbounds and upstream_outbounds define default")
+	}
+
+	// Self-loop on upstream_outbounds rejected
+	srvLoop := NewDefaultState(RoleServer)
+	srvLoop.Server.Domain = "transit.example.com"
+	srvLoop.Server.ListenPort = 443
+	srvLoop.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	srvLoop.Server.UpstreamOutbounds = []UpstreamExitProfile{{
+		Name:     "default",
+		Enabled:  true,
+		Protocol: "vless-xhttp",
+		Address:  "transit.example.com",
+		Port:     443,
+		UUID:     "22222222-2222-4222-8222-222222222222",
+	}}
+	if err := srvLoop.Validate(); err == nil || !strings.Contains(err.Error(), "self-loop") {
+		t.Fatalf("expected self-loop error, got %v", err)
+	}
+}
+
+func TestRoleBasedDoHDefaultsAndValidation(t *testing.T) {
+	cli := NewDefaultState(RoleClient)
+	if !cli.Client.DNS.EnableDoHServer {
+		t.Fatalf("expected client EnableDoHServer=true by default")
+	}
+	if !strings.HasPrefix(cli.Client.DNS.DoHServerPath, "/dq-") || len(cli.Client.DNS.DoHServerPath) != 10 {
+		t.Fatalf("expected client default DoH path /dq-xxxxxx, got %q", cli.Client.DNS.DoHServerPath)
+	}
+	if cli.Server.EnableDoH {
+		t.Fatalf("expected client Server.EnableDoH=false")
+	}
+	if err := cli.Validate(); err != nil {
+		t.Fatalf("default client state should validate cleanly: %v", err)
+	}
+
+	// Custom valid paths
+	for _, validPath := range []string{"/dq", "/dns-query", "/dq-custom_123"} {
+		cli.Client.DNS.DoHServerPath = validPath
+		if err := cli.Validate(); err != nil {
+			t.Fatalf("expected path %q to be valid, got %v", validPath, err)
+		}
+	}
+
+	// Reserved or malformed paths rejected
+	for _, badPath := range []string{"/", "/api", "/api/v1/status", "/app.js", "/style.css", "/index.html", "/bad path"} {
+		cli.Client.DNS.DoHServerPath = badPath
+		if err := cli.Validate(); err == nil {
+			t.Fatalf("expected path %q to be rejected", badPath)
+		}
+	}
+
+	srv := NewDefaultState(RoleServer)
+	if !srv.Server.EnableDoH || srv.Client.DNS.EnableDoHServer {
+		t.Fatalf("expected server EnableDoH=true and Client.EnableDoHServer=false, got srv=%v cli=%v",
+			srv.Server.EnableDoH, srv.Client.DNS.EnableDoHServer)
+	}
+
+	land := NewDefaultState(RoleLanding)
+	if land.Server.EnableDoH || land.Client.DNS.EnableDoHServer {
+		t.Fatalf("expected landing DoH disabled by default")
+	}
+	land.Server.Domain = "land.example.com"
+	land.Server.UUIDs = []string{"11111111-1111-4111-8111-111111111111"}
+	land.Server.EnableDoH = true
+	if err := land.Validate(); err == nil || !strings.Contains(err.Error(), "landing role does not deploy DoH") {
+		t.Fatalf("expected landing EnableDoH=true to fail validation, got %v", err)
+	}
+
+	rel := NewDefaultState(RoleRelay)
+	if rel.Server.EnableDoH || rel.Client.DNS.EnableDoHServer {
+		t.Fatalf("expected relay DoH disabled by default")
 	}
 }

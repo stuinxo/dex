@@ -25,6 +25,7 @@ jobs:
           head -n 1 dex | grep -q '^#!/bin/sh'
           cmp -s i scripts/install.sh
           cmp -s dex scripts/install.sh
+          sh scripts/test-install.sh
           ! grep -rn -- '--no-check-certificate' dex i scripts/ internal/ cmd/
           ! grep -rnE 'rm[[:space:]]+(-rf|-f)[[:space:]]+(/var/lib/(apt|dpkg)/.*lock|/var/cache/apt/archives/lock)' dex i scripts/
 
@@ -39,7 +40,7 @@ jobs:
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
             VERSION="${GITHUB_REF_NAME#v}"
           else
-            VERSION="0.0.5-dev"
+            VERSION="0.0.6-dev"
           fi
           COMMIT="${GITHUB_SHA::7}"
           BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"

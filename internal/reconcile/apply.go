@@ -533,7 +533,7 @@ func checkRequiredBinaries(exec SystemExecutor, ropts render.RenderOptions, bund
 	if bundle.MosDNSNeeded && !exec.HasCommand(ropts.MosDNSBin) {
 		return fmt.Errorf("missing required mosdns binary %q (run 'dex update --component mosdns')", ropts.MosDNSBin)
 	}
-	if (bundle.NFTClientNeeded || bundle.NFTRelayNeeded) && !exec.HasCommand("nft") {
+	if (bundle.NFTClientNeeded || bundle.NFTRelayNeeded || bundle.NFTHostFWNeeded) && !exec.HasCommand("nft") {
 		return fmt.Errorf("missing required binary \"nft\"")
 	}
 	if bundle.HAProxyNeeded && !exec.HasCommand("haproxy") {
@@ -915,8 +915,9 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 			changedServices["nginx"] = true
 		}
 
+		nftActive := bundle.NFTClientNeeded || bundle.NFTRelayNeeded || bundle.NFTHostFWNeeded
 		specs := []svcSpec{
-			{name: "dex-nft", active: bundle.NFTClientNeeded || bundle.NFTRelayNeeded, probe: bundle.NFTClientNeeded || bundle.NFTRelayNeeded},
+			{name: "dex-nft", active: nftActive, probe: nftActive},
 			{name: "dex-mosdns", active: bundle.MosDNSNeeded, probe: bundle.MosDNSNeeded},
 			{name: "dex-xray", active: bundle.XrayNeeded, probe: bundle.XrayNeeded},
 			{name: "dex-doh", active: bundle.DoHNeeded, probe: bundle.DoHNeeded},
@@ -984,7 +985,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		// Clean up orphaned nftables tables when a unit or table is omitted from nftables.conf
 		// (removing unit files before daemon-reload drops ExecStop).
 		if exec.HasCommand("nft") {
-			for _, tbl := range []string{"dex_relay", "dex_nat", "dex_flow", "dex_client", "dex_filter"} {
+			for _, tbl := range []string{"dex_relay", "dex_nat", "dex_flow", "dex_client", "dex_filter", "dex_host_fw"} {
 				if !hasNFTTable(bundle, tbl) {
 					_, _ = exec.RunCommand(ctx, nil, "nft", "delete", "table", "inet", tbl)
 				}
@@ -1112,7 +1113,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		}
 		// Remove any dex_* nftables tables introduced by this failed apply.
 		if exec.HasCommand("nft") {
-			for _, tbl := range []string{"dex_relay", "dex_nat", "dex_flow", "dex_client", "dex_filter"} {
+			for _, tbl := range []string{"dex_relay", "dex_nat", "dex_flow", "dex_client", "dex_filter", "dex_host_fw"} {
 				if !hasNFTTable(bundle, tbl) {
 					continue
 				}

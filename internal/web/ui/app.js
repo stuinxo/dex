@@ -302,6 +302,12 @@
     }
 
     if (currentState && currentState.role === "client") {
+      if (statusInfo.doh_url) {
+        addKV(sysKV, "本机 DoH 端点", statusInfo.doh_url);
+      }
+      if ($("dns-doh-server-url")) {
+        $("dns-doh-server-url").value = statusInfo.doh_url || "";
+      }
       renderOverviewNodes();
     } else if (currentState && (currentState.role === "server" || currentState.role === "landing")) {
       var shareKV = $("server-share-kv");
@@ -314,6 +320,13 @@
         btnDoh.classList.remove("hidden");
       } else {
         btnDoh.classList.add("hidden");
+      }
+      var btnCliCmd = $("btn-copy-client-install");
+      if (statusInfo.client_bootstrap_cmd) {
+        addKV(shareKV, "Client 一键安装对接", statusInfo.client_bootstrap_cmd);
+        if (btnCliCmd) { btnCliCmd.classList.remove("hidden"); }
+      } else if (btnCliCmd) {
+        btnCliCmd.classList.add("hidden");
       }
     }
 
@@ -460,6 +473,10 @@
     $("dns-block53").checked = !!dns.block_external_53;
     $("dns-ipv6").checked = !!(currentState.system && currentState.system.enable_ipv6);
     $("dns-auto-rules").checked = !!(currentState.system && currentState.system.auto_update_rules);
+    $("dns-enable-doh-server").checked = !!dns.enable_doh_server;
+    $("dns-doh-server-path").value = dns.doh_server_path || "";
+    $("dns-doh-server-url").value = (statusInfo && statusInfo.doh_url) || "";
+    $("dns-doh-server-box").classList.toggle("hidden", !dns.enable_doh_server);
     $("dns-china").value = (dns.china_servers || []).join("\n");
     $("dns-doh").value = (dns.doh_servers || []).join("\n");
     var hostsLines = [];
@@ -544,7 +561,10 @@
       $("srv-path").value = srv.path || "";
       $("srv-camo-dir").value = srv.camouflage_dir || "";
       $("srv-uuids").value = (srv.uuids || []).join("\n");
-      $("srv-enable-doh").checked = !!srv.enable_doh;
+      $("srv-enable-doh").checked = role === "server" && !!srv.enable_doh;
+      if ($("srv-enable-doh-wrap")) {
+        $("srv-enable-doh-wrap").classList.toggle("hidden", role !== "server");
+      }
       renderSocks5Table();
     }
     renderExtraTable();
@@ -1312,12 +1332,31 @@
     c.routing.custom.ips = splitList($("custom-ips").value);
   }
 
+  function randomClientDoHPath() {
+    var bytes = new Uint8Array(3);
+    if (window.crypto && window.crypto.getRandomValues) {
+      window.crypto.getRandomValues(bytes);
+    } else {
+      for (var i = 0; i < 3; i++) { bytes[i] = Math.floor(Math.random() * 256); }
+    }
+    var hex = "";
+    for (var j = 0; j < bytes.length; j++) {
+      hex += ("0" + bytes[j].toString(16)).slice(-2);
+    }
+    return "/dq-" + hex;
+  }
+
   function collectDNSFromUI() {
     var d = currentState.client.dns;
     d.block_ads = $("dns-block-ads").checked;
     d.block_external_53 = $("dns-block53").checked;
     currentState.system.enable_ipv6 = $("dns-ipv6").checked;
     currentState.system.auto_update_rules = $("dns-auto-rules").checked;
+    d.enable_doh_server = $("dns-enable-doh-server").checked;
+    var dohPath = $("dns-doh-server-path").value.trim();
+    if (dohPath && dohPath.charAt(0) !== "/") { dohPath = "/" + dohPath; }
+    if (d.enable_doh_server && !dohPath) { dohPath = randomClientDoHPath(); }
+    d.doh_server_path = dohPath;
     d.china_servers = splitList($("dns-china").value);
     d.doh_servers = splitList($("dns-doh").value);
     var hosts = {};
@@ -1397,7 +1436,7 @@
     srv.path = $("srv-path").value.trim();
     srv.camouflage_dir = $("srv-camo-dir").value.trim();
     srv.uuids = splitList($("srv-uuids").value);
-    srv.enable_doh = $("srv-enable-doh").checked;
+    srv.enable_doh = (currentState.role === "server") ? $("srv-enable-doh").checked : false;
   }
 
   function collectRproxySFromUI() {
@@ -1625,6 +1664,35 @@
   });
   $("btn-server-doh-qr").addEventListener("click", function () {
     showQRModal("服务端 DoH 端点", statusInfo && statusInfo.doh_url);
+  });
+  if ($("btn-copy-client-install")) {
+    $("btn-copy-client-install").addEventListener("click", function () {
+      var cmd = statusInfo && statusInfo.client_bootstrap_cmd;
+      if (!cmd) { showToast("暂无可用对接命令", true); return; }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(cmd).then(function () {
+          showToast("已复制 Client 一键安装对接命令");
+        }).catch(function () {
+          showQRModal("Client 一键安装对接命令", cmd);
+        });
+      } else {
+        showQRModal("Client 一键安装对接命令", cmd);
+      }
+    });
+  }
+  $("dns-enable-doh-server").addEventListener("change", function () {
+    $("dns-doh-server-box").classList.toggle("hidden", !$("dns-enable-doh-server").checked);
+    if ($("dns-enable-doh-server").checked && !$("dns-doh-server-path").value.trim()) {
+      $("dns-doh-server-path").value = randomClientDoHPath();
+    }
+  });
+  $("btn-gen-client-doh-path").addEventListener("click", function () {
+    $("dns-doh-server-path").value = randomClientDoHPath();
+  });
+  $("btn-client-doh-qr").addEventListener("click", function () {
+    var u = (statusInfo && statusInfo.doh_url) || $("dns-doh-server-url").value;
+    if (!u) { showToast("请先保存并应用以生成本机 DoH 地址", true); return; }
+    showQRModal("网关本机 DoH 端点", u);
   });
 
   $("btn-add-node").addEventListener("click", function () { openNodeModal(null, -1); });
