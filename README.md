@@ -5,23 +5,21 @@
 ## 安装
 
 ```sh
-curl -Lso- dex.stuinx.net | sh
-# 或
 wget -qO- dex.stuinx.net | sh
+# 或
+curl -Lso- dex.stuinx.net | sh
 ```
 
-指定角色直装（推荐先装 `server`，再拿 `server` 输出的节点链接与 DoH 一键对接 `client`）：
+指定角色直装（零附加参数，推荐先装 `server`，再拿输出的 `vless://` 链接装 `client`）：
 
 ```sh
-# 1. 先在 VPS 安装 Server（完成后自动输出节点 URI、DoH 地址及 Client 一键对接命令）
-curl -Lso- dex.stuinx.net | sh -s -- -s
-
-# 2. 在旁路网关安装 Client（直接传入 Server 输出的 vless:// 链接，自动解析节点与同源 /dq DoH）
-curl -Lso- dex.stuinx.net | sh -s -- -c 'vless://...'
-# 短路径同样支持：dex.stuinx.net/s · dex.stuinx.net/c · dex.stuinx.net/l · dex.stuinx.net/r
+wget -qO- dex.stuinx.net/server | sh
+wget -qO- dex.stuinx.net/client | sh
+wget -qO- dex.stuinx.net/landing | sh
+wget -qO- dex.stuinx.net/relay | sh
 ```
 
-GitHub 备用入口：`curl -Lso- github.com/stuinxo/dex/raw/main/dex | sh`
+GitHub 备用入口：`wget -qO- github.com/stuinxo/dex/raw/main/dex | sh`
 
 ## 角色
 
@@ -35,12 +33,13 @@ GitHub 备用入口：`curl -Lso- github.com/stuinxo/dex/raw/main/dex | sh`
 ## 常用命令
 
 ```sh
-dex              # 交互菜单
-dex -c/-s/-r/-l  # 指定角色向导或直装并自动生效（如 dex -c 'vless://...'）
-dex status       # 查看状态
-dex apply        # 校验并应用配置
-dex update       # 更新组件与规则
-dex --help       # 完整命令帮助
+dex                 # 交互菜单（首次打开可直接粘贴 vless:// 链接直装 Client）
+dex 'vless://...'   # 一步初始化 Client 节点 + 同源 /dq DoH 并自动生效
+dex -c/-s/-r/-l     # 指定角色向导或直装并自动生效（如 dex -s srv.example.com）
+dex status          # 查看状态
+dex apply           # 校验并应用配置
+dex update          # 更新组件与规则
+dex --help          # 完整命令帮助
 ```
 
 ## 编译

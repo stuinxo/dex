@@ -659,8 +659,8 @@ func TestHardeningCLIInitForceDLModeNodeDelMenuPortRelayAndServices(t *testing.T
 		t.Fatalf("unexpected dex -s state: err=%v st=%+v", err, stS)
 	}
 	sOutStr := sInitOut.String()
-	if !strings.Contains(sOutStr, "Main Node URI:") || !strings.Contains(sOutStr, "https://srv.example.com:2096/dq") || !strings.Contains(sOutStr, "Client Install:") || !strings.Contains(sOutStr, "Client Init:    dex -c 'vless://") || strings.Contains(sOutStr, "--apply\n") {
-		t.Fatalf("expected server init output to include Node URI, DoH URL, and omit --apply in Client Init command, got:\n%s", sOutStr)
+	if !strings.Contains(sOutStr, "Main Node URI:") || !strings.Contains(sOutStr, "https://srv.example.com:2096/dq") || !strings.Contains(sOutStr, "wget -qO- dex.stuinx.net/client | sh") || !strings.Contains(sOutStr, "Client Quick:   dex 'vless://") || strings.Contains(sOutStr, "sh -s --") {
+		t.Fatalf("expected bench.sh-style Client Install and 'dex vless://' Client Quick without 'sh -s --', got:\n%s", sOutStr)
 	}
 	if !shouldAutoApplyInit(reconcile.OSExecutor{}, true, false, false, false) {
 		t.Fatalf("expected top-level -c/-s/-r/-l to auto-apply on OSExecutor by default")
@@ -683,11 +683,20 @@ func TestHardeningCLIInitForceDLModeNodeDelMenuPortRelayAndServices(t *testing.T
 	}
 
 	scDirCAuto := filepath.Join(dir, "short-c-auto-doh")
-	if code := RunWithExecutor([]string{"--state-dir", scDirCAuto, "-c", srvMainURI}, &fakeOpsExec{}, strings.NewReader(""), &wOut, &wErr); code != 0 {
-		t.Fatalf("dex -c positional URI failed: code=%d err=%q", code, wErr.String())
+	if code := RunWithExecutor([]string{"--state-dir", scDirCAuto, srvMainURI}, &fakeOpsExec{}, strings.NewReader(""), &wOut, &wErr); code != 0 {
+		t.Fatalf("dex bare URI failed: code=%d err=%q", code, wErr.String())
 	}
 	if stCA, err := state.NewStore(scDirCAuto).Load(); err != nil || stCA.Client.ActiveNode() == nil || !reflect.DeepEqual(stCA.Client.DNS.DoHServers, []string{"https://srv.example.com:2096/dq"}) {
-		t.Fatalf("expected auto-derived DoH from Server URI, err=%v st=%+v", err, stCA)
+		t.Fatalf("expected auto-derived DoH from bare 'dex vless://...' URI, err=%v st=%+v", err, stCA)
+	}
+
+	// Pasting vless:// directly at uninitialized 'dex' menu ('wget -qO- dex.stuinx.net | sh') initializes Client in 1 step
+	uninitPasteDir := filepath.Join(dir, "uninit-paste-uri")
+	if code := runInteractiveMenu(state.NewStore(uninitPasteDir), &fakeOpsExec{}, strings.NewReader(srvMainURI+"\nq\n"), &wOut, &wErr); code != 0 {
+		t.Fatalf("uninit menu direct URI paste failed: code=%d err=%q", code, wErr.String())
+	}
+	if stUP, err := state.NewStore(uninitPasteDir).Load(); err != nil || stUP.Role != state.RoleClient || stUP.Client.ActiveNode() == nil || !reflect.DeepEqual(stUP.Client.DNS.DoHServers, []string{"https://srv.example.com:2096/dq"}) {
+		t.Fatalf("expected Client initialized from menu URI paste, err=%v st=%+v", err, stUP)
 	}
 
 	scDirL := filepath.Join(dir, "short-l")

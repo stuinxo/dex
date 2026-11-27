@@ -435,12 +435,15 @@ suggest_doh_from_uri() {
 }
 
 main() {
+  if [ "${DEX_INSTALL_LIB_ONLY:-0}" = "1" ]; then
+    return 0
+  fi
   if [ "${1:-}" = "--" ]; then
     shift
   fi
   case "${1:-}" in
     -h|--help|help)
-      say "Usage: curl -Lso- dex.stuinx.net | sh -s -- [-c|-s|-r|-l | client|server|relay|landing] [options]"
+      say "Usage: wget -qO- dex.stuinx.net | sh   (or dex.stuinx.net/server | dex.stuinx.net/client)"
       return 0
       ;;
   esac
@@ -456,6 +459,10 @@ main() {
     shift
   fi
   case "$role" in
+    vless://*|vmess://*|socks5://*)
+      set -- "$role" "$@"
+      role="client"
+      ;;
     client|-c|--client|c) role="client" ;;
     server|-s|--server|s) role="server" ;;
     relay|-r|--relay|r)   role="relay" ;;
@@ -533,10 +540,10 @@ main() {
             client_doh=$(suggest_doh_from_uri "$client_node")
           fi
           if [ -z "$client_node" ] && [ "${DEX_ALLOW_NO_NODE:-0}" != "1" ]; then
-            die "Client install requires Server node URI: pass 'sh -s -- -c <vless://...>' (shown on Server)."
+            die "Client install requires Server node URI: run 'wget -qO- dex.stuinx.net/client | sh' interactively or pass a vless:// URI."
           fi
           if [ -z "$client_doh" ] && [ "${DEX_ALLOW_DEFAULT_DOH:-0}" != "1" ]; then
-            die "Client install requires self-hosted DoH: pass 'sh -s -- -c <vless://...> --doh <https://.../dq>' or set DEX_DOH=<url>."
+            die "Client install requires self-hosted DoH: pass --doh <https://.../dq> or set DEX_DOH=<url>."
           fi
         fi
       fi
@@ -627,13 +634,13 @@ main() {
         say "[+] DEX installed. Opening interactive menu..."
         exec "$INSTALL_BIN" </dev/tty
       else
-        say "[+] DEX installed. Run 'dex' to open menu, or pass a role: curl -Lso- dex.stuinx.net | sh -s -- [-c|-s|-r|-l]"
+        say "[+] DEX installed. Run 'dex' to open menu (or 'wget -qO- dex.stuinx.net/server | sh' / 'dex.stuinx.net/client | sh')."
       fi
       ;;
     *)
-      die "Usage: curl -Lso- github.com/${DEX_REPO}/raw/main/i | sh -s -- [-c|-s|-r|-l | client|server|relay|landing]"
+      die "Usage: wget -qO- dex.stuinx.net | sh   (or dex.stuinx.net/[client|server|landing|relay] | sh)"
       ;;
   esac
 }
 
-[ "${DEX_INSTALL_LIB_ONLY:-0}" = "1" ] || main "$@"
+main "$@"

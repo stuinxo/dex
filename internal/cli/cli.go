@@ -131,6 +131,9 @@ func RunWithExecutor(args []string, exec reconcile.SystemExecutor, stdin io.Read
 	case "serve-doh":
 		return cmdServeDoH(rest, stdout, stderr)
 	default:
+		if isShareNodeURI(sub) {
+			return dispatchRoleFlag(store, exec, state.RoleClient, args, stdin, stdout, stderr)
+		}
 		fmt.Fprintf(stderr, "unknown command %q\n\n", sub)
 		printUsage(stderr)
 		return 2
@@ -142,9 +145,11 @@ func printUsage(w io.Writer) {
 
 Usage:
   dex [--state-dir DIR] [command] [flags]
+  dex 'vless://...'
   dex [-c|-s|-r|-l] [flags]
 
 Role Shortcuts:
+  'vless://...'         Initialize & apply client role directly from Server share URI (auto-derives /dq DoH)
   -c, --client          Initialize & apply client role (wizard if no args, e.g. dex -c 'vless://...')
   -s, --server          Initialize & apply server role (wizard if no args, e.g. dex -s srv.example.com)
   -r, --relay           Initialize & apply relay role (wizard if no args, or pass --no-apply to skip apply)
@@ -312,10 +317,10 @@ func printServerClientBootstrapInfo(w io.Writer, store *state.Store, st *state.S
 		fmt.Fprintln(w, "DoH URL:        (本角色未启用 DoH，Client 需另填其它 Server 的自建 DoH)")
 	}
 	if installCmd != "" {
-		fmt.Fprintf(w, "Client Install: %s\n", installCmd)
+		fmt.Fprintf(w, "Client Install: %s   (运行后粘贴上方 Main Node URI 即可)\n", installCmd)
 	}
 	if initCmd != "" {
-		fmt.Fprintf(w, "Client Init:    %s\n", initCmd)
+		fmt.Fprintf(w, "Client Quick:   %s\n", initCmd)
 	}
 	if store != nil {
 		certFile, keyFile := resolveActiveCertPaths(store, st)

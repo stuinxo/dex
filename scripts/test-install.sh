@@ -408,11 +408,11 @@ else
   fi
 fi
 
-# 5e. Role shorthand flags (-s, -r, -l, -h) in install.sh
-if sh "$INSTALL_SCRIPT" -h | grep -q -- "-c|-s|-r|-l"; then
-  pass "Install script -h prints shorthand role usage without root"
+# 5e. Entrypoint ends with 'main "$@"' (Cloudflare Worker compatible) and supports role shorthands
+if [ "$(tail -n 1 "$INSTALL_SCRIPT")" = 'main "$@"' ] && sh "$INSTALL_SCRIPT" -h | grep -q "wget -qO- dex.stuinx.net | sh"; then
+  pass "Install script ends with 'main \"\$@\"' and prints bench.sh-style usage"
 else
-  fail "Install script -h failed"
+  fail "Install script entrypoint or -h usage check failed"
 fi
 
 mkdir -p "$STATE_A/rules"

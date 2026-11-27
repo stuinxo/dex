@@ -174,7 +174,7 @@ func runInteractiveMenu(store *state.Store, exec reconcile.SystemExecutor, stdin
 		if st == nil {
 			fmt.Fprintf(stdout, "内核: %s\n", kernLine)
 			fmt.Fprint(stdout, `
- 1. 初始化安装 DEX       (Client / Server / Landing / Relay)
+ 1. 初始化安装 DEX       (或直接输入 c / s / l / r，或粘贴 vless:// 链接直装 Client)
  2. 内核管理             (查看状态 / 安装 Zabbly 主线内核)
  0. 更新 DEX 主程序
  q. 退出
@@ -184,9 +184,21 @@ func runInteractiveMenu(store *state.Store, exec reconcile.SystemExecutor, stdin
 			if !ok || strings.EqualFold(choice, "q") {
 				return 0
 			}
-			switch choice {
+			if isShareNodeURI(choice) {
+				dispatchRoleFlag(store, exec, state.RoleClient, []string{choice}, stdin, stdout, stderr)
+				continue
+			}
+			switch strings.ToLower(choice) {
 			case "1":
 				menuInitWizard(store, exec, p, stdout, stderr)
+			case "c", "-c", "client":
+				_ = menuInitWizardForRole(store, exec, state.RoleClient, p, stdout, stderr)
+			case "s", "-s", "server":
+				_ = menuInitWizardForRole(store, exec, state.RoleServer, p, stdout, stderr)
+			case "l", "-l", "landing":
+				_ = menuInitWizardForRole(store, exec, state.RoleLanding, p, stdout, stderr)
+			case "r", "-r", "relay":
+				_ = menuInitWizardForRole(store, exec, state.RoleRelay, p, stdout, stderr)
 			case "2":
 				menuKernelManager(exec, p, stdout, stderr)
 			case "0":

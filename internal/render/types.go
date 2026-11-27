@@ -402,29 +402,19 @@ func DeriveServerDoHFromNode(n state.OutboundNode) string {
 	return "https://" + formatHTTPSAuthority(host, n.Port) + "/dq"
 }
 
-// BuildClientBootstrapCommand returns the one-line client install command pre-populated
-// with this server's primary node URI (Client auto-derives https://<sni>[:port]/dq when Server DoH is enabled).
+// BuildClientBootstrapCommand returns the zero-flag bench.sh-style client install command.
 func BuildClientBootstrapCommand(s *state.State, fallbackHost string) string {
 	if s == nil || (s.Role != state.RoleServer && s.Role != state.RoleLanding) {
 		return ""
 	}
-	mainURI := BuildServerMainURI(s)
-	if mainURI == "" {
+	if BuildServerMainURI(s) == "" {
 		return ""
 	}
-	if dohURL := BuildDoHURL(s, fallbackHost); dohURL != "" {
-		if parsed, err := ParseNodeURI(mainURI); err == nil && DeriveServerDoHFromNode(parsed) == dohURL {
-			return fmt.Sprintf("curl -Lso- dex.stuinx.net | sh -s -- -c %s", shellSingleQuote(mainURI))
-		}
-		return fmt.Sprintf("curl -Lso- dex.stuinx.net | sh -s -- -c %s --doh %s",
-			shellSingleQuote(mainURI), shellSingleQuote(dohURL))
-	}
-	return fmt.Sprintf("curl -Lso- dex.stuinx.net | sh -s -- -c %s --doh '<自建DoH地址>'",
-		shellSingleQuote(mainURI))
+	return "wget -qO- dex.stuinx.net/client | sh"
 }
 
-// BuildClientInitCommand returns the 'dex -c ...' command for an already-installed client binary
-// (top-level '-c' automatically applies configuration on the host).
+// BuildClientInitCommand returns the 'dex <vless://...>' one-step command for an installed client binary
+// (automatically extracts active node + Server /dq DoH and applies configuration on the host).
 func BuildClientInitCommand(s *state.State, fallbackHost string) string {
 	if s == nil || (s.Role != state.RoleServer && s.Role != state.RoleLanding) {
 		return ""
@@ -435,12 +425,12 @@ func BuildClientInitCommand(s *state.State, fallbackHost string) string {
 	}
 	if dohURL := BuildDoHURL(s, fallbackHost); dohURL != "" {
 		if parsed, err := ParseNodeURI(mainURI); err == nil && DeriveServerDoHFromNode(parsed) == dohURL {
-			return fmt.Sprintf("dex -c %s", shellSingleQuote(mainURI))
+			return fmt.Sprintf("dex %s", shellSingleQuote(mainURI))
 		}
-		return fmt.Sprintf("dex -c %s --doh %s",
+		return fmt.Sprintf("dex %s --doh %s",
 			shellSingleQuote(mainURI), shellSingleQuote(dohURL))
 	}
-	return fmt.Sprintf("dex -c %s --doh '<自建DoH地址>'",
+	return fmt.Sprintf("dex %s --doh '<自建DoH地址>'",
 		shellSingleQuote(mainURI))
 }
 
