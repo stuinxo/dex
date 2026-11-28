@@ -1393,3 +1393,30 @@ func TestHasContainerEnvFile(t *testing.T) {
 		t.Fatalf("expected missing file to return false")
 	}
 }
+
+func TestRenderCertificateOverrides(t *testing.T) {
+	store := state.NewStore(t.TempDir())
+	st := state.NewDefaultState(state.RoleClient)
+	st.Cert.Mode = "imported"
+	st.Cert.CertFile = "/external/cert.pem"
+	st.Cert.KeyFile = "/external/key.pem"
+	for _, tc := range []struct{ cert, key string }{
+		{},
+		{cert: "/override/cert.pem"},
+		{key: "/override/key.pem"},
+		{cert: "/override/cert.pem", key: "/override/key.pem"},
+	} {
+		opts := ApplyOptions{RenderOpts: render.RenderOptions{CertFile: tc.cert, KeyFile: tc.key}}
+		got, _ := populateRenderOptions(context.Background(), st, store, &mockExecutor{}, opts)
+		wantCert, wantKey := st.Cert.CertFile, st.Cert.KeyFile
+		if tc.cert != "" {
+			wantCert = tc.cert
+		}
+		if tc.key != "" {
+			wantKey = tc.key
+		}
+		if got.CertFile != wantCert || got.KeyFile != wantKey {
+			t.Fatalf("overrides %#v resolved to %q/%q, want %q/%q", tc, got.CertFile, got.KeyFile, wantCert, wantKey)
+		}
+	}
+}

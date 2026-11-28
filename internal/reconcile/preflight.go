@@ -72,7 +72,7 @@ func dryRunPreflight(ctx context.Context, exec SystemExecutor, store *state.Stor
 
 	dryRopts := ropts
 	dryFiles := bundle.Files
-	if !HasCustomExternalCert(store, st) {
+	if !store.HasCustomExternalCert(st) {
 		certDisk := fsutil.MapRootPrefix(rootPrefix, ropts.CertFile)
 		keyDisk := fsutil.MapRootPrefix(rootPrefix, ropts.KeyFile)
 		_, errC := os.Stat(certDisk)

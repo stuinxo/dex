@@ -224,7 +224,7 @@ func TestStoreWithApplyLockWaitWarning(t *testing.T) {
 	release := make(chan struct{})
 	done1 := make(chan error, 1)
 	go func() {
-		done1 <- st.WithApplyLock(context.Background(), func() error {
+		done1 <- st.WithApplyLock(context.Background(), func(*Store) error {
 			close(holding)
 			<-release
 			return nil
@@ -237,7 +237,7 @@ func TestStoreWithApplyLockWaitWarning(t *testing.T) {
 		close(release)
 	}()
 
-	if err := st.WithApplyLock(context.Background(), func() error {
+	if err := st.WithApplyLock(context.Background(), func(*Store) error {
 		return nil
 	}); err != nil {
 		t.Fatalf("second WithApplyLock failed: %v", err)

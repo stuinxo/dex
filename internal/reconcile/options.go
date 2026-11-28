@@ -75,11 +75,14 @@ func populateRenderOptions(ctx context.Context, st *state.State, store *state.St
 	if ropts.GeneratedDir == "" {
 		ropts.GeneratedDir = store.GeneratedDir()
 	}
-	if ropts.CertFile == "" {
-		ropts.CertFile, _ = ResolveActiveCertPaths(store, st)
-	}
-	if ropts.KeyFile == "" {
-		_, ropts.KeyFile = ResolveActiveCertPaths(store, st)
+	if ropts.CertFile == "" || ropts.KeyFile == "" {
+		certFile, keyFile := store.ActiveCertPaths(st)
+		if ropts.CertFile == "" {
+			ropts.CertFile = certFile
+		}
+		if ropts.KeyFile == "" {
+			ropts.KeyFile = keyFile
+		}
 	}
 	ropts = ropts.WithDefaults()
 

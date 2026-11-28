@@ -34,7 +34,7 @@ func cmdCert(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 func cmdCertWithOpts(store *state.Store, exec reconcile.SystemExecutor, applyOpts reconcile.ApplyOptions, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "inspect" {
 		st, _ := store.Load()
-		certFile, keyFile := reconcile.ResolveActiveCertPaths(store, st)
+		certFile, keyFile := store.ActiveCertPaths(st)
 		if applyOpts.RootPrefix != "" {
 			certFile = fsutil.MapRootPrefix(applyOpts.RootPrefix, certFile)
 			keyFile = fsutil.MapRootPrefix(applyOpts.RootPrefix, keyFile)
@@ -77,7 +77,7 @@ func cmdCertWithOpts(store *state.Store, exec reconcile.SystemExecutor, applyOpt
 		if fs.NArg() > 0 && cn == "localhost" {
 			cn = fs.Arg(0)
 		}
-		if _, _, _, err := reconcile.SelfSignCertAndSync(context.Background(), store, exec, applyOpts, cn, *force, true, stdout); err != nil {
+		if _, _, _, err := reconcile.SelfSignCertAndSync(context.Background(), store, exec, applyOpts, cn, *force, true, stdout, nil); err != nil {
 			fmt.Fprintf(stderr, "self-sign failed: %v\n", err)
 			return 1
 		}
@@ -89,7 +89,7 @@ func cmdCertWithOpts(store *state.Store, exec reconcile.SystemExecutor, applyOpt
 			return 2
 		}
 		allowSelf := len(rest) > 2 && rest[2] == "--allow-self-signed"
-		rep, changed, _, err := reconcile.ImportCertAndSync(context.Background(), store, exec, applyOpts, rest[0], rest[1], allowSelf, true, stdout)
+		rep, changed, _, err := reconcile.ImportCertAndSync(context.Background(), store, exec, applyOpts, rest[0], rest[1], allowSelf, true, stdout, nil)
 		if err != nil {
 			fmt.Fprintf(stderr, "import failed: %v\n", err)
 			return 1
@@ -329,12 +329,7 @@ func cmdDaemon(store *state.Store, exec reconcile.SystemExecutor, args []string,
 			errCh <- httpSrv.ListenAndServe()
 			return
 		}
-		cer := store.DefaultCert()
-		key := store.DefaultKey()
-		if st.Cert.Mode == "imported" && st.Cert.CertFile != "" && st.Cert.KeyFile != "" {
-			cer = st.Cert.CertFile
-			key = st.Cert.KeyFile
-		}
+		cer, key := store.ActiveCertPaths(st)
 		if err := cert.EnsureSelfSigned(cer, key, st.Auth.ServerName); err != nil {
 			errCh <- err
 			return

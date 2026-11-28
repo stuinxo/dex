@@ -13,29 +13,6 @@ import (
 	"github.com/stuinxo/dex/internal/state"
 )
 
-// ResolveActiveCertPaths returns the active TLS certificate and key paths for st,
-// preferring external imported paths when configured and falling back to Store defaults.
-func ResolveActiveCertPaths(store *state.Store, st *state.State) (string, string) {
-	if store == nil {
-		return "", ""
-	}
-	if st != nil && st.Cert.Mode == "imported" && st.Cert.CertFile != "" && st.Cert.KeyFile != "" {
-		return st.Cert.CertFile, st.Cert.KeyFile
-	}
-	return store.DefaultCert(), store.DefaultKey()
-}
-
-// HasCustomExternalCert reports whether st currently points to a custom external certificate/key pair
-// outside store.DefaultCert() / store.DefaultKey().
-func HasCustomExternalCert(store *state.Store, st *state.State) bool {
-	if st == nil || store == nil {
-		return false
-	}
-	return st.Cert.Mode == "imported" &&
-		((st.Cert.CertFile != "" && st.Cert.CertFile != store.DefaultCert()) ||
-			(st.Cert.KeyFile != "" && st.Cert.KeyFile != store.DefaultKey()))
-}
-
 // ReloadCertConsumers reloads or restarts active TLS consumers (nginx, dex-xray, and optionally dex-daemon).
 func ReloadCertConsumers(ctx context.Context, exec SystemExecutor, includeDaemon bool, stdout io.Writer) {
 	if exec == nil {
@@ -62,6 +39,14 @@ func ReloadCertConsumers(ctx context.Context, exec SystemExecutor, includeDaemon
 			fmt.Fprintln(stdout, "Reloaded TLS consumers: dex-daemon")
 		}
 	}
+}
+
+func runCertReload(ctx context.Context, exec SystemExecutor, includeDaemon bool, stdout io.Writer, reloadFn func(context.Context)) {
+	if reloadFn != nil {
+		reloadFn(ctx)
+		return
+	}
+	ReloadCertConsumers(ctx, exec, includeDaemon, stdout)
 }
 
 // CleanupTProxyPolicyRoutes removes dex fwmark 0x9 policy routing rules and flushes table 220 across IPv4/IPv6.
@@ -101,10 +86,11 @@ type IssueACMEParams struct {
 	ReloadCmd     string
 	IncludeDaemon bool
 	LogOut        io.Writer
+	ReloadFn      func(context.Context) // optional override invoked once instead of default ReloadCertConsumers
 }
 
-// IssueACMEAndSync issues an ACME certificate (Cloudflare DNS-01 or HTTP-01), updates state,
-// reconciles configs if transitioning away from an external cert path, and reloads active TLS consumers.
+// IssueACMEAndSync issues an ACME certificate (Cloudflare DNS-01 or HTTP-01), atomically updates state
+// and reconciles if transitioning away from an external cert path, then reloads active TLS consumers once.
 func IssueACMEAndSync(
 	ctx context.Context,
 	store *state.Store,
@@ -171,38 +157,31 @@ func IssueACMEAndSync(
 	}
 
 	if stErr == nil && st != nil {
-		hadCustomExternal := HasCustomExternalCert(store, st)
-		if _, uerr := store.Update(st.Role, func(cur *state.State) error {
-			cur.Cert.Mode = certMode
-			cur.Cert.Domain = dom
-			cur.Cert.CertFile = ""
-			cur.Cert.KeyFile = ""
-			cur.Cert.AutoRenew = autoRenew
-			if certMode == "acme_http" {
-				// HTTP-01 does not rely on CF API tokens
-			} else if autoRenew {
-				cur.Cert.CFToken = tok
-				cur.Cert.CFEmail = email
-			} else {
-				cur.Cert.CFToken = ""
-				cur.Cert.CFEmail = ""
+		if lerr := store.WithApplyLock(ctx, func(locked *state.Store) error {
+			var hadCustomExternal bool
+			if _, uerr := locked.Update(st.Role, func(cur *state.State) error {
+				hadCustomExternal = locked.HasCustomExternalCert(cur)
+				cur.Cert.UseACME(certMode, dom, autoRenew, tok, email)
+				return nil
+			}); uerr != nil {
+				return fmt.Errorf("update state after issue: %w", uerr)
+			}
+			if hadCustomExternal {
+				if _, rerr := Reconcile(ctx, locked, exec, applyOpts); rerr != nil {
+					return fmt.Errorf("reconcile after cert issue: %w", rerr)
+				}
 			}
 			return nil
-		}); uerr != nil {
-			return nil, "", fmt.Errorf("update state after issue: %w", uerr)
-		}
-		if hadCustomExternal {
-			if _, rerr := Reconcile(ctx, store, exec, applyOpts); rerr != nil {
-				return nil, "", fmt.Errorf("reconcile after cert issue: %w", rerr)
-			}
+		}); lerr != nil {
+			return nil, "", lerr
 		}
 	}
-	ReloadCertConsumers(ctx, exec, p.IncludeDaemon, p.LogOut)
+	runCertReload(ctx, exec, p.IncludeDaemon, p.LogOut, p.ReloadFn)
 	return rep, dom, nil
 }
 
-// ImportCertAndSync validates and installs external cert/key files into Store defaults, updates state,
-// reconciles if switching away from custom external paths, and reloads active TLS consumers.
+// ImportCertAndSync validates and installs external cert/key files into Store defaults, atomically updates state
+// and reconciles if switching away from custom external paths, then reloads active TLS consumers once.
 func ImportCertAndSync(
 	ctx context.Context,
 	store *state.Store,
@@ -212,6 +191,7 @@ func ImportCertAndSync(
 	allowSelfSigned bool,
 	includeDaemon bool,
 	logOut io.Writer,
+	reloadFn func(context.Context),
 ) (*cert.CertReport, bool, bool, error) {
 	st, stErr := store.Load()
 	if stErr != nil && !errors.Is(stErr, state.ErrNotFound) {
@@ -230,29 +210,32 @@ func ImportCertAndSync(
 
 	pathsChanged := false
 	if st != nil {
-		pathsChanged = HasCustomExternalCert(store, st)
-		if _, uerr := store.Update(st.Role, func(cur *state.State) error {
-			cur.Cert.Mode = "imported"
-			cur.Cert.CertFile = store.DefaultCert()
-			cur.Cert.KeyFile = store.DefaultKey()
-			return nil
-		}); uerr != nil {
-			return nil, false, false, fmt.Errorf("update state after import: %w", uerr)
-		}
-		if pathsChanged {
-			if _, rerr := Reconcile(ctx, store, exec, applyOpts); rerr != nil {
-				return nil, false, false, fmt.Errorf("reconcile after cert import: %w", rerr)
+		if lerr := store.WithApplyLock(ctx, func(locked *state.Store) error {
+			if _, uerr := locked.Update(st.Role, func(cur *state.State) error {
+				pathsChanged = locked.HasCustomExternalCert(cur)
+				cur.Cert.UseImported(locked.DefaultCert(), locked.DefaultKey())
+				return nil
+			}); uerr != nil {
+				return fmt.Errorf("update state after import: %w", uerr)
 			}
+			if pathsChanged {
+				if _, rerr := Reconcile(ctx, locked, exec, applyOpts); rerr != nil {
+					return fmt.Errorf("reconcile after cert import: %w", rerr)
+				}
+			}
+			return nil
+		}); lerr != nil {
+			return nil, false, false, lerr
 		}
 	}
 	if changed || pathsChanged {
-		ReloadCertConsumers(ctx, exec, includeDaemon, logOut)
+		runCertReload(ctx, exec, includeDaemon, logOut, reloadFn)
 	}
 	return rep, changed, pathsChanged, nil
 }
 
-// SelfSignCertAndSync generates or ensures a self-signed certificate pair, updates state to self_signed,
-// reconciles if transitioning from a custom external cert path, and reloads active TLS consumers.
+// SelfSignCertAndSync generates or ensures a self-signed certificate pair, atomically updates state to self_signed
+// and reconciles if transitioning from a custom external cert path, then reloads active TLS consumers once.
 func SelfSignCertAndSync(
 	ctx context.Context,
 	store *state.Store,
@@ -262,6 +245,7 @@ func SelfSignCertAndSync(
 	force bool,
 	includeDaemon bool,
 	logOut io.Writer,
+	reloadFn func(context.Context),
 ) (*cert.CertReport, bool, bool, error) {
 	st, stErr := store.Load()
 	if stErr != nil && !errors.Is(stErr, state.ErrNotFound) {
@@ -292,23 +276,26 @@ func SelfSignCertAndSync(
 
 	hadCustomExternal := false
 	if st != nil {
-		hadCustomExternal = HasCustomExternalCert(store, st)
-		if _, uerr := store.Update(st.Role, func(cur *state.State) error {
-			cur.Cert.Mode = "self_signed"
-			cur.Cert.CertFile = ""
-			cur.Cert.KeyFile = ""
-			return nil
-		}); uerr != nil {
-			return nil, false, false, fmt.Errorf("update state after self-sign: %w", uerr)
-		}
-		if hadCustomExternal {
-			if _, rerr := Reconcile(ctx, store, exec, applyOpts); rerr != nil {
-				return nil, false, false, fmt.Errorf("reconcile after self-sign: %w", rerr)
+		if lerr := store.WithApplyLock(ctx, func(locked *state.Store) error {
+			if _, uerr := locked.Update(st.Role, func(cur *state.State) error {
+				hadCustomExternal = locked.HasCustomExternalCert(cur)
+				cur.Cert.UseSelfSigned()
+				return nil
+			}); uerr != nil {
+				return fmt.Errorf("update state after self-sign: %w", uerr)
 			}
+			if hadCustomExternal {
+				if _, rerr := Reconcile(ctx, locked, exec, applyOpts); rerr != nil {
+					return fmt.Errorf("reconcile after self-sign: %w", rerr)
+				}
+			}
+			return nil
+		}); lerr != nil {
+			return nil, false, false, lerr
 		}
 	}
 	if certChanged || hadCustomExternal {
-		ReloadCertConsumers(ctx, exec, includeDaemon, logOut)
+		runCertReload(ctx, exec, includeDaemon, logOut, reloadFn)
 	}
 	cb, _ := os.ReadFile(store.DefaultCert())
 	kb, _ := os.ReadFile(store.DefaultKey())

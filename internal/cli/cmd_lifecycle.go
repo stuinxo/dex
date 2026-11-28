@@ -161,7 +161,7 @@ func printServerClientBootstrapInfo(w io.Writer, store *state.Store, st *state.S
 		fmt.Fprintf(w, "Client Quick:   %s\n", initCmd)
 	}
 	if store != nil {
-		certFile, keyFile := reconcile.ResolveActiveCertPaths(store, st)
+		certFile, keyFile := store.ActiveCertPaths(st)
 		if cb, err1 := os.ReadFile(certFile); err1 == nil {
 			if kb, err2 := os.ReadFile(keyFile); err2 == nil {
 				if rep, ierr := cert.InspectPair(cb, kb); ierr == nil && rep.SelfSigned {
@@ -541,7 +541,7 @@ func cmdStatus(store *state.Store, exec reconcile.SystemExecutor, stdout, stderr
 	if sum := serviceStatusSummary(exec, st); sum != "" {
 		fmt.Fprintf(stdout, "Services: %s\n", sum)
 	}
-	certFile, keyFile := reconcile.ResolveActiveCertPaths(store, st)
+	certFile, keyFile := store.ActiveCertPaths(st)
 	if cb, err1 := os.ReadFile(certFile); err1 == nil {
 		if kb, err2 := os.ReadFile(keyFile); err2 == nil {
 			if rep, ierr := cert.InspectPair(cb, kb); ierr == nil {

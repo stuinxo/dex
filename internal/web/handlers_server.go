@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
@@ -9,6 +10,13 @@ import (
 
 	"github.com/stuinxo/dex/internal/reconcile"
 )
+
+func (s *Server) certReloadHook() func(context.Context) {
+	if s.ReloadCertFn != nil {
+		return s.ReloadCertFn
+	}
+	return func(context.Context) {}
+}
 
 func (s *Server) handleTestSocks5(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
 	var req struct {
@@ -105,13 +113,11 @@ func (s *Server) handleCertIssue(w http.ResponseWriter, r *http.Request, _ *sess
 		AutoRenew:     &autoRenew,
 		ReloadCmd:     s.CertReloadCmd,
 		IncludeDaemon: false,
+		ReloadFn:      s.certReloadHook(),
 	})
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
-	}
-	if s.ReloadCertFn != nil {
-		s.ReloadCertFn(r.Context())
 	}
 	_ = st
 	s.Hub.Log("INFO", "cert", fmt.Sprintf("issued %s ACME cert for %s", mode, dom))
@@ -177,13 +183,10 @@ func (s *Server) handleCertImport(w http.ResponseWriter, r *http.Request, _ *ses
 		writeJSONError(w, http.StatusBadRequest, "cert_path/key_path or cert_pem/key_pem are required")
 		return
 	}
-	rep, changed, pathsChanged, err := reconcile.ImportCertAndSync(r.Context(), s.Store, s.Exec, s.ApplyOpts, srcCert, srcKey, req.AllowSelfSigned, false, nil)
+	rep, changed, pathsChanged, err := reconcile.ImportCertAndSync(r.Context(), s.Store, s.Exec, s.ApplyOpts, srcCert, srcKey, req.AllowSelfSigned, false, nil, s.certReloadHook())
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
-	}
-	if (changed || pathsChanged) && s.ReloadCertFn != nil {
-		s.ReloadCertFn(r.Context())
 	}
 	s.Hub.Log("INFO", "cert", fmt.Sprintf("imported certificate CN=%s changed=%v", rep.CommonName, changed))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "changed": changed, "cert": rep})
@@ -202,13 +205,10 @@ func (s *Server) handleCertSelfSign(w http.ResponseWriter, r *http.Request, _ *s
 	if req.Force != nil {
 		force = *req.Force
 	}
-	rep, _, _, err := reconcile.SelfSignCertAndSync(r.Context(), s.Store, s.Exec, s.ApplyOpts, req.CN, force, false, nil)
+	rep, _, _, err := reconcile.SelfSignCertAndSync(r.Context(), s.Store, s.Exec, s.ApplyOpts, req.CN, force, false, nil, s.certReloadHook())
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
-	}
-	if s.ReloadCertFn != nil {
-		s.ReloadCertFn(r.Context())
 	}
 	cn := ""
 	if rep != nil {

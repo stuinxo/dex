@@ -3,6 +3,7 @@ package reconcile
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -49,23 +50,23 @@ func UpdateAndReconcile(
 		updated *state.State
 		res     *ApplyResult
 	)
-	err := store.WithApplyLock(ctx, func() error {
+	err := store.WithApplyLock(ctx, func(store *state.Store) (retErr error) {
 		if err := store.BeginTxn(); err != nil {
 			return fmt.Errorf("begin txn: %w", err)
 		}
-		var uerr error
-		updated, uerr = store.Update(defaultRole, mutator)
-		if uerr != nil {
-			_, _ = store.RollbackTxn()
-			return uerr
+		defer func() {
+			if retErr != nil || opts.DryRun {
+				retErr = rollbackState(store, retErr)
+			}
+		}()
+		var err error
+		updated, err = store.Update(defaultRole, mutator)
+		if err != nil {
+			return err
 		}
 		opts.PreserveTxn = true
-		var rerr error
-		res, rerr = reconcileUnlocked(ctx, store, exec, opts)
-		if rerr != nil || opts.DryRun {
-			_, _ = store.RollbackTxn()
-		}
-		return rerr
+		res, err = reconcileUnlocked(ctx, store, exec, opts)
+		return err
 	})
 	if err != nil {
 		return nil, nil, err
@@ -80,7 +81,7 @@ func Reconcile(ctx context.Context, store *state.Store, exec SystemExecutor, opt
 		return reconcileUnlocked(ctx, store, exec, opts)
 	}
 	var res *ApplyResult
-	err := store.WithApplyLock(ctx, func() error {
+	err := store.WithApplyLock(ctx, func(store *state.Store) error {
 		var rerr error
 		res, rerr = reconcileUnlocked(ctx, store, exec, opts)
 		return rerr
@@ -91,7 +92,7 @@ func Reconcile(ctx context.Context, store *state.Store, exec SystemExecutor, opt
 	return res, nil
 }
 
-func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecutor, opts ApplyOptions) (*ApplyResult, error) {
+func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecutor, opts ApplyOptions) (_ *ApplyResult, retErr error) {
 	if exec == nil {
 		exec = OSExecutor{}
 	}
@@ -124,6 +125,11 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		if err := store.BeginTxn(); err != nil {
 			return nil, fmt.Errorf("begin txn: %w", err)
 		}
+		defer func() {
+			if retErr != nil {
+				retErr = rollbackState(store, retErr)
+			}
+		}()
 	}
 
 	prevManifest, err := LoadManifest(store.ManifestPath())
@@ -134,7 +140,6 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		if err := CheckUnmanagedEdits(prevManifest, bundle.Files, func(p string) string {
 			return fsutil.MapRootPrefix(opts.RootPrefix, p)
 		}); err != nil {
-			_, _ = store.RollbackTxn()
 			return nil, err
 		}
 	}
@@ -155,7 +160,6 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		}
 		if err := writeBytesExact(staged, f.Content, f.Mode); err != nil {
 			cleanupStaged()
-			_, _ = store.RollbackTxn()
 			return nil, fmt.Errorf("stage %s: %w", f.TargetPath, err)
 		}
 		stagedPaths[f.TargetPath] = staged
@@ -164,13 +168,11 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 	_, isOS := exec.(OSExecutor)
 	if err := ensureRequiredRuntimeTools(ctx, exec, ropts, bundle, isOS); err != nil {
 		cleanupStaged()
-		_, _ = store.RollbackTxn()
 		return nil, err
 	}
 
 	if err := preflightValidate(ctx, exec, ropts, stagedPaths, bundle.Files); err != nil {
 		cleanupStaged()
-		_, _ = store.RollbackTxn()
 		return nil, err
 	}
 
@@ -184,7 +186,6 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		if err := backupTargetFile(opts.RootPrefix, f.TargetPath, &backups); err != nil {
 			cleanupStaged()
 			rollbackFileBackups(backups)
-			_, _ = store.RollbackTxn()
 			return nil, fmt.Errorf("backup %s: %w", f.TargetPath, err)
 		}
 	}
@@ -195,7 +196,6 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		if err := backupTargetFile(opts.RootPrefix, oldTarget, &backups); err != nil {
 			cleanupStaged()
 			rollbackFileBackups(backups)
-			_, _ = store.RollbackTxn()
 			return nil, fmt.Errorf("backup obsolete %s: %w", oldTarget, err)
 		}
 	}
@@ -207,7 +207,6 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		if err := os.Rename(stagedPaths[f.TargetPath], diskPath); err != nil {
 			cleanupStaged()
 			rollbackFileBackups(backups)
-			_, _ = store.RollbackTxn()
 			return nil, fmt.Errorf("promote %s: %w", f.TargetPath, err)
 		}
 		res.FilesWritten = append(res.FilesWritten, f.TargetPath)
@@ -239,7 +238,6 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 	if bundle.NginxNeeded && exec.HasCommand("nginx") {
 		if out, err := exec.RunCommand(ctx, nil, "nginx", "-t"); err != nil {
 			rollbackFileBackups(backups)
-			_, _ = store.RollbackTxn()
 			return nil, fmt.Errorf("nginx -t failed (rolled back): %w (%s)", err, strings.TrimSpace(out))
 		}
 	}
@@ -247,7 +245,6 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 	orch := newServiceOrchestrator(ctx, store, exec, opts, st, ropts, bundle, changedFiles, obsoleteUnitPaths, certCreated, isOS, res)
 	if err := orch.apply(); err != nil {
 		orch.rollback(backups)
-		_, _ = store.RollbackTxn()
 		return nil, fmt.Errorf("apply services failed (rolled back): %w", err)
 	}
 
@@ -278,7 +275,7 @@ func ensureRuntimeArtifacts(store *state.Store, st *state.State, ropts render.Re
 			}
 		}
 	}
-	if HasCustomExternalCert(store, st) {
+	if store.HasCustomExternalCert(st) {
 		return false
 	}
 	certDisk := fsutil.MapRootPrefix(rootPrefix, ropts.CertFile)
@@ -333,4 +330,12 @@ func detectChangedFiles(rootPrefix string, files []render.RenderedFile, prevMani
 		}
 	}
 	return changed
+}
+
+// rollbackState preserves the operation error and reports failure to restore state.
+func rollbackState(store *state.Store, operationErr error) error {
+	if _, err := store.RollbackTxn(); err != nil {
+		return errors.Join(operationErr, fmt.Errorf("rollback state: %w", err))
+	}
+	return operationErr
 }

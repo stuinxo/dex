@@ -129,7 +129,7 @@ func readServerCertSummary(store *state.Store, st *state.State) string {
 	if store == nil || st == nil {
 		return "未找到"
 	}
-	certFile, keyFile := reconcile.ResolveActiveCertPaths(store, st)
+	certFile, keyFile := store.ActiveCertPaths(st)
 	cb, err1 := os.ReadFile(certFile)
 	kb, err2 := os.ReadFile(keyFile)
 	if err1 != nil || err2 != nil {

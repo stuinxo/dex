@@ -83,7 +83,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, _ *session
 	}
 
 	var certSummary any
-	certPath, keyPath := reconcile.ResolveActiveCertPaths(s.Store, st)
+	certPath, keyPath := s.Store.ActiveCertPaths(st)
 	if cb, e1 := os.ReadFile(certPath); e1 == nil {
 		if kb, e2 := os.ReadFile(keyPath); e2 == nil {
 			if rep, e3 := cert.InspectPair(cb, kb); e3 == nil {

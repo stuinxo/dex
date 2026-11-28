@@ -17,6 +17,7 @@ var ErrNotFound = errors.New("state file not found")
 
 // Store manages atomic, flock-serialized persistence for /etc/dex/state.json.
 type Store struct {
+	applyLocked     bool
 	Dir             string
 	OnApplyLockWait func() // optional callback invoked once if WithApplyLock waits >= 1s
 }
@@ -38,7 +39,12 @@ func (s *Store) ApplyLockPath() string { return filepath.Join(s.Dir, "apply.lock
 
 // WithApplyLock serializes full UpdateAndReconcile / Reconcile transactions across processes
 // and goroutines. Lock ordering invariant: apply.lock is strictly outer to state.lock.
-func (s *Store) WithApplyLock(ctx context.Context, fn func() error) error {
+// The callback must use the supplied Store for synchronous writes and must not retain it
+// or start asynchronous work using it beyond the callback lifetime.
+func (s *Store) WithApplyLock(ctx context.Context, fn func(*Store) error) error {
+	if s.applyLocked {
+		return fn(s)
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -77,13 +83,34 @@ func (s *Store) WithApplyLock(ctx context.Context, fn func() error) error {
 	}
 	defer func() { _ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN) }()
 
-	return fn()
+	locked := *s
+	locked.applyLocked = true
+	return fn(&locked)
 }
 func (s *Store) GeneratedDir() string { return filepath.Join(s.Dir, "generated") }
 func (s *Store) ManifestPath() string { return filepath.Join(s.Dir, "generated", "manifest.json") }
 func (s *Store) CertDir() string      { return filepath.Join(s.Dir, "ssl") }
 func (s *Store) DefaultCert() string  { return filepath.Join(s.Dir, "ssl", "dex.cer") }
 func (s *Store) DefaultKey() string   { return filepath.Join(s.Dir, "ssl", "dex.key") }
+
+// ActiveCertPaths resolves the configured imported pair or the store-managed pair.
+// A partial imported pair falls back as a unit to avoid mixing certificate sources.
+func (s *Store) ActiveCertPaths(st *State) (string, string) {
+	if st != nil && st.Cert.Mode == "imported" && st.Cert.CertFile != "" && st.Cert.KeyFile != "" {
+		return st.Cert.CertFile, st.Cert.KeyFile
+	}
+	return s.DefaultCert(), s.DefaultKey()
+}
+
+// HasCustomExternalCert reports whether st resolves via ActiveCertPaths to an external imported
+// certificate/key pair outside store.DefaultCert() / store.DefaultKey().
+func (s *Store) HasCustomExternalCert(st *State) bool {
+	if st == nil || s == nil {
+		return false
+	}
+	certPath, keyPath := s.ActiveCertPaths(st)
+	return certPath != s.DefaultCert() || keyPath != s.DefaultKey()
+}
 
 func (s *Store) ensureDir() error {
 	return os.MkdirAll(s.Dir, 0o755)
@@ -179,31 +206,35 @@ func (s *Store) saveUnlocked(st *State) error {
 	return fsutil.WriteJSONAtomic(s.StatePath(), st, 0o600)
 }
 
-// Save validates and atomically writes st to state.json under an exclusive flock.
+// Save serializes with apply, then validates and atomically writes st to state.json.
 func (s *Store) Save(st *State) error {
-	return s.withLock(true, func() error {
-		return s.saveUnlocked(st)
+	return s.WithApplyLock(context.Background(), func(locked *Store) error {
+		return locked.withLock(true, func() error {
+			return locked.saveUnlocked(st)
+		})
 	})
 }
 
-// Update atomically loads (or creates default if missing), applies mutator, validates, backs up, and writes state.json.
+// Update serializes with apply, then atomically loads (or creates default if missing), applies mutator, validates, backs up, and writes state.json.
 func (s *Store) Update(defaultRole string, mutator func(*State) error) (*State, error) {
 	var updated *State
-	err := s.withLock(true, func() error {
-		cur, err := s.loadUnlocked()
-		if errors.Is(err, ErrNotFound) {
-			cur = NewDefaultState(defaultRole)
-		} else if err != nil {
-			return err
-		}
-		if err := mutator(cur); err != nil {
-			return err
-		}
-		if err := s.saveUnlocked(cur); err != nil {
-			return err
-		}
-		updated = cur
-		return nil
+	err := s.WithApplyLock(context.Background(), func(locked *Store) error {
+		return locked.withLock(true, func() error {
+			cur, err := locked.loadUnlocked()
+			if errors.Is(err, ErrNotFound) {
+				cur = NewDefaultState(defaultRole)
+			} else if err != nil {
+				return err
+			}
+			if err := mutator(cur); err != nil {
+				return err
+			}
+			if err := locked.saveUnlocked(cur); err != nil {
+				return err
+			}
+			updated = cur
+			return nil
+		})
 	})
 	return updated, err
 }
@@ -215,7 +246,7 @@ func (s *Store) BeginTxn() error {
 		cur, err := s.loadUnlocked()
 		if errors.Is(err, ErrNotFound) {
 			_ = os.Remove(s.TxnPath())
-			return os.WriteFile(s.EmptyTxnPath(), []byte("empty\n"), 0o600)
+			return fsutil.WriteFileAtomic(s.EmptyTxnPath(), []byte("empty\n"), 0o600)
 		}
 		if err != nil {
 			return err
@@ -237,7 +268,7 @@ func (s *Store) CommitTxn() error {
 	})
 }
 
-// RollbackTxn restores state.json from state.json.txn if it exists,
+// RollbackTxn restores both state.json.bak and state.json from state.json.txn if it exists,
 // or removes state.json/state.json.bak if state.json.txn.empty was recorded.
 func (s *Store) RollbackTxn() (*State, error) {
 	var restored *State
@@ -258,6 +289,11 @@ func (s *Store) RollbackTxn() (*State, error) {
 				return nil
 			}
 			return err
+		}
+		// Restore backup first so a crash or primary-corrupt fallback cannot resurrect
+		// a rejected intermediate state recorded during the failed transaction.
+		if err := fsutil.WriteJSONAtomic(s.BackupPath(), txn, 0o600); err != nil {
+			return fmt.Errorf("restore backup: %w", err)
 		}
 		if err := fsutil.WriteJSONAtomic(s.StatePath(), txn, 0o600); err != nil {
 			return err
