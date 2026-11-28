@@ -20,6 +20,7 @@ jobs:
       - name: Shell syntax & safety checks
         run: |
           sh scripts/test-install.sh
+          node --check internal/web/ui/*.js
           ! grep -rn -- '--no-check-certificate' dex i scripts/ internal/ cmd/
           ! grep -rnE 'rm[[:space:]]+(-rf|-f)[[:space:]]+(/var/lib/(apt|dpkg)/.*lock|/var/cache/apt/archives/lock)' dex i scripts/
 

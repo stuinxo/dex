@@ -8,6 +8,7 @@ import (
 	"go/token"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -329,6 +330,27 @@ func TestNoGodFiles(t *testing.T) {
 		})
 		if err != nil {
 			t.Fatal(err)
+		}
+	}
+}
+
+func TestEmbeddedUIScriptSyntax(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed in PATH")
+	}
+	root := repoRoot(t)
+	scripts, err := filepath.Glob(filepath.Join(root, "internal/web/ui/*.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scripts) == 0 {
+		t.Fatal("no embedded UI scripts found")
+	}
+	for _, s := range scripts {
+		out, cerr := exec.Command(nodeBin, "--check", s).CombinedOutput()
+		if cerr != nil {
+			t.Errorf("JS syntax check failed for %s: %v\n%s", filepath.Base(s), cerr, string(out))
 		}
 	}
 }

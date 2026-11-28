@@ -295,6 +295,7 @@ func cmdDaemon(store *state.Store, exec reconcile.SystemExecutor, args []string,
 		Addr:              addr,
 		Handler:           webSrv,
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	var redirSrv *http.Server
@@ -312,6 +313,9 @@ func cmdDaemon(store *state.Store, exec reconcile.SystemExecutor, args []string,
 					Addr:              ":80",
 					Handler:           newHTTPSRedirectHandler(httpsPort),
 					ReadHeaderTimeout: 5 * time.Second,
+					ReadTimeout:       10 * time.Second,
+					WriteTimeout:      10 * time.Second,
+					IdleTimeout:       60 * time.Second,
 				}
 				fmt.Fprintf(stdout, "dex daemon listening HTTP->HTTPS redirect on :80 -> :%s\n", httpsPort)
 				go func() {

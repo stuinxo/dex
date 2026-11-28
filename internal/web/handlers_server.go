@@ -26,7 +26,7 @@ func (s *Server) handleTestSocks5(w http.ResponseWriter, r *http.Request, _ *ses
 		Username    string `json:"username"`
 		Password    string `json:"password"`
 	}
-	if err := decodeJSONBody(r, &req, 4096); err != nil {
+	if err := decodeJSONBody(w, r, &req, 4096); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
@@ -83,7 +83,7 @@ func (s *Server) handleCertIssue(w http.ResponseWriter, r *http.Request, _ *sess
 		Webroot   string `json:"webroot"`
 		AutoRenew *bool  `json:"auto_renew"`
 	}
-	if err := decodeJSONBody(r, &req, 16384); err != nil {
+	if err := decodeJSONBody(w, r, &req, 16384); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
@@ -133,7 +133,7 @@ func (s *Server) handleCertImport(w http.ResponseWriter, r *http.Request, _ *ses
 		KeyPEM          string `json:"key_pem"`
 		AllowSelfSigned bool   `json:"allow_self_signed"`
 	}
-	if err := decodeJSONBody(r, &req, 1<<20); err != nil {
+	if err := decodeJSONBody(w, r, &req, 1<<20); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
@@ -200,7 +200,7 @@ func (s *Server) handleCertSelfSign(w http.ResponseWriter, r *http.Request, _ *s
 		CN    string `json:"cn"`
 		Force *bool  `json:"force"`
 	}
-	_ = decodeJSONBody(r, &req, 4096)
+	_ = decodeJSONBody(w, r, &req, 4096)
 	force := true
 	if req.Force != nil {
 		force = *req.Force

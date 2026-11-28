@@ -149,3 +149,76 @@ func TestPutStateDryRunLeavesSecretsUnchanged(t *testing.T) {
 		t.Fatal("dry-run changed stored state")
 	}
 }
+
+func TestPutStateOptimisticConcurrencyIfMatch(t *testing.T) {
+	srv, store, _ := setupTestWeb(t, false)
+
+	getRec := httptest.NewRecorder()
+	srv.handleGetState(getRec, httptest.NewRequest("GET", "/api/v1/state", nil), nil)
+	if getRec.Code != 200 {
+		t.Fatalf("GET state failed: %d", getRec.Code)
+	}
+	var getResp struct {
+		State    *state.State `json:"state"`
+		Revision string       `json:"revision"`
+	}
+	if err := json.Unmarshal(getRec.Body.Bytes(), &getResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(getResp.Revision) != 32 {
+		t.Fatalf("expected 32-char revision, got %q", getResp.Revision)
+	}
+	if gotETag := getRec.Header().Get("ETag"); gotETag != `"`+getResp.Revision+`"` {
+		t.Fatalf("expected quoted ETag %q, got %q", `"`+getResp.Revision+`"`, gotETag)
+	}
+
+	// 1. PUT with matching If-Match succeeds and returns a new revision.
+	getResp.State.System.Hostname = "tab-a"
+	b1, _ := json.Marshal(getResp.State)
+	req1 := httptest.NewRequest("PUT", "/api/v1/state", bytes.NewReader(b1))
+	req1.Header.Set("If-Match", `"`+getResp.Revision+`"`)
+	rec1 := httptest.NewRecorder()
+	srv.handlePutState(rec1, req1, nil)
+	if rec1.Code != 200 {
+		t.Fatalf("expected 200 on matching If-Match, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+	var putResp1 struct {
+		Revision string `json:"revision"`
+	}
+	_ = json.Unmarshal(rec1.Body.Bytes(), &putResp1)
+	if putResp1.Revision == "" || putResp1.Revision == getResp.Revision {
+		t.Fatalf("expected updated revision != %q, got %q", getResp.Revision, putResp1.Revision)
+	}
+
+	// 2. PUT with stale If-Match fails with 409 Conflict without overwriting tab-a.
+	getResp.State.System.Hostname = "tab-b-stale"
+	b2, _ := json.Marshal(getResp.State)
+	req2 := httptest.NewRequest("PUT", "/api/v1/state", bytes.NewReader(b2))
+	req2.Header.Set("If-Match", getResp.Revision)
+	rec2 := httptest.NewRecorder()
+	srv.handlePutState(rec2, req2, nil)
+	if rec2.Code != 409 {
+		t.Fatalf("expected 409 Conflict on stale If-Match, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	if cur, _ := store.Load(); cur.System.Hostname != "tab-a" {
+		t.Fatalf("expected hostname tab-a preserved on conflict, got %q", cur.System.Hostname)
+	}
+
+	// 3. PUT with force=1 bypasses stale If-Match.
+	req3 := httptest.NewRequest("PUT", "/api/v1/state?force=1", bytes.NewReader(b2))
+	req3.Header.Set("If-Match", getResp.Revision)
+	rec3 := httptest.NewRecorder()
+	srv.handlePutState(rec3, req3, nil)
+	if rec3.Code != 200 {
+		t.Fatalf("expected force=1 to bypass If-Match, got %d: %s", rec3.Code, rec3.Body.String())
+	}
+
+	// 4. Omitting If-Match preserves backward compatibility for existing API callers.
+	getResp.State.System.Hostname = "compat-no-if-match"
+	b4, _ := json.Marshal(getResp.State)
+	rec4 := httptest.NewRecorder()
+	srv.handlePutState(rec4, httptest.NewRequest("PUT", "/api/v1/state", bytes.NewReader(b4)), nil)
+	if rec4.Code != 200 {
+		t.Fatalf("expected PUT without If-Match to succeed, got %d: %s", rec4.Code, rec4.Body.String())
+	}
+}

@@ -2,6 +2,10 @@ package cli
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -19,11 +23,12 @@ import (
 )
 
 const (
-	defaultZabblyRepoBase = "https://pkgs.zabbly.com/kernel/stable"
-	defaultZabblyKeyURL   = "https://pkgs.zabbly.com/key.asc"
-	zabblyKeyringSysPath  = "/etc/apt/keyrings/zabbly.asc"
-	zabblySourcesSysPath  = "/etc/apt/sources.list.d/zabbly-kernel-stable.sources"
-	defaultMinBootFreeMB  = uint64(200)
+	defaultZabblyRepoBase       = "https://pkgs.zabbly.com/kernel/stable"
+	defaultZabblyKeyURL         = "https://pkgs.zabbly.com/key.asc"
+	defaultZabblyKeyFingerprint = "4EFC590696CB15B87C73A3AD82CC8797C838DCFD"
+	zabblyKeyringSysPath        = "/etc/apt/keyrings/zabbly.asc"
+	zabblySourcesSysPath        = "/etc/apt/sources.list.d/zabbly-kernel-stable.sources"
+	defaultMinBootFreeMB        = uint64(200)
 )
 
 // KernelConfig configures kernel inspection and Zabbly mainline kernel installation.
@@ -31,6 +36,7 @@ type KernelConfig struct {
 	Client         *http.Client
 	RepoBaseURL    string
 	KeyURL         string
+	KeyFingerprint string
 	RootPrefix     string
 	OSReleasePath  string
 	ArchOverride   string
@@ -52,6 +58,9 @@ func (c KernelConfig) withDefaults() KernelConfig {
 	c.RepoBaseURL = strings.TrimRight(strings.TrimSpace(c.RepoBaseURL), "/")
 	if strings.TrimSpace(c.KeyURL) == "" {
 		c.KeyURL = defaultZabblyKeyURL
+	}
+	if strings.TrimSpace(c.KeyFingerprint) == "" && strings.TrimSpace(c.KeyURL) == defaultZabblyKeyURL {
+		c.KeyFingerprint = defaultZabblyKeyFingerprint
 	}
 	if strings.TrimSpace(c.OSReleasePath) == "" {
 		c.OSReleasePath = "/etc/os-release"
@@ -261,7 +270,109 @@ func checkZabblySuiteAvailable(ctx context.Context, client *http.Client, repoBas
 	return nil
 }
 
-func fetchZabblyKey(ctx context.Context, client *http.Client, keyURL string) ([]byte, error) {
+func normalizeOpenPGPFingerprint(s string) string {
+	return strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(s), " ", ""))
+}
+
+// extractOpenPGPPrimaryFingerprint computes the RFC 4880 §12.2 v4 primary-key
+// fingerprint from an ASCII-armored OpenPGP public key block.
+func extractOpenPGPPrimaryFingerprint(armored string) (string, error) {
+	norm := strings.ReplaceAll(armored, "\r\n", "\n")
+	inBody := false
+	inHeaders := false
+	var b64 strings.Builder
+	for _, rawLine := range strings.Split(norm, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if !inBody {
+			if line == "-----BEGIN PGP PUBLIC KEY BLOCK-----" {
+				inBody = true
+				inHeaders = true
+			}
+			continue
+		}
+		if line == "-----END PGP PUBLIC KEY BLOCK-----" {
+			break
+		}
+		if line == "" {
+			inHeaders = false
+			continue
+		}
+		if inHeaders && strings.Contains(line, ":") {
+			continue
+		}
+		inHeaders = false
+		if strings.HasPrefix(line, "=") {
+			continue
+		}
+		b64.WriteString(line)
+	}
+	if b64.Len() == 0 {
+		return "", errors.New("empty OpenPGP key payload")
+	}
+	data, err := base64.StdEncoding.DecodeString(b64.String())
+	if err != nil {
+		return "", fmt.Errorf("decode OpenPGP key base64: %w", err)
+	}
+	if len(data) < 3 || data[0]&0x80 == 0 {
+		return "", errors.New("invalid OpenPGP packet header")
+	}
+	var tag byte
+	var pktLen, hdrLen int
+	if data[0]&0x40 != 0 {
+		tag = data[0] & 0x3f
+		l0 := int(data[1])
+		switch {
+		case l0 < 192:
+			pktLen, hdrLen = l0, 2
+		case l0 < 224:
+			if len(data) < 3 {
+				return "", errors.New("truncated OpenPGP 2-byte length")
+			}
+			pktLen, hdrLen = ((l0-192)<<8)+int(data[2])+192, 3
+		case l0 == 255:
+			if len(data) < 6 {
+				return "", errors.New("truncated OpenPGP 5-byte length")
+			}
+			pktLen, hdrLen = int(binary.BigEndian.Uint32(data[2:6])), 6
+		default:
+			return "", errors.New("partial body length unsupported for public-key packet")
+		}
+	} else {
+		tag = (data[0] >> 2) & 0x0f
+		switch data[0] & 0x03 {
+		case 0:
+			pktLen, hdrLen = int(data[1]), 2
+		case 1:
+			if len(data) < 3 {
+				return "", errors.New("truncated OpenPGP old 2-byte length")
+			}
+			pktLen, hdrLen = int(binary.BigEndian.Uint16(data[1:3])), 3
+		case 2:
+			if len(data) < 5 {
+				return "", errors.New("truncated OpenPGP old 4-byte length")
+			}
+			pktLen, hdrLen = int(binary.BigEndian.Uint32(data[1:5])), 5
+		default:
+			return "", errors.New("indeterminate OpenPGP packet length unsupported")
+		}
+	}
+	if tag != 6 || pktLen <= 0 || pktLen > 0xffff || len(data) < hdrLen+pktLen {
+		return "", fmt.Errorf("unexpected OpenPGP packet (tag=%d len=%d)", tag, pktLen)
+	}
+	pktBody := data[hdrLen : hdrLen+pktLen]
+	if pktBody[0] != 4 {
+		return "", fmt.Errorf("unsupported OpenPGP key version %d", pktBody[0])
+	}
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(pktBody)))
+	h := sha1.New()
+	_, _ = h.Write([]byte{0x99})
+	_, _ = h.Write(lenBuf[:])
+	_, _ = h.Write(pktBody)
+	return strings.ToUpper(hex.EncodeToString(h.Sum(nil))), nil
+}
+
+func fetchZabblyKey(ctx context.Context, client *http.Client, keyURL, expectedFingerprint string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, keyURL, nil)
 	if err != nil {
 		return nil, err
@@ -286,6 +397,15 @@ func fetchZabblyKey(ctx context.Context, client *http.Client, keyURL string) ([]
 	if !strings.Contains(text, "-----BEGIN PGP PUBLIC KEY BLOCK-----") ||
 		!strings.Contains(text, "-----END PGP PUBLIC KEY BLOCK-----") {
 		return nil, errors.New("invalid Zabbly GPG key response (missing PGP public key block)")
+	}
+	if want := normalizeOpenPGPFingerprint(expectedFingerprint); want != "" {
+		got, ferr := extractOpenPGPPrimaryFingerprint(text)
+		if ferr != nil {
+			return nil, fmt.Errorf("verify Zabbly GPG key fingerprint: %w", ferr)
+		}
+		if got != want {
+			return nil, fmt.Errorf("Zabbly GPG key fingerprint mismatch: got %s want %s", got, want)
+		}
 	}
 	return body, nil
 }
@@ -325,14 +445,18 @@ func InstallZabblyKernel(ctx context.Context, exec reconcile.SystemExecutor, cfg
 	if dryRun {
 		if stdout != nil {
 			fmt.Fprintf(stdout, "[dry-run] Host eligible: %s %s (%s), current kernel %s\n", info.DistroID, info.Codename, info.Arch, info.Release)
-			fmt.Fprintf(stdout, "[dry-run] Would download key: %s -> %s\n", cfg.KeyURL, keyDst)
+			fmt.Fprintf(stdout, "[dry-run] Would download key: %s -> %s", cfg.KeyURL, keyDst)
+			if fp := normalizeOpenPGPFingerprint(cfg.KeyFingerprint); fp != "" {
+				fmt.Fprintf(stdout, " (fingerprint %s)", fp)
+			}
+			fmt.Fprintln(stdout)
 			fmt.Fprintf(stdout, "[dry-run] Would write %s:\n%s", sourcesDst, sourcesContent)
 			fmt.Fprintln(stdout, "[dry-run] Would run: apt-get update && apt-get install -y --no-install-recommends linux-zabbly")
 		}
 		return nil
 	}
 
-	keyData, err := fetchZabblyKey(ctx, cfg.Client, cfg.KeyURL)
+	keyData, err := fetchZabblyKey(ctx, cfg.Client, cfg.KeyURL, cfg.KeyFingerprint)
 	if err != nil {
 		return err
 	}

@@ -3,6 +3,9 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -279,5 +282,57 @@ func TestInstallZabblyKernelDryRunAndFullSuccess(t *testing.T) {
 	}
 	if strings.Contains(sOut.String(), "旧版迁移") || !strings.Contains(sOut.String(), "反向代理 RproxyS (服务端)") || !strings.Contains(sOut.String(), "状态: 未启用") || !strings.Contains(sOut.String(), "22. 反向代理 (RproxyS)") {
 		t.Fatalf("unexpected server menu output:\n%s", sOut.String())
+	}
+}
+
+func TestZabblyKeyFingerprintPinning(t *testing.T) {
+	if got := (KernelConfig{}).withDefaults().KeyFingerprint; got != defaultZabblyKeyFingerprint {
+		t.Fatalf("expected default Zabbly fingerprint %q, got %q", defaultZabblyKeyFingerprint, got)
+	}
+
+	// Build a minimal RFC 4880 v4 Public-Key packet (tag 6, new-format header 0xC6, len 6).
+	pktBody := []byte{4, 0, 0, 0, 1, 22}
+	rawPkt := append([]byte{0xc6, byte(len(pktBody))}, pktBody...)
+	armored := "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n" + base64.StdEncoding.EncodeToString(rawPkt) + "\n-----END PGP PUBLIC KEY BLOCK-----\n"
+
+	sum := sha1.Sum(append([]byte{0x99, 0x00, byte(len(pktBody))}, pktBody...))
+	wantFP := strings.ToUpper(hex.EncodeToString(sum[:]))
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/kernel/stable/dists/trixie/Release":
+			_, _ = w.Write([]byte("Suite: trixie\n"))
+		case "/key.asc":
+			_, _ = w.Write([]byte(armored))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	root := filepath.Join(dir, "root")
+	exec := &fakeKernelExec{isContainer: false, hasApt: true, hasDpkg: true}
+	cfg := KernelConfig{
+		Client:         srv.Client(),
+		RepoBaseURL:    srv.URL + "/kernel/stable",
+		KeyURL:         srv.URL + "/key.asc",
+		KeyFingerprint: defaultZabblyKeyFingerprint,
+		RootPrefix:     root,
+		OSReleasePath:  writeTestOSRelease(t, dir, "debian", "trixie"),
+		BootFreeMBFn:   func() (uint64, error) { return 1024, nil },
+		SkipRootCheck:  true,
+	}
+	err := InstallZabblyKernel(context.Background(), exec, cfg, false, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "fingerprint mismatch") {
+		t.Fatalf("expected fingerprint mismatch rejection, got %v", err)
+	}
+	if _, statErr := os.Stat(fsutil.MapRootPrefix(root, zabblySourcesSysPath)); !os.IsNotExist(statErr) {
+		t.Fatalf("expected sources file not written on fingerprint mismatch, statErr=%v", statErr)
+	}
+
+	cfg.KeyFingerprint = wantFP
+	if err := InstallZabblyKernel(context.Background(), exec, cfg, false, &bytes.Buffer{}); err != nil {
+		t.Fatalf("expected matching fingerprint install to succeed, got %v", err)
 	}
 }

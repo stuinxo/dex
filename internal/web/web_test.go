@@ -708,11 +708,11 @@ func TestHardeningWebPathWhitelistProxyRateLimitAndBodyLimits(t *testing.T) {
 	bigBody := `{"password":"` + strings.Repeat("a", 5000) + `"}`
 	bigReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/auth/login", strings.NewReader(bigBody))
 	var dst map[string]any
-	if err := decodeJSONBody(bigReq, &dst, 4096); err == nil || !strings.Contains(err.Error(), "request body too large") {
+	if err := decodeJSONBody(httptest.NewRecorder(), bigReq, &dst, 4096); err == nil || !strings.Contains(err.Error(), "request body too large") {
 		t.Fatalf("expected 'request body too large', got %v", err)
 	}
 	trailReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/auth/login", strings.NewReader(`{"password":"x"}{"extra":1}`))
-	if err := decodeJSONBody(trailReq, &dst, 4096); err == nil {
+	if err := decodeJSONBody(httptest.NewRecorder(), trailReq, &dst, 4096); err == nil {
 		t.Fatalf("expected trailing JSON token rejected")
 	}
 }

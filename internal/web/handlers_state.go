@@ -2,6 +2,8 @@ package web
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -167,16 +169,48 @@ func redactStateForAPI(st *state.State) (*state.State, map[string]bool) {
 	return clone, secrets
 }
 
+var errStateRevisionConflict = errors.New("state was modified by another session; reload before saving")
+
+func computeStateRevision(st *state.State) string {
+	if st == nil {
+		return ""
+	}
+	b, err := json.Marshal(st)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:16])
+}
+
+func parseIfMatchRevision(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" || s == "*" {
+		return ""
+	}
+	s = strings.TrimPrefix(s, "W/")
+	s = strings.Trim(strings.TrimSpace(s), `"`)
+	if s == "*" {
+		return ""
+	}
+	return s
+}
+
 func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
 	st, err := s.Store.Load()
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	rev := computeStateRevision(st)
+	if rev != "" {
+		w.Header().Set("ETag", fmt.Sprintf("%q", rev))
+	}
 	redacted, secrets := redactStateForAPI(st)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"state":   redacted,
-		"secrets": secrets,
+		"state":    redacted,
+		"secrets":  secrets,
+		"revision": rev,
 	})
 }
 
@@ -203,10 +237,11 @@ func preserveStateSecrets(incoming, cur *state.State) {
 
 func (s *Server) handlePutState(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
 	var incoming state.State
-	if err := decodeJSONBody(r, &incoming, 4<<20); err != nil {
+	if err := decodeJSONBody(w, r, &incoming, 4<<20); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid state JSON: "+err.Error())
 		return
 	}
+	expectedRev := parseIfMatchRevision(r.Header.Get("If-Match"))
 
 	cur, err := s.Store.Load()
 	if err != nil && !errors.Is(err, state.ErrNotFound) {
@@ -234,6 +269,13 @@ func (s *Server) handlePutState(w http.ResponseWriter, r *http.Request, _ *sessi
 		opts.Force = true
 	}
 	if r.URL.Query().Get("dry_run") == "1" {
+		if !opts.Force && expectedRev != "" && computeStateRevision(cur) != expectedRev {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":    errStateRevisionConflict.Error(),
+				"conflict": true,
+			})
+			return
+		}
 		res, err := render.RenderAll(preview, opts.RenderOpts)
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -245,12 +287,22 @@ func (s *Server) handlePutState(w http.ResponseWriter, r *http.Request, _ *sessi
 
 	listenChanged := false
 	updated, applyRes, err := reconcile.UpdateAndReconcile(r.Context(), s.Store, incoming.Role, s.Exec, opts, func(dst *state.State) error {
+		if !opts.Force && expectedRev != "" && computeStateRevision(dst) != expectedRev {
+			return errStateRevisionConflict
+		}
 		preserveStateSecrets(&incoming, dst)
 		listenChanged = strings.TrimSpace(dst.Auth.ListenAddr) != strings.TrimSpace(incoming.Auth.ListenAddr)
 		*dst = incoming
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, errStateRevisionConflict) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":    errStateRevisionConflict.Error(),
+				"conflict": true,
+			})
+			return
+		}
 		s.Hub.Log("ERROR", "apply", err.Error())
 		writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
 		return
@@ -264,11 +316,16 @@ func (s *Server) handlePutState(w http.ResponseWriter, r *http.Request, _ *sessi
 			_ = s.Exec.ServiceRestart(context.Background(), s.Exec.DetectInitSystem(), "dex-daemon")
 		}()
 	}
+	rev := computeStateRevision(updated)
+	if rev != "" {
+		w.Header().Set("ETag", fmt.Sprintf("%q", rev))
+	}
 	redacted, secrets := redactStateForAPI(updated)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":               true,
 		"state":            redacted,
 		"secrets":          secrets,
+		"revision":         rev,
 		"result":           applyRes,
 		"restarted_daemon": listenChanged,
 	})
@@ -281,7 +338,7 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request, _ *sessio
 		RawJSON string `json:"raw_json"`
 		Apply   bool   `json:"apply"`
 	}
-	if err := decodeJSONBody(r, &req, 4<<20); err != nil {
+	if err := decodeJSONBody(w, r, &req, 4<<20); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
@@ -442,7 +499,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, _ *sessionR
 		Force      bool `json:"force"`
 		RestartAll bool `json:"restart_all"`
 	}
-	if err := decodeJSONBody(r, &req, 4096); err != nil && !errors.Is(err, io.EOF) {
+	if err := decodeJSONBody(w, r, &req, 4096); err != nil && !errors.Is(err, io.EOF) {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
@@ -487,7 +544,7 @@ func (s *Server) handlePutSystem(w http.ResponseWriter, r *http.Request, _ *sess
 		AutoTuneSysctl  *bool   `json:"auto_tune_sysctl"`
 		EnableFlowtable *bool   `json:"enable_flowtable"`
 	}
-	if err := decodeJSONBody(r, &req, 4096); err != nil {
+	if err := decodeJSONBody(w, r, &req, 4096); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid system JSON: "+err.Error())
 		return
 	}

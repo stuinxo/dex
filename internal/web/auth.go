@@ -201,7 +201,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Password string `json:"password"`
 	}
-	if err := decodeJSONBody(r, &req, 4096); err != nil || req.Password == "" {
+	if err := decodeJSONBody(w, r, &req, 4096); err != nil || req.Password == "" {
 		s.recordLoginFailure(ip)
 		writeJSONError(w, http.StatusUnauthorized, "invalid credentials")
 		return
@@ -334,7 +334,7 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request, se
 		CurrentPassword string `json:"current_password"`
 		NewPassword     string `json:"new_password"`
 	}
-	if err := decodeJSONBody(r, &req, 4096); err != nil {
+	if err := decodeJSONBody(w, r, &req, 4096); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}

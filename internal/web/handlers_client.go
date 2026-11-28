@@ -23,7 +23,7 @@ func (s *Server) handleSelectNode(w http.ResponseWriter, r *http.Request, _ *ses
 	var req struct {
 		NodeID string `json:"node_id"`
 	}
-	if err := decodeJSONBody(r, &req, 4096); err != nil || strings.TrimSpace(req.NodeID) == "" {
+	if err := decodeJSONBody(w, r, &req, 4096); err != nil || strings.TrimSpace(req.NodeID) == "" {
 		writeJSONError(w, http.StatusBadRequest, "node_id is required")
 		return
 	}
@@ -122,7 +122,7 @@ func (s *Server) handleProbeNodes(w http.ResponseWriter, r *http.Request, _ *ses
 		NodeID     string `json:"node_id"`
 		IncludeDoH bool   `json:"include_doh"`
 	}
-	_ = decodeJSONBody(r, &req, 4096)
+	_ = decodeJSONBody(w, r, &req, 4096)
 
 	st, err := s.Store.Load()
 	if err != nil {
@@ -200,7 +200,7 @@ func (s *Server) handleNotifyTest(w http.ResponseWriter, r *http.Request, _ *ses
 		TelegramBotToken string `json:"telegram_bot_token"`
 		TelegramChatID   string `json:"telegram_chat_id"`
 	}
-	_ = decodeJSONBody(r, &req, 8192)
+	_ = decodeJSONBody(w, r, &req, 8192)
 
 	st, err := s.Store.Load()
 	if err != nil {
@@ -244,7 +244,7 @@ func (s *Server) handleParseNodeURI(w http.ResponseWriter, r *http.Request, _ *s
 	var req struct {
 		URI string `json:"uri"`
 	}
-	if err := decodeJSONBody(r, &req, 16384); err != nil || strings.TrimSpace(req.URI) == "" {
+	if err := decodeJSONBody(w, r, &req, 16384); err != nil || strings.TrimSpace(req.URI) == "" {
 		writeJSONError(w, http.StatusBadRequest, "uri is required")
 		return
 	}
@@ -263,7 +263,7 @@ func (s *Server) handleAddWGPeer(w http.ResponseWriter, r *http.Request, _ *sess
 		ListenPort   int    `json:"listen_port"`
 		SubnetCIDR   string `json:"subnet_cidr"`
 	}
-	if err := decodeJSONBody(r, &req, 4096); err != nil {
+	if err := decodeJSONBody(w, r, &req, 4096); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
@@ -382,7 +382,7 @@ func (s *Server) handleConnectivity(w http.ResponseWriter, r *http.Request, _ *s
 	var req struct {
 		WithIPs bool `json:"with_ips"`
 	}
-	_ = decodeJSONBody(r, &req, 1024)
+	_ = decodeJSONBody(w, r, &req, 1024)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
@@ -494,7 +494,7 @@ func (s *Server) handleRulesUpdate(w http.ResponseWriter, r *http.Request, _ *se
 	var req struct {
 		IncludeAds bool `json:"include_ads"`
 	}
-	_ = decodeJSONBody(r, &req, 1024)
+	_ = decodeJSONBody(w, r, &req, 1024)
 	wLog := &hubLogWriter{hub: s.Hub, tag: "rules"}
 	if err := s.UpdateRulesFn(r.Context(), req.IncludeAds, wLog); err != nil {
 		s.Hub.Log("ERROR", "rules", err.Error())
@@ -514,7 +514,7 @@ func (s *Server) handleUpdateComponents(w http.ResponseWriter, r *http.Request, 
 		Component string `json:"component"`
 		Version   string `json:"version"`
 	}
-	_ = decodeJSONBody(r, &req, 1024)
+	_ = decodeJSONBody(w, r, &req, 1024)
 	comp := strings.TrimSpace(req.Component)
 	if comp == "" {
 		comp = "all"

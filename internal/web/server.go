@@ -201,19 +201,33 @@ func writeJSONError(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]any{"error": msg})
 }
 
-func decodeJSONBody(r *http.Request, dst any, maxBytes int64) error {
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64) error {
 	if maxBytes <= 0 {
 		maxBytes = 1 << 20
 	}
 	if r.Body == nil {
 		return io.EOF
 	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, maxBytes+1))
-	if err != nil {
-		return err
-	}
-	if int64(len(raw)) > maxBytes {
-		return errors.New("request body too large")
+	var raw []byte
+	var err error
+	if w != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+		raw, err = io.ReadAll(r.Body)
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			return errors.New("request body too large")
+		}
+		if err != nil {
+			return err
+		}
+	} else {
+		raw, err = io.ReadAll(io.LimitReader(r.Body, maxBytes+1))
+		if err != nil {
+			return err
+		}
+		if int64(len(raw)) > maxBytes {
+			return errors.New("request body too large")
+		}
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	if err := dec.Decode(dst); err != nil {

@@ -375,6 +375,9 @@ func ListenAndServe(ctx context.Context, cfg Config) error {
 		Addr:              addr,
 		Handler:           NewHandler(cfg),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	errCh := make(chan error, 1)
 	go func() {

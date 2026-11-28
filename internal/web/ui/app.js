@@ -4,6 +4,7 @@
   var csrfToken = "";
   var currentState = null;
   var currentSecrets = {};
+  var currentRevision = "";
   var statusInfo = null;
   var probeResultsMap = {};
   var logSource = null;
@@ -85,7 +86,7 @@
     return cand;
   }
 
-  async function api(method, path, body) {
+  async function api(method, path, body, extraHeaders) {
     var opts = {
       method: method,
       credentials: "same-origin",
@@ -93,6 +94,11 @@
     };
     if (csrfToken && method !== "GET") {
       opts.headers["X-CSRF-Token"] = csrfToken;
+    }
+    if (extraHeaders) {
+      Object.keys(extraHeaders).forEach(function (k) {
+        opts.headers[k] = extraHeaders[k];
+      });
     }
     if (body !== undefined) {
       opts.headers["Content-Type"] = "application/json";
@@ -103,7 +109,9 @@
     var data = {};
     try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { error: text }; }
     if (!resp.ok) {
-      throw new Error(data.error || ("HTTP " + resp.status));
+      var err = new Error(data.error || ("HTTP " + resp.status));
+      err.status = resp.status;
+      throw err;
     }
     return data;
   }
@@ -257,6 +265,7 @@
     var stateRes = await api("GET", "/api/v1/state");
     currentState = stateRes.state;
     currentSecrets = stateRes.secrets || {};
+    currentRevision = stateRes.revision || "";
     applyRoleVisibility(currentState.role);
     renderStatus();
     renderStateForms();
@@ -1459,12 +1468,21 @@
 
   async function saveAndApplyState(msg) {
     try {
-      var res = await api("PUT", "/api/v1/state", currentState);
+      var headers = currentRevision ? { "If-Match": currentRevision } : undefined;
+      var res = await api("PUT", "/api/v1/state", currentState, headers);
       currentState = res.state;
       currentSecrets = res.secrets || {};
+      currentRevision = res.revision || currentRevision;
       showToast(res.restarted_daemon ? "监听地址已变更，daemon 正在重启，请使用新端口刷新" : (msg || "已保存并应用"));
       await refreshAll();
-    } catch (e) { showToast(e.message, true); }
+    } catch (e) {
+      if (e && e.status === 409) {
+        showToast("配置已被其他窗口修改，已自动刷新最新状态，请确认后重试", true);
+        try { await refreshAll(); } catch (_) {}
+        return;
+      }
+      showToast(e.message, true);
+    }
   }
 
   async function runConnectivityProbe(silent) {
@@ -1500,6 +1518,7 @@
   async function doLogout() {
     try { await api("POST", "/api/v1/auth/logout", {}); } catch (_) {}
     csrfToken = "";
+    currentRevision = "";
     clientAutoProbed = false;
     lastLogSeq = 0;
     if (logSource) { logSource.close(); logSource = null; }
