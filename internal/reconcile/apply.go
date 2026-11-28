@@ -973,7 +973,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		// Clean up orphaned nftables tables when a unit or table is omitted from nftables.conf
 		// (removing unit files before daemon-reload drops ExecStop).
 		if exec.HasCommand("nft") {
-			for _, tbl := range []string{"dex_relay", "dex_nat", "dex_flow", "dex_client", "dex_filter", "dex_host_fw"} {
+			for _, tbl := range render.ManagedNFTTables {
 				if !hasNFTTable(bundle, tbl) {
 					_, _ = exec.RunCommand(ctx, nil, "nft", "delete", "table", "inet", tbl)
 				}
@@ -1101,7 +1101,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 		}
 		// Remove any dex_* nftables tables introduced by this failed apply.
 		if exec.HasCommand("nft") {
-			for _, tbl := range []string{"dex_relay", "dex_nat", "dex_flow", "dex_client", "dex_filter", "dex_host_fw"} {
+			for _, tbl := range render.ManagedNFTTables {
 				if !hasNFTTable(bundle, tbl) {
 					continue
 				}

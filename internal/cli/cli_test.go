@@ -567,6 +567,11 @@ func TestHardeningCLIInitForceDLModeNodeDelMenuPortRelayAndServices(t *testing.T
 	if got := serviceNamesForState(land, "systemd"); !reflect.DeepEqual(got, []string{"dex-xray"}) {
 		t.Fatalf("expected landing services=[dex-xray], got %v", got)
 	}
+	srvFW := state.NewDefaultState(state.RoleServer)
+	srvFW.System.Firewall.Enabled = true
+	if got := serviceNamesForState(srvFW, "systemd"); !reflect.DeepEqual(got, []string{"dex-xray", "dex-nft", "nginx", "dex-doh", "dex-daemon"}) {
+		t.Fatalf("expected server with host firewall to include dex-nft, got %v", got)
+	}
 
 	// 7. dex cert inspect uses resolveActiveCertPaths (reads external imported cert when configured)
 	extDir := filepath.Join(dir, "ext-cert-inspect")

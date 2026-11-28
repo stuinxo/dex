@@ -820,6 +820,26 @@ func TestHardeningWebStatusServerPauseAndCertExternalReconcile(t *testing.T) {
 		t.Fatalf("expected dex-nft omitted on server without nft forwards, got %+v", svcs)
 	}
 
+	// 1b. Enabling host firewall reports dex-nft in server status even without relay forwards
+	if _, uerr := store.Update(state.RoleServer, func(cur *state.State) error {
+		cur.System.Firewall = state.HostFirewallConfig{Enabled: true, AllowPublicSSH: true}
+		return nil
+	}); uerr != nil {
+		t.Fatal(uerr)
+	}
+	fwRec := doReq(http.MethodGet, "/api/v1/status", "")
+	var fwBody map[string]any
+	_ = json.Unmarshal(fwRec.Body.Bytes(), &fwBody)
+	if _, hasNFT := fwBody["services"].(map[string]any)["dex-nft"]; !hasNFT {
+		t.Fatalf("expected dex-nft present when host firewall enabled, got %+v", fwBody["services"])
+	}
+	if _, uerr := store.Update(state.RoleServer, func(cur *state.State) error {
+		cur.System.Firewall = state.HostFirewallConfig{}
+		return nil
+	}); uerr != nil {
+		t.Fatal(uerr)
+	}
+
 	// 2. handleCertSelfSign reconciles nginx back to store.DefaultCert() when switching away from external path
 	ssRec := doReq(http.MethodPost, "/api/v1/cert/self-sign", `{"cn":"srv.example.com","force":true}`)
 	if ssRec.Code != 200 {

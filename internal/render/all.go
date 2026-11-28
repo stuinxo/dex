@@ -106,19 +106,13 @@ func RenderAll(s *state.State, opts RenderOptions) (*RenderBundle, error) {
 		})
 	}
 
-	if s.Role == state.RoleServer && s.Server.TLSMode == "nginx" && s.Server.EnableDoH {
-		bundle.DoHNeeded = true
-	}
-	bundle.DaemonNeeded = s.Role == state.RoleClient || s.Role == state.RoleServer
-	bundle.RulesTimerNeeded = s.Role == state.RoleClient && s.System.AutoUpdateRules
-	if bundle.NFTRelayNeeded {
-		bundle.RefreshTimerNeeded = true
-		bundle.RefreshInterval = "5min"
-	} else if clientHasDomainTargets(s) {
-		bundle.RefreshTimerNeeded = true
-		bundle.RefreshInterval = "4h"
-	}
-	bundle.CoreUpdateTimerNeeded = s.System.AutoUpdateCore
+	plan := ComputeServicePlan(s)
+	bundle.DoHNeeded = plan.DoH
+	bundle.DaemonNeeded = plan.Daemon
+	bundle.RulesTimerNeeded = plan.RulesTimer
+	bundle.RefreshTimerNeeded = plan.RefreshTimer
+	bundle.RefreshInterval = plan.RefreshInterval
+	bundle.CoreUpdateTimerNeeded = plan.CoreUpdateTimer
 
 	if wgFiles, needed, err := RenderWireGuard(s, opts); err != nil {
 		return nil, fmt.Errorf("render wireguard: %w", err)

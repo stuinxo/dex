@@ -709,33 +709,6 @@ func firstNonEmptyStr(vals ...string) string {
 	return ""
 }
 
-func buildExtraURI(st *state.State, ex state.ExtraInbound) string {
-	host := strings.TrimSpace(ex.Domain)
-	if host == "" && st != nil {
-		host = st.Server.EffectiveConnectHost()
-	}
-	if host == "" {
-		host = "node.example.com"
-	}
-	path := ex.Path
-	if ex.Protocol == "vless-xhttp" || ex.Protocol == "vless-ws" || ex.Protocol == "vmess-ws" {
-		path = render.NormalizePath(ex.Path, ex.UUID)
-	}
-	return render.BuildNodeURI(state.OutboundNode{
-		Name:           ex.Tag,
-		Protocol:       ex.Protocol,
-		Address:        host,
-		Port:           ex.ListenPort,
-		UUID:           ex.UUID,
-		TLSSNI:         firstNonEmptyStr(ex.RealitySNI, ex.Domain, host),
-		Path:           path,
-		RealityPubKey:  ex.RealityPubKey,
-		RealityShortID: ex.RealityShortID,
-		Username:       ex.SocksUser,
-		Password:       ex.SocksPass,
-	})
-}
-
 func readHostUptimeSec(fallback time.Time) int64 {
 	if b, err := os.ReadFile("/proc/uptime"); err == nil {
 		fields := strings.Fields(string(b))
@@ -771,25 +744,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, _ *session
 	}
 
 	initSys := s.Exec.DetectInitSystem()
-	wgUnit := "wg-quick@wg0"
-	if initSys == "openrc" {
-		wgUnit = "wg-quick.wg0"
-	}
+	wgUnit := render.WireGuardUnitName(initSys)
+	plan := render.ComputeServicePlan(st)
 	checkSvc := func(unit string) bool {
 		return s.Exec.ServiceIsActive(r.Context(), initSys, unit)
-	}
-	hasNFTForward := false
-	hasHAProxyForward := false
-	hasXrayForward := false
-	for _, f := range st.Relay.Forwards {
-		switch f.Engine {
-		case "nft":
-			hasNFTForward = true
-		case "haproxy":
-			hasHAProxyForward = true
-		case "xray":
-			hasXrayForward = true
-		}
 	}
 	svcs := map[string]bool{
 		"dex-daemon": checkSvc("dex-daemon"),
@@ -799,10 +757,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, _ *session
 		svcs["dex-xray"] = checkSvc("dex-xray")
 		svcs["dex-mosdns"] = checkSvc("dex-mosdns")
 		svcs["dex-nft"] = checkSvc("dex-nft")
-		if st.Client.WireGuard.Enabled || checkSvc(wgUnit) {
+		if plan.WireGuard || checkSvc(wgUnit) {
 			svcs["wireguard"] = checkSvc(wgUnit)
 		}
-		if hasHAProxyForward || checkSvc("haproxy") {
+		if plan.HAProxy || checkSvc("haproxy") {
 			svcs["haproxy"] = checkSvc("haproxy")
 		}
 		for _, opt := range []string{"nginx", "dex-doh"} {
@@ -812,36 +770,27 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, _ *session
 		}
 		proxyPaused = !svcs["dex-xray"] && !svcs["dex-nft"]
 	} else {
-		needsXray := st.Role == state.RoleServer || st.Role == state.RoleLanding ||
-			hasXrayForward || st.RproxyS.Enabled || len(st.ExtraInbounds) > 0
-		if needsXray || checkSvc("dex-xray") {
+		if plan.Xray || checkSvc("dex-xray") {
 			svcs["dex-xray"] = checkSvc("dex-xray")
 		}
-		needsNginx := st.Role == state.RoleServer && st.Server.TLSMode == "nginx"
-		for _, ex := range st.ExtraInbounds {
-			if ex.ViaNginx {
-				needsNginx = true
-				break
-			}
-		}
-		if needsNginx || checkSvc("nginx") {
+		if plan.Nginx || checkSvc("nginx") {
 			svcs["nginx"] = checkSvc("nginx")
 		}
-		if (st.Role == state.RoleServer && st.Server.TLSMode == "nginx" && st.Server.EnableDoH) || checkSvc("dex-doh") {
+		if plan.DoH || checkSvc("dex-doh") {
 			svcs["dex-doh"] = checkSvc("dex-doh")
 		}
-		if hasNFTForward || checkSvc("dex-nft") {
+		if plan.NFTNeeded() || checkSvc("dex-nft") {
 			svcs["dex-nft"] = checkSvc("dex-nft")
 		}
-		if hasHAProxyForward || checkSvc("haproxy") {
+		if plan.HAProxy || checkSvc("haproxy") {
 			svcs["haproxy"] = checkSvc("haproxy")
 		}
 		switch {
-		case needsXray && hasNFTForward:
+		case plan.Xray && plan.NFTRelay:
 			proxyPaused = !svcs["dex-xray"] && !svcs["dex-nft"]
-		case needsXray:
+		case plan.Xray:
 			proxyPaused = !svcs["dex-xray"]
-		case hasNFTForward:
+		case plan.NFTRelay:
 			proxyPaused = !svcs["dex-nft"]
 		default:
 			proxyPaused = false
@@ -869,7 +818,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, _ *session
 	}
 	extraURIs := make(map[string]string, len(st.ExtraInbounds))
 	for _, ex := range st.ExtraInbounds {
-		if u := buildExtraURI(st, ex); u != "" {
+		if u := render.BuildExtraURI(st, ex); u != "" {
 			extraURIs[ex.Tag] = u
 		}
 	}
@@ -1097,16 +1046,9 @@ func (s *Server) probeDoHURL(ctx context.Context, raw string) DoHProbeResult {
 	if s.ProbeDoHFn != nil {
 		return s.ProbeDoHFn(ctx, raw)
 	}
-	norm := strings.TrimSpace(raw)
+	norm := render.NormalizeDoHUpstream(raw)
 	if norm == "" {
 		return DoHProbeResult{URL: raw, Error: "empty URL"}
-	}
-	if !strings.Contains(norm, "://") {
-		if strings.Contains(norm, "/") {
-			norm = "https://" + norm
-		} else {
-			norm = "https://" + norm + "/dq"
-		}
 	}
 	u, err := url.Parse(norm)
 	if err != nil {

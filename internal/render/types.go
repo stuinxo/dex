@@ -188,17 +188,6 @@ func NormalizePath(path, uuid string) string {
 	return p
 }
 
-// ExtraInternalPort returns the loopback port Xray binds to when an ExtraInbound is fronted by Nginx.
-func ExtraInternalPort(listenPort int) int {
-	return state.ExtraInternalPort(listenPort)
-}
-
-// AllocateViaNginxInternalPorts deterministically assigns collision-free loopback ports
-// for all ViaNginx ExtraInbounds keyed by ex.Tag.
-func AllocateViaNginxInternalPorts(s *state.State) map[string]int {
-	return state.AllocateViaNginxInternalPorts(s)
-}
-
 // BuildNodeURI formats a standard client share URI for an OutboundNode.
 func BuildNodeURI(n state.OutboundNode) string {
 	host := n.Address
@@ -378,8 +367,46 @@ func BuildDoHURL(s *state.State, fallbackHost string) string {
 	}
 }
 
-func shellSingleQuote(v string) string {
+// ShellSingleQuote wraps v in POSIX single quotes with internal quotes escaped.
+func ShellSingleQuote(v string) string {
 	return "'" + strings.ReplaceAll(v, "'", "'\\''") + "'"
+}
+
+func firstNonEmptyRenderStr(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+// BuildExtraURI formats the canonical client share URI for an ExtraInbound (server/landing/relay).
+func BuildExtraURI(s *state.State, ex state.ExtraInbound) string {
+	host := strings.TrimSpace(ex.Domain)
+	if host == "" && s != nil {
+		host = s.Server.EffectiveConnectHost()
+	}
+	if host == "" {
+		host = "node.example.com"
+	}
+	path := ex.Path
+	if ex.Protocol == "vless-xhttp" || ex.Protocol == "vless-ws" || ex.Protocol == "vmess-ws" {
+		path = NormalizePath(ex.Path, ex.UUID)
+	}
+	return BuildNodeURI(state.OutboundNode{
+		Name:           ex.Tag,
+		Protocol:       ex.Protocol,
+		Address:        host,
+		Port:           ex.ListenPort,
+		UUID:           ex.UUID,
+		TLSSNI:         firstNonEmptyRenderStr(ex.RealitySNI, ex.Domain, host),
+		Path:           path,
+		RealityPubKey:  ex.RealityPubKey,
+		RealityShortID: ex.RealityShortID,
+		Username:       ex.SocksUser,
+		Password:       ex.SocksPass,
+	})
 }
 
 // DeriveServerDoHFromNode derives a default self-hosted Server DoH URL ("https://<host>[:port]/dq")
@@ -424,13 +451,13 @@ func BuildClientInitCommand(s *state.State, fallbackHost string) string {
 	}
 	if dohURL := BuildDoHURL(s, fallbackHost); dohURL != "" {
 		if parsed, err := ParseNodeURI(mainURI); err == nil && DeriveServerDoHFromNode(parsed) == dohURL {
-			return fmt.Sprintf("dex %s", shellSingleQuote(mainURI))
+			return fmt.Sprintf("dex %s", ShellSingleQuote(mainURI))
 		}
 		return fmt.Sprintf("dex %s --doh %s",
-			shellSingleQuote(mainURI), shellSingleQuote(dohURL))
+			ShellSingleQuote(mainURI), ShellSingleQuote(dohURL))
 	}
 	return fmt.Sprintf("dex %s --doh '<自建DoH地址>'",
-		shellSingleQuote(mainURI))
+		ShellSingleQuote(mainURI))
 }
 
 // BuildFWDURI returns a client share URI for FWD0 ("fwd0") or FWD1 ("fwd1").

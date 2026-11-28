@@ -1900,3 +1900,34 @@ func TestRenderMultiClientRproxyS(t *testing.T) {
 		t.Fatalf("unexpected isolated RproxyS routing rules: %+v", ruleMap)
 	}
 }
+
+func TestBuildExtraURIAndServicePlan(t *testing.T) {
+	srv := state.NewDefaultState(state.RoleServer)
+	srv.Server.Domain = "srv.example.com"
+	srv.System.Firewall.Enabled = true
+	plan := ComputeServicePlan(srv)
+	if !plan.NFTNeeded() || !plan.NFTHostFW || plan.NFTRelay {
+		t.Fatalf("expected host firewall NFTNeeded=true without NFTRelay, got %+v", plan)
+	}
+	units := plan.ManagedServiceUnits(srv, "systemd")
+	foundNFT := false
+	for _, u := range units {
+		if u == "dex-nft" {
+			foundNFT = true
+		}
+	}
+	if !foundNFT {
+		t.Fatalf("expected ManagedServiceUnits to include dex-nft when HostFirewall enabled, got %v", units)
+	}
+
+	ex := state.ExtraInbound{
+		Tag:        "ex-xhttp",
+		Protocol:   "vless-xhttp",
+		ListenPort: 8443,
+		UUID:       "11111111-1111-4111-8111-111111111111",
+	}
+	uri := BuildExtraURI(srv, ex)
+	if !strings.HasPrefix(uri, "vless://11111111-1111-4111-8111-111111111111@srv.example.com:8443") || !strings.Contains(uri, "#ex-xhttp") {
+		t.Fatalf("unexpected BuildExtraURI output: %q", uri)
+	}
+}

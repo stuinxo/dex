@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/stuinxo/dex/internal/cryptoext"
+	"github.com/stuinxo/dex/internal/render"
 	"github.com/stuinxo/dex/internal/state"
 )
 
@@ -353,7 +354,7 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 			seen := make(map[string]struct{})
 			var clean []string
 			for _, d := range doh {
-				d = normalizeDoHURL(d)
+				d = render.NormalizeDoHUpstream(d)
 				if d == "" {
 					continue
 				}
@@ -674,20 +675,6 @@ func ImportV2Client(confPath, extraDir string) (*state.State, []string, error) {
 	}
 
 	return st, notes, nil
-}
-
-func normalizeDoHURL(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	if strings.Contains(raw, "://") {
-		return raw
-	}
-	if !strings.Contains(raw, "/") {
-		return "https://" + raw + "/dq"
-	}
-	return "https://" + raw
 }
 
 func normalizeProto(p string) string {

@@ -3,11 +3,20 @@ package render
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/stuinxo/dex/internal/state"
 )
 
-// RenderUnits renders systemd units or OpenRC init scripts for active dex v3 services.
+func renderNFTStopCommands(indent, sep string) string {
+	cmds := make([]string, 0, len(ManagedNFTTables))
+	for _, tbl := range ManagedNFTTables {
+		cmds = append(cmds, indent+"nft delete table inet "+tbl+" 2>/dev/null || true")
+	}
+	return strings.Join(cmds, sep)
+}
+
+// RenderUnits renders systemd units or OpenRC init scripts for active dex services.
 func RenderUnits(s *state.State, opts RenderOptions, b *RenderBundle) []RenderedFile {
 	opts = opts.WithDefaults()
 	var out []RenderedFile
@@ -24,11 +33,6 @@ func RenderUnits(s *state.State, opts RenderOptions, b *RenderBundle) []Rendered
 
 	if opts.InitSystem == "openrc" {
 		if b.XrayNeeded {
-			caps := "cap_net_bind_service"
-			if s.Role == state.RoleClient {
-				caps = "cap_net_bind_service,cap_net_admin,cap_net_raw"
-			}
-			_ = caps
 			script := fmt.Sprintf(`#!/sbin/openrc-run
 description="DEX Xray Core"
 command="%s"
@@ -115,15 +119,10 @@ start() {
 }
 stop() {
   ebegin "Stopping dex nftables"
-  nft delete table inet dex_client 2>/dev/null || true
-  nft delete table inet dex_filter 2>/dev/null || true
-  nft delete table inet dex_nat 2>/dev/null || true
-  nft delete table inet dex_flow 2>/dev/null || true
-  nft delete table inet dex_relay 2>/dev/null || true
-  nft delete table inet dex_host_fw 2>/dev/null || true%s
+%s%s
   eend 0
 }
-`, nftConf, nftConf, tproxyStart, tproxyStop)
+`, nftConf, nftConf, tproxyStart, renderNFTStopCommands("  ", "\n"), tproxyStop)
 			out = append(out, RenderedFile{
 				RelName:    "openrc/dex-nft",
 				TargetPath: "/etc/init.d/dex-nft",
@@ -136,12 +135,12 @@ stop() {
 			script := fmt.Sprintf(`#!/sbin/openrc-run
 description="DEX RFC 8484 DoH Server"
 command="%s"
-command_args="serve-doh --listen 127.0.0.1:9853 --upstream %s --path /dq"
+command_args="serve-doh --listen 127.0.0.1:%d --upstream %s --path /dq"
 command_background=true
 pidfile="/run/dex-doh.pid"
 rc_ulimit="-n 65535"
 depend() { need net; }
-`, opts.DexBin, dohUpstreams)
+`, opts.DexBin, state.DefaultServerDoHPort, dohUpstreams)
 			out = append(out, RenderedFile{
 				RelName:    "openrc/dex-doh",
 				TargetPath: "/etc/init.d/dex-doh",
@@ -150,7 +149,7 @@ depend() { need net; }
 			})
 		}
 
-		if s.Role == state.RoleClient || s.Role == state.RoleServer {
+		if b.DaemonNeeded {
 			script := fmt.Sprintf(`#!/sbin/openrc-run
 description="DEX Control Plane Daemon"
 command="%s"
@@ -261,11 +260,11 @@ ConditionFileNotEmpty=%s
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/nft -f %s%s
-ExecStop=/bin/sh -c 'nft delete table inet dex_client 2>/dev/null || true; nft delete table inet dex_filter 2>/dev/null || true; nft delete table inet dex_nat 2>/dev/null || true; nft delete table inet dex_flow 2>/dev/null || true; nft delete table inet dex_relay 2>/dev/null || true; nft delete table inet dex_host_fw 2>/dev/null || true'%s
+ExecStop=/bin/sh -c '%s'%s
 
 [Install]
 WantedBy=multi-user.target
-`, nftConf, nftConf, tproxyStart, tproxyStop)
+`, nftConf, nftConf, tproxyStart, renderNFTStopCommands("", "; "), tproxyStop)
 		out = append(out, RenderedFile{
 			RelName:    "systemd/dex-nft.service",
 			TargetPath: "/etc/systemd/system/dex-nft.service",
@@ -281,14 +280,14 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=%s serve-doh --listen 127.0.0.1:9853 --upstream %s --path /dq
+ExecStart=%s serve-doh --listen 127.0.0.1:%d --upstream %s --path /dq
 Restart=always
 RestartSec=2
 LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
-`, opts.DexBin, dohUpstreams)
+`, opts.DexBin, state.DefaultServerDoHPort, dohUpstreams)
 		out = append(out, RenderedFile{
 			RelName:    "systemd/dex-doh.service",
 			TargetPath: "/etc/systemd/system/dex-doh.service",
@@ -297,7 +296,7 @@ WantedBy=multi-user.target
 		})
 	}
 
-	if s.Role == state.RoleClient || s.Role == state.RoleServer {
+	if b.DaemonNeeded {
 		unit := fmt.Sprintf(`[Unit]
 Description=DEX Control Plane & Web UI Daemon
 After=network-online.target

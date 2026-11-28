@@ -191,7 +191,7 @@ server {
 `, xhttpPath, mainConnHeaders)
 	}
 
-	viaNginxPorts := AllocateViaNginxInternalPorts(s)
+	viaNginxPorts := state.AllocateViaNginxInternalPorts(s)
 
 	for _, ex := range extraViaNginx {
 		dom := ex.Domain
@@ -206,7 +206,7 @@ server {
 		}
 		internalPort := viaNginxPorts[ex.Tag]
 		if internalPort <= 0 {
-			internalPort = ExtraInternalPort(ex.ListenPort)
+			internalPort = state.ExtraInternalPort(ex.ListenPort)
 		}
 		withSockOpts := !seenListenPorts[ex.ListenPort]
 		seenListenPorts[ex.ListenPort] = true

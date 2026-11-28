@@ -8,6 +8,12 @@ const (
 	DefaultServerDoHPort  = 9853
 	DefaultWGPort         = 51820
 	DefaultWGSubnet       = "172.16.66.1/24"
+
+	// Linux netfilter / routing marks shared across nftables, xray, and dex-daemon.
+	TProxyMark       = 0x9
+	QUICRejectMark   = 0x8
+	DirectBypassMark = 0xff
+	TProxyRouteTable = 220
 )
 
 // ManagedRuleFiles lists all geo/domain rule files managed in /etc/dex/rules.

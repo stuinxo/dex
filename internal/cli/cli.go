@@ -645,65 +645,7 @@ func cmdApply(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 }
 
 func serviceNamesForState(st *state.State, initSys string) []string {
-	var svcs []string
-	if st == nil {
-		return svcs
-	}
-	hasNFTForward := false
-	hasHAProxyForward := false
-	hasXrayForward := false
-	for _, f := range st.Relay.Forwards {
-		switch f.Engine {
-		case "nft":
-			hasNFTForward = true
-		case "haproxy":
-			hasHAProxyForward = true
-		case "xray":
-			hasXrayForward = true
-		}
-	}
-	if st.Role == state.RoleClient {
-		svcs = append(svcs, "dex-xray", "dex-mosdns", "dex-nft")
-		if hasHAProxyForward {
-			svcs = append(svcs, "haproxy")
-		}
-		if st.Client.WireGuard.Enabled {
-			if initSys == "openrc" {
-				svcs = append(svcs, "wg-quick.wg0")
-			} else {
-				svcs = append(svcs, "wg-quick@wg0")
-			}
-		}
-	} else {
-		needsXray := st.Role == state.RoleServer || st.Role == state.RoleLanding ||
-			hasXrayForward || st.RproxyS.Enabled || len(st.ExtraInbounds) > 0
-		if needsXray {
-			svcs = append(svcs, "dex-xray")
-		}
-		if hasNFTForward {
-			svcs = append(svcs, "dex-nft")
-		}
-		if hasHAProxyForward {
-			svcs = append(svcs, "haproxy")
-		}
-		needsNginx := (st.Role == state.RoleServer && st.Server.TLSMode == "nginx")
-		for _, ex := range st.ExtraInbounds {
-			if ex.ViaNginx {
-				needsNginx = true
-				break
-			}
-		}
-		if needsNginx {
-			svcs = append(svcs, "nginx")
-		}
-		if st.Role == state.RoleServer && st.Server.TLSMode == "nginx" && st.Server.EnableDoH {
-			svcs = append(svcs, "dex-doh")
-		}
-	}
-	if st.Role == state.RoleClient || st.Role == state.RoleServer {
-		svcs = append(svcs, "dex-daemon")
-	}
-	return svcs
+	return render.ComputeServicePlan(st).ManagedServiceUnits(st, initSys)
 }
 
 func serviceStatusSummary(exec reconcile.SystemExecutor, st *state.State) string {
@@ -1125,7 +1067,7 @@ func cmdNode(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 				fmt.Fprintf(stdout, "Client Install:\n  %s\n", cmd)
 			}
 			for _, ex := range st.ExtraInbounds {
-				if uri := buildExtraShareURI(st, ex); uri != "" {
+				if uri := render.BuildExtraURI(st, ex); uri != "" {
 					fmt.Fprintf(stdout, "Extra [%s] (%s:%d): %s\n", ex.Tag, ex.Protocol, ex.ListenPort, uri)
 				} else if ex.Protocol == "dokodemo" {
 					fmt.Fprintf(stdout, "Extra [%s] (dokodemo :%d -> %s:%d)\n", ex.Tag, ex.ListenPort, ex.TargetAddr, ex.TargetPort)
@@ -1702,16 +1644,12 @@ func cmdCertWithOpts(store *state.Store, exec reconcile.SystemExecutor, applyOpt
 	}
 }
 
-func shellSingleQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
 func buildCertReloadCmd(stateDir string) string {
 	exe, err := os.Executable()
 	if err != nil || exe == "" || strings.HasSuffix(exe, ".test") || strings.Contains(exe, "/go-build") {
 		exe = "/usr/local/bin/dex"
 	}
-	return fmt.Sprintf("%s --state-dir %s cert reload", shellSingleQuote(exe), shellSingleQuote(stateDir))
+	return fmt.Sprintf("%s --state-dir %s cert reload", render.ShellSingleQuote(exe), render.ShellSingleQuote(stateDir))
 }
 
 func reloadNonDaemonCertConsumers(ctx context.Context, exec reconcile.SystemExecutor, stdout io.Writer) {
@@ -2547,33 +2485,6 @@ func cmdRproxy(store *state.Store, exec reconcile.SystemExecutor, args []string,
 	}
 }
 
-func buildExtraShareURI(st *state.State, ex state.ExtraInbound) string {
-	host := strings.TrimSpace(ex.Domain)
-	if host == "" && st != nil {
-		host = st.Server.EffectiveConnectHost()
-	}
-	if host == "" {
-		host = "node.example.com"
-	}
-	path := ex.Path
-	if ex.Protocol == "vless-xhttp" || ex.Protocol == "vless-ws" || ex.Protocol == "vmess-ws" {
-		path = render.NormalizePath(ex.Path, ex.UUID)
-	}
-	return render.BuildNodeURI(state.OutboundNode{
-		Name:           ex.Tag,
-		Protocol:       ex.Protocol,
-		Address:        host,
-		Port:           ex.ListenPort,
-		UUID:           ex.UUID,
-		TLSSNI:         firstNonEmpty(ex.RealitySNI, ex.Domain, host),
-		Path:           path,
-		RealityPubKey:  ex.RealityPubKey,
-		RealityShortID: ex.RealityShortID,
-		Username:       ex.SocksUser,
-		Password:       ex.SocksPass,
-	})
-}
-
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if strings.TrimSpace(v) != "" {
@@ -2636,7 +2547,7 @@ func addTLSExtraInbound(store *state.Store, exec reconcile.SystemExecutor, defRo
 	}
 	st, _ := store.Load()
 	fmt.Fprintf(stdout, "Added %s (%s :%d via_nginx=%v)\nUUID: %s\nPath: %s\nURI:  %s\n",
-		ex.Tag, ex.Protocol, ex.ListenPort, ex.ViaNginx, ex.UUID, render.NormalizePath(ex.Path, ex.UUID), buildExtraShareURI(st, ex))
+		ex.Tag, ex.Protocol, ex.ListenPort, ex.ViaNginx, ex.UUID, render.NormalizePath(ex.Path, ex.UUID), render.BuildExtraURI(st, ex))
 	return 0
 }
 
@@ -2662,7 +2573,7 @@ func cmdExtra(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 				fmt.Fprintf(stdout, " domain=%s path=%s", ex.Domain, render.NormalizePath(ex.Path, ex.UUID))
 			}
 			fmt.Fprintln(stdout)
-			if uri := buildExtraShareURI(st, ex); uri != "" {
+			if uri := render.BuildExtraURI(st, ex); uri != "" {
 				fmt.Fprintf(stdout, "  URI: %s\n", uri)
 			}
 		}
@@ -2815,7 +2726,7 @@ func cmdExtra(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 		}
 		st, _ := store.Load()
 		fmt.Fprintf(stdout, "Added %s (%s :%d)\nUUID: %s\nPBK:  %s\nSID:  %s\nSNI:  %s\nURI:  %s\n",
-			ex.Tag, ex.Protocol, ex.ListenPort, ex.UUID, ex.RealityPubKey, ex.RealityShortID, ex.RealitySNI, buildExtraShareURI(st, ex))
+			ex.Tag, ex.Protocol, ex.ListenPort, ex.UUID, ex.RealityPubKey, ex.RealityShortID, ex.RealitySNI, render.BuildExtraURI(st, ex))
 		return 0
 
 	case "add-socks5":
@@ -2852,7 +2763,7 @@ func cmdExtra(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 			return 1
 		}
 		st, _ := store.Load()
-		fmt.Fprintf(stdout, "Added %s (socks5 :%d)\nURI: %s\n", ex.Tag, ex.ListenPort, buildExtraShareURI(st, ex))
+		fmt.Fprintf(stdout, "Added %s (socks5 :%d)\nURI: %s\n", ex.Tag, ex.ListenPort, render.BuildExtraURI(st, ex))
 		return 0
 
 	case "del":

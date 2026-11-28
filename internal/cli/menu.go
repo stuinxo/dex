@@ -1804,5 +1804,3 @@ func menuClientDNS(store *state.Store, exec reconcile.SystemExecutor, p *menuPro
 		cmdDNS(store, exec, args, stdout, stderr)
 	}
 }
-
-var _ = render.RenderAll // ensure render imported for helper completeness

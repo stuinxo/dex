@@ -491,7 +491,7 @@ func buildExtraInbound(ex state.ExtraInbound, viaNginxPort int, certFile, keyFil
 		if viaNginxPort > 0 {
 			bindPort = viaNginxPort
 		} else {
-			bindPort = ExtraInternalPort(ex.ListenPort)
+			bindPort = state.ExtraInternalPort(ex.ListenPort)
 		}
 	}
 
@@ -632,7 +632,7 @@ func RenderXray(s *state.State, opts RenderOptions) (data []byte, needed bool, e
 		"servers":       dnsServers,
 	}
 
-	viaNginxPorts := AllocateViaNginxInternalPorts(s)
+	viaNginxPorts := state.AllocateViaNginxInternalPorts(s)
 	wildcardListen := inboundWildcardListen(s.System.EnableIPv6)
 
 	addCommonRelayAndExtra := func(mark int) {
