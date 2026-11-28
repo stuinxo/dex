@@ -19,6 +19,7 @@ import (
 	"github.com/stuinxo/dex/internal/reconcile"
 	"github.com/stuinxo/dex/internal/render"
 	"github.com/stuinxo/dex/internal/state"
+	"github.com/stuinxo/dex/internal/update"
 )
 
 type fakeOpsExec struct {
@@ -152,7 +153,7 @@ func TestUpdateRulesAndHTMLRejection(t *testing.T) {
 
 	dir := t.TempDir()
 	store := state.NewStore(filepath.Join(dir, "dex"))
-	cfg := OpsConfig{
+	cfg := update.OpsConfig{
 		Client:          srv.Client(),
 		GeoIPURL:        srv.URL + "/geoip.dat",
 		GeoSiteURL:      srv.URL + "/geosite.dat",
@@ -169,7 +170,7 @@ func TestUpdateRulesAndHTMLRejection(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := UpdateRules(context.Background(), store, &fakeOpsExec{}, cfg, true, true, &out); err != nil {
+	if err := update.UpdateRules(context.Background(), store, &fakeOpsExec{}, cfg, true, true, &out); err != nil {
 		t.Fatalf("UpdateRules failed: %v", err)
 	}
 	b, err := os.ReadFile(filepath.Join(store.Dir, "rules", "IPchnroute"))
@@ -179,7 +180,7 @@ func TestUpdateRulesAndHTMLRejection(t *testing.T) {
 
 	// Ensure invalid HTML keeps previous good IPchnroute untouched
 	serveHTML = true
-	if err := UpdateRules(context.Background(), store, &fakeOpsExec{}, cfg, false, true, &out); err == nil {
+	if err := update.UpdateRules(context.Background(), store, &fakeOpsExec{}, cfg, false, true, &out); err == nil {
 		t.Fatalf("expected UpdateRules to reject HTML error page")
 	}
 	after, _ := os.ReadFile(filepath.Join(store.Dir, "rules", "IPchnroute"))
@@ -226,7 +227,7 @@ func TestUpdateComponentsAtomicAndCleanupV2(t *testing.T) {
 	_ = store.Save(state.NewDefaultState(state.RoleClient))
 
 	exec := &fakeOpsExec{}
-	cfg := OpsConfig{
+	cfg := update.OpsConfig{
 		Client:              srv.Client(),
 		DexReleaseBase:      srv.URL + "/dex",
 		XrayReleaseBase:     srv.URL + "/xray",
@@ -240,7 +241,7 @@ func TestUpdateComponentsAtomicAndCleanupV2(t *testing.T) {
 
 	var out bytes.Buffer
 	for _, comp := range []string{"dex", "xray", "mosdns"} {
-		if err := UpdateComponents(context.Background(), store, exec, cfg, comp, "latest", &out); err != nil {
+		if err := update.UpdateComponents(context.Background(), store, exec, cfg, comp, "latest", &out); err != nil {
 			t.Fatalf("UpdateComponents(%s) failed: %v", comp, err)
 		}
 	}
@@ -347,7 +348,7 @@ func TestUpdateRulesRestoresBackupOnReconcileFailure(t *testing.T) {
 		t.Fatalf("Save state: %v", err)
 	}
 
-	cfg := OpsConfig{
+	cfg := update.OpsConfig{
 		Client:          srv.Client(),
 		GeoIPURL:        srv.URL + "/geoip.dat",
 		GeoSiteURL:      srv.URL + "/geosite.dat",
@@ -364,14 +365,14 @@ func TestUpdateRulesRestoresBackupOnReconcileFailure(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := UpdateRules(context.Background(), store, &fakeOpsExec{}, cfg, false, true, &out); err != nil {
+	if err := update.UpdateRules(context.Background(), store, &fakeOpsExec{}, cfg, false, true, &out); err != nil {
 		t.Fatalf("initial UpdateRules failed: %v", err)
 	}
 
 	// Second update with Reconcile failing must restore v1 rule files and remove newly added ads file.
 	useV2 = true
 	execFail := &fakeOpsExec{failResolve: true}
-	if err := UpdateRules(context.Background(), store, execFail, cfg, true, false, &out); err == nil {
+	if err := update.UpdateRules(context.Background(), store, execFail, cfg, true, false, &out); err == nil {
 		t.Fatalf("expected UpdateRules to fail when Reconcile fails")
 	}
 
@@ -607,7 +608,7 @@ func TestUpdateRulesRestartsAffectedServices(t *testing.T) {
 		t.Fatalf("Save state: %v", err)
 	}
 
-	cfg := OpsConfig{
+	cfg := update.OpsConfig{
 		Client:          srv.Client(),
 		GeoIPURL:        srv.URL + "/geoip.dat",
 		GeoSiteURL:      srv.URL + "/geosite.dat",
@@ -629,7 +630,7 @@ func TestUpdateRulesRestartsAffectedServices(t *testing.T) {
 	var out bytes.Buffer
 
 	// 1. Initial download creates all rule files -> restarts both dex-xray and dex-mosdns.
-	if err := UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
+	if err := update.UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
 		t.Fatalf("initial UpdateRules failed: %v", err)
 	}
 	if strings.Join(exec.restarted, ",") != "dex-xray,dex-mosdns" {
@@ -638,7 +639,7 @@ func TestUpdateRulesRestartsAffectedServices(t *testing.T) {
 
 	// 2. Unchanged second run -> restarts neither.
 	exec.restarted = nil
-	if err := UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
+	if err := update.UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
 		t.Fatalf("unchanged UpdateRules failed: %v", err)
 	}
 	if len(exec.restarted) != 0 {
@@ -648,7 +649,7 @@ func TestUpdateRulesRestartsAffectedServices(t *testing.T) {
 	// 3. Only Domains.chn.txt changed -> restarts only dex-mosdns.
 	exec.restarted = nil
 	chnDomains = "qq.com\nbaidu.com\ntaobao.com\n"
-	if err := UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
+	if err := update.UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
 		t.Fatalf("Domains.chn.txt UpdateRules failed: %v", err)
 	}
 	if strings.Join(exec.restarted, ",") != "dex-mosdns" {
@@ -658,7 +659,7 @@ func TestUpdateRulesRestartsAffectedServices(t *testing.T) {
 	// 4. Only Domains.apple.txt changed -> restarts only dex-mosdns.
 	exec.restarted = nil
 	appleDomains = "apple.com\nicloud.com\nmzstatic.com\n"
-	if err := UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
+	if err := update.UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
 		t.Fatalf("Domains.apple.txt UpdateRules failed: %v", err)
 	}
 	if strings.Join(exec.restarted, ",") != "dex-mosdns" {
@@ -668,7 +669,7 @@ func TestUpdateRulesRestartsAffectedServices(t *testing.T) {
 	// 5. Only Domains.games.txt changed -> restarts only dex-mosdns.
 	exec.restarted = nil
 	gamesDomains = "steampowered.com\nsteamcontent.com\nvalvesoftware.com\n"
-	if err := UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
+	if err := update.UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
 		t.Fatalf("Domains.games.txt UpdateRules failed: %v", err)
 	}
 	if strings.Join(exec.restarted, ",") != "dex-mosdns" {
@@ -678,7 +679,7 @@ func TestUpdateRulesRestartsAffectedServices(t *testing.T) {
 	// 6. Only geoip.dat changed -> restarts only dex-xray.
 	exec.restarted = nil
 	geoip = []byte("geoip-v2")
-	if err := UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
+	if err := update.UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
 		t.Fatalf("geoip.dat UpdateRules failed: %v", err)
 	}
 	if strings.Join(exec.restarted, ",") != "dex-xray" {
@@ -688,7 +689,7 @@ func TestUpdateRulesRestartsAffectedServices(t *testing.T) {
 	// 7. Only IPchnroute changed -> restarts only dex-mosdns.
 	exec.restarted = nil
 	chnCIDRs = "1.0.1.0/24\n223.5.5.0/24\n"
-	if err := UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
+	if err := update.UpdateRules(context.Background(), store, exec, cfg, true, false, &out); err != nil {
 		t.Fatalf("IPchnroute UpdateRules failed: %v", err)
 	}
 	if strings.Join(exec.restarted, ",") != "dex-mosdns" {
@@ -759,7 +760,7 @@ func TestUpdateMosDNSVerifySHA256AndRejectTamper(t *testing.T) {
 	store := state.NewStore(filepath.Join(dir, "state"))
 	_ = store.Save(state.NewDefaultState(state.RoleClient))
 
-	cfg := OpsConfig{
+	cfg := update.OpsConfig{
 		Client:              srv.Client(),
 		MosDNSBase:          srv.URL + "/mosdns",
 		MosDNSReleaseAPIURL: srv.URL + "/mosdns/release.json",
@@ -769,7 +770,7 @@ func TestUpdateMosDNSVerifySHA256AndRejectTamper(t *testing.T) {
 
 	var out bytes.Buffer
 	// 1. Succeeds via .sha256sum
-	if err := UpdateComponents(context.Background(), store, &fakeOpsExec{}, cfg, "mosdns", "latest", &out); err != nil {
+	if err := update.UpdateComponents(context.Background(), store, &fakeOpsExec{}, cfg, "mosdns", "latest", &out); err != nil {
 		t.Fatalf("mosdns update with .sha256sum failed: %v", err)
 	}
 	got, _ := os.ReadFile(binPath)
@@ -779,11 +780,11 @@ func TestUpdateMosDNSVerifySHA256AndRejectTamper(t *testing.T) {
 
 	// 2. Tampered zip rejected when verified via .sha256sum or Release API; existing binary preserved
 	serveZip = evilZip
-	if err := UpdateComponents(context.Background(), store, &fakeOpsExec{}, cfg, "mosdns", "latest", &out); err == nil || !strings.Contains(err.Error(), "sha256 mismatch") {
+	if err := update.UpdateComponents(context.Background(), store, &fakeOpsExec{}, cfg, "mosdns", "latest", &out); err == nil || !strings.Contains(err.Error(), "sha256 mismatch") {
 		t.Fatalf("expected sha256 mismatch for tampered zip (.sha256sum), got %v", err)
 	}
 	serveShaSumFile = false
-	if err := UpdateComponents(context.Background(), store, &fakeOpsExec{}, cfg, "mosdns", "latest", &out); err == nil || !strings.Contains(err.Error(), "sha256 mismatch") {
+	if err := update.UpdateComponents(context.Background(), store, &fakeOpsExec{}, cfg, "mosdns", "latest", &out); err == nil || !strings.Contains(err.Error(), "sha256 mismatch") {
 		t.Fatalf("expected sha256 mismatch for tampered zip (release API), got %v", err)
 	}
 	afterTamper, _ := os.ReadFile(binPath)
@@ -794,7 +795,7 @@ func TestUpdateMosDNSVerifySHA256AndRejectTamper(t *testing.T) {
 	// 3. Missing both .sha256sum and Release API metadata is rejected
 	serveZip = goodZip
 	serveReleaseAPI = false
-	if err := UpdateComponents(context.Background(), store, &fakeOpsExec{}, cfg, "mosdns", "latest", &out); err == nil {
+	if err := update.UpdateComponents(context.Background(), store, &fakeOpsExec{}, cfg, "mosdns", "latest", &out); err == nil {
 		t.Fatalf("expected error when neither .sha256sum nor release API is available")
 	}
 }
@@ -852,7 +853,7 @@ func TestUpdateComponentsRollsBackOnRestartFailure(t *testing.T) {
 	_ = os.WriteFile(mosBin, oldELF, 0o755)
 	_ = os.WriteFile(dexBin, oldELF, 0o755)
 
-	cfg := OpsConfig{
+	cfg := update.OpsConfig{
 		Client:          srv.Client(),
 		XrayReleaseBase: srv.URL + "/xray",
 		MosDNSBase:      srv.URL + "/mosdns",
@@ -866,7 +867,7 @@ func TestUpdateComponentsRollsBackOnRestartFailure(t *testing.T) {
 	// 1. Xray restart fails -> error returned, old xray binary restored, no "Updated ... cleanly"
 	var out bytes.Buffer
 	execXrayFail := &fakeOpsExec{activeSvcs: map[string]bool{"dex-xray": true}, failRestartSvc: "dex-xray"}
-	if err := UpdateComponents(context.Background(), store, execXrayFail, cfg, "xray", "latest", &out); err == nil {
+	if err := update.UpdateComponents(context.Background(), store, execXrayFail, cfg, "xray", "latest", &out); err == nil {
 		t.Fatalf("expected UpdateComponents(xray) to fail on restart error")
 	}
 	if strings.Contains(out.String(), "Updated") {
@@ -879,7 +880,7 @@ func TestUpdateComponentsRollsBackOnRestartFailure(t *testing.T) {
 	// 2. MosDNS restart fails -> error returned, old mosdns binary restored
 	out.Reset()
 	execMosFail := &fakeOpsExec{activeSvcs: map[string]bool{"dex-mosdns": true}, failRestartSvc: "dex-mosdns"}
-	if err := UpdateComponents(context.Background(), store, execMosFail, cfg, "mosdns", "latest", &out); err == nil {
+	if err := update.UpdateComponents(context.Background(), store, execMosFail, cfg, "mosdns", "latest", &out); err == nil {
 		t.Fatalf("expected UpdateComponents(mosdns) to fail on restart error")
 	}
 	if strings.Contains(out.String(), "Updated") {
@@ -892,7 +893,7 @@ func TestUpdateComponentsRollsBackOnRestartFailure(t *testing.T) {
 	// 3. DEX consumer (dex-doh) restart fails -> error returned, old dex binary restored
 	out.Reset()
 	execDohFail := &fakeOpsExec{activeSvcs: map[string]bool{"dex-doh": true, "dex-daemon": true}, failRestartSvc: "dex-doh"}
-	if err := UpdateComponents(context.Background(), store, execDohFail, cfg, "dex", "latest", &out); err == nil {
+	if err := update.UpdateComponents(context.Background(), store, execDohFail, cfg, "dex", "latest", &out); err == nil {
 		t.Fatalf("expected UpdateComponents(dex) to fail on dex-doh restart error")
 	}
 	if strings.Contains(out.String(), "Updated") {
@@ -904,7 +905,7 @@ func TestUpdateComponentsRollsBackOnRestartFailure(t *testing.T) {
 
 	// 4. Explicit invalid DEX_BIN fails instead of silently downloading
 	t.Setenv("DEX_BIN", filepath.Join(dir, "does-not-exist"))
-	if err := UpdateComponents(context.Background(), store, &fakeOpsExec{}, cfg, "dex", "latest", &out); err == nil || !strings.Contains(err.Error(), "DEX_BIN") {
+	if err := update.UpdateComponents(context.Background(), store, &fakeOpsExec{}, cfg, "dex", "latest", &out); err == nil || !strings.Contains(err.Error(), "DEX_BIN") {
 		t.Fatalf("expected explicit missing DEX_BIN error, got %v", err)
 	}
 }
@@ -1012,8 +1013,8 @@ func TestBootstrapRoleRuntimeDeps(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	newCfg := func(dir string) OpsConfig {
-		return OpsConfig{
+	newCfg := func(dir string) update.OpsConfig {
+		return update.OpsConfig{
 			Client:          srv.Client(),
 			XrayReleaseBase: srv.URL + "/xray",
 			MosDNSBase:      srv.URL + "/mosdns",

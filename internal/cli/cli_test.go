@@ -18,6 +18,7 @@ import (
 	"github.com/stuinxo/dex/internal/reconcile"
 	"github.com/stuinxo/dex/internal/render"
 	"github.com/stuinxo/dex/internal/state"
+	"github.com/stuinxo/dex/internal/update"
 )
 
 func TestCLISmokeEndToEnd(t *testing.T) {
@@ -494,7 +495,7 @@ func TestHardeningCLIInitForceDLModeNodeDelMenuPortRelayAndServices(t *testing.T
 	}))
 	defer dlSrv.Close()
 	dlDst := filepath.Join(dir, "rules", "geoip.dat")
-	if err := DownloadVerifiedFile(context.Background(), dlSrv.Client(), dlSrv.URL+"/geoip.dat", hexSum, dlDst, false); err != nil {
+	if err := update.DownloadVerifiedFile(context.Background(), dlSrv.Client(), dlSrv.URL+"/geoip.dat", hexSum, dlDst, false); err != nil {
 		t.Fatalf("DownloadVerifiedFile failed: %v", err)
 	}
 	info, err := os.Stat(dlDst)

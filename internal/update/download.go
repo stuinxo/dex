@@ -1,4 +1,4 @@
-package cli
+package update
 
 import (
 	"bytes"
@@ -73,35 +73,6 @@ func IsELFBinary(path string) (bool, error) {
 		return false, nil
 	}
 	return bytes.Equal(hdr[:], []byte{0x7f, 'E', 'L', 'F'}), nil
-}
-
-// FindLocalPackage checks an env override and common local directories for an offline package or binary.
-func FindLocalPackage(envKey string, filenames []string) string {
-	if envKey != "" {
-		if p := strings.TrimSpace(os.Getenv(envKey)); p != "" {
-			if info, err := os.Stat(p); err == nil && !info.IsDir() {
-				return p
-			}
-		}
-	}
-	var dirs []string
-	if exe, err := os.Executable(); err == nil {
-		dirs = append(dirs, filepath.Dir(exe))
-	}
-	if cwd, err := os.Getwd(); err == nil {
-		dirs = append(dirs, cwd)
-	}
-	dirs = append(dirs, "/root", "/tmp")
-
-	for _, dir := range dirs {
-		for _, name := range filenames {
-			cand := filepath.Join(dir, name)
-			if info, err := os.Stat(cand); err == nil && !info.IsDir() && info.Size() > 0 {
-				return cand
-			}
-		}
-	}
-	return ""
 }
 
 // DownloadWithMirrors downloads rawURL to dstPath atomically, falling back across GitHub mirrors.

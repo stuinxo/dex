@@ -10,6 +10,7 @@ import (
 	"github.com/stuinxo/dex/internal/reconcile"
 	"github.com/stuinxo/dex/internal/render"
 	"github.com/stuinxo/dex/internal/state"
+	"github.com/stuinxo/dex/internal/update"
 	"github.com/stuinxo/dex/internal/version"
 	"io"
 	"net"
@@ -407,7 +408,7 @@ func cmdInitWithDefaultApply(store *state.Store, exec reconcile.SystemExecutor, 
 
 	if effectiveApply {
 		if _, isOS := exec.(reconcile.OSExecutor); isOS {
-			if err := bootstrapRoleRuntimeDeps(context.Background(), store, exec, st.Role, OpsConfig{}, stdout); err != nil {
+			if err := bootstrapRoleRuntimeDeps(context.Background(), store, exec, st.Role, update.OpsConfig{}, stdout); err != nil {
 				fmt.Fprintf(stderr, "bootstrap runtime dependencies failed: %v\n", err)
 				return 1
 			}

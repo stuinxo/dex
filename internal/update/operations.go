@@ -1,0 +1,888 @@
+package update
+
+import (
+	"archive/zip"
+	"bufio"
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+
+	"github.com/stuinxo/dex/internal/fsutil"
+	"github.com/stuinxo/dex/internal/reconcile"
+	"github.com/stuinxo/dex/internal/state"
+)
+
+// OpsConfig configures remote sources and install targets for dex rules/update (overridable in tests).
+type OpsConfig struct {
+	Client              *http.Client
+	GeoIPURL            string
+	GeoSiteURL          string
+	ChnRouteURL         string
+	DomainsChnURL       string
+	DomainsAdsURL       string
+	DomainsAppleURL     string
+	DomainsGamesURL     string
+	DexRepo             string
+	DexReleaseBase      string // optional override base URL instead of GitHub repo releases
+	XrayReleaseBase     string
+	MosDNSBase          string
+	MosDNSReleaseAPIURL string
+	DexBinPath          string
+	XrayBinPath         string
+	MosDNSBinPath       string
+	GOARCH              string
+	MinChnRouteCIDR     int
+	MinChnDomains       int
+	MinAdsDomains       int
+	MinAppleDomains     int
+	MinGamesDomains     int
+	SkipDaemonRestart   bool
+}
+
+// WithDefaults resolves omitted sources, install targets and rule thresholds.
+func (c OpsConfig) WithDefaults(versionTag string) OpsConfig {
+	if c.Client == nil {
+		c.Client = &http.Client{Timeout: 180 * time.Second}
+	}
+	if c.GeoIPURL == "" {
+		c.GeoIPURL = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+	}
+	if c.GeoSiteURL == "" {
+		c.GeoSiteURL = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+	}
+	if c.ChnRouteURL == "" {
+		c.ChnRouteURL = "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text/cn.txt"
+	}
+	if c.DomainsChnURL == "" {
+		c.DomainsChnURL = "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt"
+	}
+	if c.DomainsAdsURL == "" {
+		c.DomainsAdsURL = "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/reject-list.txt"
+	}
+	if c.DexRepo == "" {
+		c.DexRepo = strings.TrimSpace(os.Getenv("DEX_REPO"))
+		if c.DexRepo == "" {
+			c.DexRepo = "stuinxo/dex"
+		}
+	}
+	if c.DomainsAppleURL == "" {
+		c.DomainsAppleURL = fmt.Sprintf("https://raw.githubusercontent.com/%s/main/rules/Domains.apple.txt", c.DexRepo)
+	}
+	if c.DomainsGamesURL == "" {
+		c.DomainsGamesURL = fmt.Sprintf("https://raw.githubusercontent.com/%s/main/rules/Domains.games.txt", c.DexRepo)
+	}
+	if c.DexReleaseBase == "" {
+		if versionTag == "" || versionTag == "latest" {
+			c.DexReleaseBase = fmt.Sprintf("https://github.com/%s/releases/latest/download", c.DexRepo)
+		} else {
+			c.DexReleaseBase = fmt.Sprintf("https://github.com/%s/releases/download/%s", c.DexRepo, versionTag)
+		}
+	}
+	if c.XrayReleaseBase == "" {
+		c.XrayReleaseBase = "https://github.com/XTLS/Xray-core/releases/latest/download"
+	}
+	if c.MosDNSBase == "" {
+		c.MosDNSBase = "https://github.com/IrineSistiana/mosdns/releases/latest/download"
+	}
+	if c.MosDNSReleaseAPIURL == "" {
+		c.MosDNSReleaseAPIURL = "https://api.github.com/repos/IrineSistiana/mosdns/releases/latest"
+	}
+	if c.DexBinPath == "" {
+		c.DexBinPath = "/usr/local/bin/dex"
+	}
+	if c.XrayBinPath == "" {
+		c.XrayBinPath = "/usr/local/bin/xray"
+	}
+	if c.MosDNSBinPath == "" {
+		c.MosDNSBinPath = "/usr/local/bin/mosdns"
+	}
+	if c.GOARCH == "" {
+		c.GOARCH = runtime.GOARCH
+	}
+	if c.MinChnRouteCIDR <= 0 {
+		c.MinChnRouteCIDR = 1000
+	}
+	if c.MinChnDomains <= 0 {
+		c.MinChnDomains = 10000
+	}
+	if c.MinAdsDomains <= 0 {
+		c.MinAdsDomains = 1000
+	}
+	if c.MinAppleDomains <= 0 {
+		c.MinAppleDomains = 100
+	}
+	if c.MinGamesDomains <= 0 {
+		c.MinGamesDomains = 100
+	}
+	return c
+}
+
+// UpdateRules serializes download, validation, publication and optional reconcile
+// against other updates and applies using the same state directory.
+func UpdateRules(ctx context.Context, store *state.Store, exec reconcile.SystemExecutor, cfg OpsConfig, includeAds, noApply bool, stdout io.Writer) error {
+	return store.WithApplyLock(ctx, func(locked *state.Store) error {
+		return updateRulesLocked(ctx, locked, exec, cfg, includeAds, noApply, stdout)
+	})
+}
+
+func updateRulesLocked(ctx context.Context, store *state.Store, exec reconcile.SystemExecutor, cfg OpsConfig, includeAds, noApply bool, stdout io.Writer) error {
+	cfg = cfg.WithDefaults("")
+	rulesDir := filepath.Join(store.Dir, "rules")
+	if err := os.MkdirAll(rulesDir, 0o755); err != nil {
+		return fmt.Errorf("create rules dir: %w", err)
+	}
+
+	st, stErr := store.Load()
+	if stErr == nil && st != nil && st.Client.DNS.BlockAds {
+		includeAds = true
+	}
+
+	backups, bakDir, err := backupRulesFiles(rulesDir)
+	if err != nil {
+		return fmt.Errorf("backup existing rules: %w", err)
+	}
+	keepBackups := false
+	defer func() {
+		if !keepBackups {
+			_ = os.RemoveAll(bakDir)
+		}
+	}()
+
+	failWithRestore := func(operationErr error) error {
+		if restoreErr := restoreRulesFiles(backups); restoreErr != nil {
+			keepBackups = true
+			return errors.Join(operationErr, fmt.Errorf("restore rules failed; backups retained at %s: %w", bakDir, restoreErr))
+		}
+		return operationErr
+	}
+
+	if stdout != nil {
+		fmt.Fprintf(stdout, "[*] Updating geoip.dat & geosite.dat (SHA256 verified)...\n")
+	}
+	if err := DownloadVerifiedFile(ctx, cfg.Client, cfg.GeoIPURL, cfg.GeoIPURL+".sha256sum", filepath.Join(rulesDir, "geoip.dat"), false); err != nil {
+		return failWithRestore(fmt.Errorf("update geoip.dat: %w", err))
+	}
+	if err := DownloadVerifiedFile(ctx, cfg.Client, cfg.GeoSiteURL, cfg.GeoSiteURL+".sha256sum", filepath.Join(rulesDir, "geosite.dat"), false); err != nil {
+		return failWithRestore(fmt.Errorf("update geosite.dat: %w", err))
+	}
+
+	if stdout != nil {
+		fmt.Fprintf(stdout, "[*] Updating IPchnroute & Domains.chn.txt...\n")
+	}
+	if err := downloadAndValidateTextRule(ctx, cfg.Client, cfg.ChnRouteURL, filepath.Join(rulesDir, "IPchnroute"), func(path string) error {
+		return validateChnRouteFile(path, cfg.MinChnRouteCIDR)
+	}); err != nil {
+		return failWithRestore(fmt.Errorf("update IPchnroute: %w", err))
+	}
+	if err := downloadAndValidateTextRule(ctx, cfg.Client, cfg.DomainsChnURL, filepath.Join(rulesDir, "Domains.chn.txt"), func(path string) error {
+		return validateDomainListFile(path, cfg.MinChnDomains)
+	}); err != nil {
+		return failWithRestore(fmt.Errorf("update Domains.chn.txt: %w", err))
+	}
+
+	if stdout != nil {
+		fmt.Fprintf(stdout, "[*] Updating Domains.apple.txt & Domains.games.txt...\n")
+	}
+	if err := downloadAndValidateTextRule(ctx, cfg.Client, cfg.DomainsAppleURL, filepath.Join(rulesDir, "Domains.apple.txt"), func(path string) error {
+		return validateDomainListFile(path, cfg.MinAppleDomains)
+	}); err != nil {
+		return failWithRestore(fmt.Errorf("update Domains.apple.txt: %w", err))
+	}
+	if err := downloadAndValidateTextRule(ctx, cfg.Client, cfg.DomainsGamesURL, filepath.Join(rulesDir, "Domains.games.txt"), func(path string) error {
+		return validateDomainListFile(path, cfg.MinGamesDomains)
+	}); err != nil {
+		return failWithRestore(fmt.Errorf("update Domains.games.txt: %w", err))
+	}
+
+	if includeAds {
+		if stdout != nil {
+			fmt.Fprintf(stdout, "[*] Updating Domains.ads.txt...\n")
+		}
+		if err := downloadAndValidateTextRule(ctx, cfg.Client, cfg.DomainsAdsURL, filepath.Join(rulesDir, "Domains.ads.txt"), func(path string) error {
+			return validateDomainListFile(path, cfg.MinAdsDomains)
+		}); err != nil {
+			return failWithRestore(fmt.Errorf("update Domains.ads.txt: %w", err))
+		}
+	}
+
+	if stdout != nil {
+		fmt.Fprintln(stdout, "[+] Rules updated cleanly.")
+	}
+	if !noApply && stErr == nil && st != nil {
+		if _, err := reconcile.Reconcile(ctx, store, exec, reconcile.ApplyOptions{}); err != nil {
+			return failWithRestore(fmt.Errorf("reconcile after rules update: %w", err))
+		}
+		// Restart services that read rule files directly outside RenderBundle:
+		// xray reads geoip.dat / geosite.dat via XRAY_LOCATION_ASSET;
+		// mosdns reads IPchnroute / Domains.chn.txt / Domains.apple.txt / Domains.games.txt / Domains.ads.txt.
+		if anyRuleFileChanged(backups, "geoip.dat", "geosite.dat") {
+			if err := restartIfActive(ctx, exec, "dex-xray"); err != nil {
+				recoveryErr := failWithRestore(fmt.Errorf("restart dex-xray after rules update: %w", err))
+				bestEffortRestartActive(ctx, exec, "dex-xray")
+				return recoveryErr
+			}
+		}
+		if anyRuleFileChanged(backups, "IPchnroute", "Domains.chn.txt", "Domains.apple.txt", "Domains.games.txt", "Domains.ads.txt") {
+			if err := restartIfActive(ctx, exec, "dex-mosdns"); err != nil {
+				recoveryErr := failWithRestore(fmt.Errorf("restart dex-mosdns after rules update: %w", err))
+				bestEffortRestartActive(ctx, exec, "dex-xray", "dex-mosdns")
+				return recoveryErr
+			}
+		}
+		if stdout != nil {
+			fmt.Fprintln(stdout, "[+] Applied updated rules.")
+		}
+	}
+	return nil
+}
+
+type ruleFileBackup struct {
+	name     string
+	livePath string
+	bakPath  string
+	existed  bool
+	mode     os.FileMode
+}
+
+func fileSHA256(path string) ([sha256.Size]byte, error) {
+	var sum [sha256.Size]byte
+	f, err := os.Open(path)
+	if err != nil {
+		return sum, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return sum, err
+	}
+	copy(sum[:], h.Sum(nil))
+	return sum, nil
+}
+
+func anyRuleFileChanged(backups []ruleFileBackup, names ...string) bool {
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
+	for _, b := range backups {
+		if !want[b.name] {
+			continue
+		}
+		if !b.existed {
+			if _, err := os.Stat(b.livePath); err == nil {
+				return true
+			}
+			continue
+		}
+		oldSum, err1 := fileSHA256(b.bakPath)
+		newSum, err2 := fileSHA256(b.livePath)
+		if err1 != nil || err2 != nil || oldSum != newSum {
+			return true
+		}
+	}
+	return false
+}
+
+func backupRulesFiles(rulesDir string) ([]ruleFileBackup, string, error) {
+	bakDir, err := os.MkdirTemp(rulesDir, ".rules-bak-*")
+	if err != nil {
+		return nil, "", err
+	}
+	backups := make([]ruleFileBackup, 0, len(state.ManagedRuleFiles))
+	for _, name := range state.ManagedRuleFiles {
+		live := filepath.Join(rulesDir, name)
+		info, statErr := os.Stat(live)
+		if os.IsNotExist(statErr) {
+			backups = append(backups, ruleFileBackup{name: name, livePath: live, existed: false})
+			continue
+		}
+		if statErr != nil {
+			_ = os.RemoveAll(bakDir)
+			return nil, "", statErr
+		}
+		if info.IsDir() {
+			continue
+		}
+		bakPath := filepath.Join(bakDir, name)
+		mode := info.Mode().Perm()
+		if err := fsutil.CopyFileAtomic(live, bakPath, mode); err != nil {
+			_ = os.RemoveAll(bakDir)
+			return nil, "", err
+		}
+		backups = append(backups, ruleFileBackup{
+			name:     name,
+			livePath: live,
+			bakPath:  bakPath,
+			existed:  true,
+			mode:     mode,
+		})
+	}
+	return backups, bakDir, nil
+}
+
+func restoreRulesFiles(backups []ruleFileBackup) error {
+	var failures []error
+	for _, b := range backups {
+		var err error
+		if b.existed {
+			err = fsutil.CopyFileAtomic(b.bakPath, b.livePath, b.mode)
+		} else {
+			err = os.Remove(b.livePath)
+			if os.IsNotExist(err) {
+				err = nil
+			}
+		}
+		if err != nil {
+			failures = append(failures, fmt.Errorf("restore %s: %w", b.name, err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func downloadAndValidateTextRule(ctx context.Context, client *http.Client, rawURL, dstPath string, validate func(string) error) error {
+	stagePath := dstPath + ".stage"
+	defer os.Remove(stagePath)
+	if err := DownloadWithMirrors(ctx, client, rawURL, stagePath, nil); err != nil {
+		return err
+	}
+	if err := validate(stagePath); err != nil {
+		return err
+	}
+	if err := os.Chmod(stagePath, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(stagePath, dstPath)
+}
+
+func validateChnRouteFile(path string, minCIDRs int) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	count := 0
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.Contains(strings.ToLower(line), "<html") {
+			return errors.New("downloaded IPchnroute looks like HTML")
+		}
+		if p, perr := netip.ParsePrefix(line); perr == nil && p.Addr().Is4() {
+			count++
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return err
+	}
+	if count < minCIDRs {
+		return fmt.Errorf("IPchnroute validation failed: only %d IPv4 CIDRs (want >= %d)", count, minCIDRs)
+	}
+	return nil
+}
+
+func validateDomainListFile(path string, minLines int) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	count := 0
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		low := strings.ToLower(line)
+		if strings.Contains(low, "<html") || strings.Contains(low, "<!doctype html") {
+			return errors.New("downloaded domain rule file looks like HTML")
+		}
+		count++
+	}
+	if err := sc.Err(); err != nil {
+		return err
+	}
+	if count < minLines {
+		return fmt.Errorf("domain list validation failed: only %d entries (want >= %d)", count, minLines)
+	}
+	return nil
+}
+
+// UpdateComponents serializes component updates with applies for this state directory.
+// Each component retains its checksum, ELF and restart recovery checks.
+func UpdateComponents(ctx context.Context, store *state.Store, exec reconcile.SystemExecutor, cfg OpsConfig, component, versionTag string, stdout io.Writer) error {
+	return store.WithApplyLock(ctx, func(locked *state.Store) error {
+		return updateComponentsLocked(ctx, locked, exec, cfg, component, versionTag, stdout)
+	})
+}
+
+func updateComponentsLocked(ctx context.Context, store *state.Store, exec reconcile.SystemExecutor, cfg OpsConfig, component, versionTag string, stdout io.Writer) error {
+	cfg = cfg.WithDefaults(versionTag)
+	dexArch, xrayArch, mosArch, err := mapArch(cfg.GOARCH)
+	if err != nil {
+		return err
+	}
+
+	st, stErr := store.Load()
+	hasBinary := func(p string) bool {
+		info, serr := os.Stat(p)
+		return serr == nil && !info.IsDir()
+	}
+
+	updateOne := func(comp string) error {
+		switch comp {
+		case "dex":
+			return updateDexBinary(ctx, exec, cfg, dexArch, stdout)
+		case "xray":
+			return updateXrayBinary(ctx, exec, cfg, xrayArch, stdout)
+		case "mosdns":
+			return updateMosDNSBinary(ctx, exec, cfg, mosArch, stdout)
+		case "rules":
+			return UpdateRules(ctx, store, exec, cfg, false, false, stdout)
+		default:
+			return fmt.Errorf("unknown component %q (want all|dex|xray|mosdns|rules)", comp)
+		}
+	}
+
+	if component != "all" {
+		return updateOne(component)
+	}
+
+	if err := updateOne("dex"); err != nil {
+		return err
+	}
+	if hasBinary(cfg.XrayBinPath) || (stErr == nil && st.Role != state.RoleRelay) {
+		if err := updateOne("xray"); err != nil {
+			return err
+		}
+	}
+	if hasBinary(cfg.MosDNSBinPath) || (stErr == nil && st.Role == state.RoleClient) {
+		if err := updateOne("mosdns"); err != nil {
+			return err
+		}
+	}
+	if _, rerr := os.Stat(filepath.Join(store.Dir, "rules")); rerr == nil || (stErr == nil && st.Role == state.RoleClient) {
+		if err := updateOne("rules"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func mapArch(goarch string) (dexArch, xrayArch, mosArch string, err error) {
+	switch goarch {
+	case "amd64":
+		return "amd64", "64", "amd64", nil
+	case "arm64":
+		return "arm64", "arm64-v8a", "arm64", nil
+	default:
+		return "", "", "", fmt.Errorf("unsupported architecture: %s", goarch)
+	}
+}
+
+func findSHA256Entry(sumsData []byte, assetName string) (string, error) {
+	sc := bufio.NewScanner(strings.NewReader(string(sumsData)))
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 2 {
+			continue
+		}
+		name := strings.TrimPrefix(fields[1], "*")
+		if name == assetName {
+			return NormalizeSHA256(fields[0])
+		}
+	}
+	return "", fmt.Errorf("checksum entry for %s not found", assetName)
+}
+
+func parseXrayDigest(dgstData []byte) (string, error) {
+	sc := bufio.NewScanner(strings.NewReader(string(dgstData)))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		for _, prefix := range []string{"SHA2-256=", "SHA256="} {
+			if rest, ok := strings.CutPrefix(line, prefix); ok {
+				return NormalizeSHA256(rest)
+			}
+		}
+	}
+	return "", errors.New("SHA2-256 digest not found in .dgst")
+}
+
+func installBinaryAtomic(srcPath, dstPath string) error {
+	ok, err := IsELFBinary(srcPath)
+	if err != nil || !ok {
+		return fmt.Errorf("%s is not a valid Linux ELF binary", srcPath)
+	}
+	return fsutil.CopyFileAtomic(srcPath, dstPath, 0o755)
+}
+
+func extractZipBinaryToTemp(zipPath, entryBase, tmpDir string) (string, error) {
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return "", fmt.Errorf("open zip %s: %w", zipPath, err)
+	}
+	defer zr.Close()
+
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() || filepath.Base(f.Name) != entryBase {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return "", err
+		}
+		tmp, err := os.CreateTemp(tmpDir, ".zipext.tmp.*")
+		if err != nil {
+			_ = rc.Close()
+			return "", err
+		}
+		tmpName := tmp.Name()
+		_, copyErr := io.Copy(tmp, io.LimitReader(rc, 256<<20))
+		_ = rc.Close()
+		closeErr := tmp.Close()
+		if copyErr != nil || closeErr != nil {
+			_ = os.Remove(tmpName)
+			if copyErr != nil {
+				return "", copyErr
+			}
+			return "", closeErr
+		}
+		return tmpName, nil
+	}
+	return "", fmt.Errorf("entry %q not found inside %s", entryBase, zipPath)
+}
+
+func backupExistingBinary(dstPath string) (bakPath string, existed bool, err error) {
+	info, statErr := os.Stat(dstPath)
+	if os.IsNotExist(statErr) {
+		return "", false, nil
+	}
+	if statErr != nil {
+		return "", false, statErr
+	}
+	if info.IsDir() {
+		return "", false, fmt.Errorf("destination %s is a directory", dstPath)
+	}
+	bak, err := os.CreateTemp(filepath.Dir(dstPath), ".bak-upd.*")
+	if err != nil {
+		return "", false, err
+	}
+	bakName := bak.Name()
+	_ = bak.Close()
+	if err := fsutil.CopyFileAtomic(dstPath, bakName, info.Mode().Perm()); err != nil {
+		_ = os.Remove(bakName)
+		return "", false, err
+	}
+	return bakName, true, nil
+}
+
+func installBinaryWithRollback(newSrc, dstPath string, linkDeGWD bool, verifyRestart func() error, rollbackRestart func()) error {
+	ok, err := IsELFBinary(newSrc)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("%s is not a valid Linux ELF binary", newSrc)
+	}
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+		return err
+	}
+	bakPath, hasBackup, err := backupExistingBinary(dstPath)
+	if err != nil {
+		return err
+	}
+	if hasBackup {
+		defer os.Remove(bakPath)
+	}
+	if err := installBinaryAtomic(newSrc, dstPath); err != nil {
+		return err
+	}
+	linkPath := filepath.Join(filepath.Dir(dstPath), "de_GWD")
+	if linkDeGWD {
+		_ = os.Remove(linkPath)
+		_ = os.Symlink(dstPath, linkPath)
+	}
+	if verifyRestart != nil {
+		if err := verifyRestart(); err != nil {
+			if hasBackup {
+				_ = os.Rename(bakPath, dstPath)
+				if linkDeGWD {
+					_ = os.Remove(linkPath)
+					_ = os.Symlink(dstPath, linkPath)
+				}
+			} else {
+				_ = os.Remove(dstPath)
+				if linkDeGWD {
+					_ = os.Remove(linkPath)
+				}
+			}
+			if rollbackRestart != nil {
+				rollbackRestart()
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func updateDexBinary(ctx context.Context, exec reconcile.SystemExecutor, cfg OpsConfig, dexArch string, stdout io.Writer) error {
+	verifyRestart := func() error { return restartDexConsumers(ctx, exec, cfg) }
+	rollbackRestart := func() { bestEffortRestartDexConsumers(ctx, exec, cfg) }
+
+	if local := strings.TrimSpace(os.Getenv("DEX_BIN")); local != "" {
+		info, err := os.Stat(local)
+		if err != nil {
+			return fmt.Errorf("specified DEX_BIN %q is invalid: %w", local, err)
+		}
+		if info.IsDir() {
+			return fmt.Errorf("specified DEX_BIN %q is a directory", local)
+		}
+		if err := installBinaryWithRollback(local, cfg.DexBinPath, true, verifyRestart, rollbackRestart); err != nil {
+			return err
+		}
+		if stdout != nil {
+			fmt.Fprintf(stdout, "[+] Updated dex from local DEX_BIN=%s\n", local)
+		}
+		return nil
+	}
+
+	asset := "dex-linux-" + dexArch
+	binStage := cfg.DexBinPath + ".stage"
+	sumStage := cfg.DexBinPath + ".sha256"
+	defer os.Remove(binStage)
+	defer os.Remove(sumStage)
+
+	if stdout != nil {
+		fmt.Fprintf(stdout, "[*] Downloading %s...\n", asset)
+	}
+	if err := DownloadWithMirrors(ctx, cfg.Client, strings.TrimRight(cfg.DexReleaseBase, "/")+"/"+asset, binStage, nil); err != nil {
+		return err
+	}
+	if err := DownloadTrustAnchor(ctx, cfg.Client, strings.TrimRight(cfg.DexReleaseBase, "/")+"/SHA256SUMS", sumStage); err != nil {
+		return err
+	}
+	sumsData, err := os.ReadFile(sumStage)
+	if err != nil {
+		return err
+	}
+	expectedHex, err := findSHA256Entry(sumsData, asset)
+	if err != nil {
+		return err
+	}
+	if err := VerifyFileSHA256(binStage, expectedHex); err != nil {
+		return err
+	}
+	if err := installBinaryWithRollback(binStage, cfg.DexBinPath, true, verifyRestart, rollbackRestart); err != nil {
+		return err
+	}
+	if stdout != nil {
+		fmt.Fprintf(stdout, "[+] Updated %s cleanly.\n", cfg.DexBinPath)
+	}
+	return nil
+}
+
+func restartDexConsumers(ctx context.Context, exec reconcile.SystemExecutor, cfg OpsConfig) error {
+	if cfg.SkipDaemonRestart {
+		return restartIfActive(ctx, exec, "dex-doh")
+	}
+	return restartIfActive(ctx, exec, "dex-doh", "dex-daemon")
+}
+
+func bestEffortRestartDexConsumers(ctx context.Context, exec reconcile.SystemExecutor, cfg OpsConfig) {
+	if cfg.SkipDaemonRestart {
+		bestEffortRestartActive(ctx, exec, "dex-doh")
+		return
+	}
+	bestEffortRestartActive(ctx, exec, "dex-doh", "dex-daemon")
+}
+
+func updateXrayBinary(ctx context.Context, exec reconcile.SystemExecutor, cfg OpsConfig, xrayArch string, stdout io.Writer) error {
+	zipName := fmt.Sprintf("Xray-linux-%s.zip", xrayArch)
+	tmpDir, err := os.MkdirTemp("", "dex-xray-upd-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	zipPath := filepath.Join(tmpDir, zipName)
+	dgstPath := zipPath + ".dgst"
+	base := strings.TrimRight(cfg.XrayReleaseBase, "/")
+
+	if stdout != nil {
+		fmt.Fprintf(stdout, "[*] Downloading %s...\n", zipName)
+	}
+	if err := DownloadWithMirrors(ctx, cfg.Client, base+"/"+zipName, zipPath, nil); err != nil {
+		return err
+	}
+	if err := DownloadTrustAnchor(ctx, cfg.Client, base+"/"+zipName+".dgst", dgstPath); err != nil {
+		return err
+	}
+	dgstBytes, err := os.ReadFile(dgstPath)
+	if err != nil {
+		return err
+	}
+	expected, err := parseXrayDigest(dgstBytes)
+	if err != nil {
+		return err
+	}
+	if err := VerifyFileSHA256(zipPath, expected); err != nil {
+		return err
+	}
+	extracted, err := extractZipBinaryToTemp(zipPath, "xray", tmpDir)
+	if err != nil {
+		return err
+	}
+	if err := installBinaryWithRollback(
+		extracted,
+		cfg.XrayBinPath,
+		false,
+		func() error { return restartIfActive(ctx, exec, "dex-xray") },
+		func() { bestEffortRestartActive(ctx, exec, "dex-xray") },
+	); err != nil {
+		return err
+	}
+	if stdout != nil {
+		fmt.Fprintf(stdout, "[+] Updated %s cleanly.\n", cfg.XrayBinPath)
+	}
+	return nil
+}
+
+func parseMosDNSReleaseDigest(apiJSON []byte, assetName string) (string, error) {
+	var rel struct {
+		Assets []struct {
+			Name   string `json:"name"`
+			Digest string `json:"digest"`
+		} `json:"assets"`
+	}
+	if err := json.Unmarshal(apiJSON, &rel); err != nil {
+		return "", fmt.Errorf("parse mosdns release metadata: %w", err)
+	}
+	for _, a := range rel.Assets {
+		if a.Name != assetName {
+			continue
+		}
+		dig := strings.TrimSpace(a.Digest)
+		if rest, ok := strings.CutPrefix(strings.ToLower(dig), "sha256:"); ok {
+			return NormalizeSHA256(rest)
+		}
+		return "", fmt.Errorf("mosdns asset %s missing sha256 digest (%q)", assetName, a.Digest)
+	}
+	return "", fmt.Errorf("mosdns asset %s not found in release metadata", assetName)
+}
+
+func resolveMosDNSSHA256(ctx context.Context, cfg OpsConfig, tmpDir, base, zipName string) (string, error) {
+	sumPath := filepath.Join(tmpDir, zipName+".sha256sum")
+	var sumErr error
+	if err := DownloadTrustAnchor(ctx, cfg.Client, base+"/"+zipName+".sha256sum", sumPath); err == nil {
+		if sumsData, rerr := os.ReadFile(sumPath); rerr == nil {
+			if expected, perr := findSHA256Entry(sumsData, zipName); perr == nil {
+				return expected, nil
+			} else if len(strings.Fields(string(sumsData))) == 1 {
+				if expected, nerr := NormalizeSHA256(string(sumsData)); nerr == nil {
+					return expected, nil
+				}
+			} else {
+				sumErr = perr
+			}
+		} else {
+			sumErr = rerr
+		}
+	} else {
+		sumErr = err
+	}
+
+	apiPath := filepath.Join(tmpDir, "mosdns-release.json")
+	if err := DownloadTrustAnchor(ctx, cfg.Client, cfg.MosDNSReleaseAPIURL, apiPath); err != nil {
+		return "", fmt.Errorf("fetch mosdns checksum (.sha256sum: %v; release API: %w)", sumErr, err)
+	}
+	apiData, err := os.ReadFile(apiPath)
+	if err != nil {
+		return "", err
+	}
+	return parseMosDNSReleaseDigest(apiData, zipName)
+}
+
+func updateMosDNSBinary(ctx context.Context, exec reconcile.SystemExecutor, cfg OpsConfig, mosArch string, stdout io.Writer) error {
+	zipName := fmt.Sprintf("mosdns-linux-%s.zip", mosArch)
+	tmpDir, err := os.MkdirTemp("", "dex-mos-upd-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	zipPath := filepath.Join(tmpDir, zipName)
+	base := strings.TrimRight(cfg.MosDNSBase, "/")
+	if stdout != nil {
+		fmt.Fprintf(stdout, "[*] Downloading %s...\n", zipName)
+	}
+	if err := DownloadWithMirrors(ctx, cfg.Client, base+"/"+zipName, zipPath, nil); err != nil {
+		return err
+	}
+	expected, err := resolveMosDNSSHA256(ctx, cfg, tmpDir, base, zipName)
+	if err != nil {
+		return err
+	}
+	if err := VerifyFileSHA256(zipPath, expected); err != nil {
+		return err
+	}
+	extracted, err := extractZipBinaryToTemp(zipPath, "mosdns", tmpDir)
+	if err != nil {
+		return err
+	}
+	if err := installBinaryWithRollback(
+		extracted,
+		cfg.MosDNSBinPath,
+		false,
+		func() error { return restartIfActive(ctx, exec, "dex-mosdns") },
+		func() { bestEffortRestartActive(ctx, exec, "dex-mosdns") },
+	); err != nil {
+		return err
+	}
+	if stdout != nil {
+		fmt.Fprintf(stdout, "[+] Updated %s cleanly.\n", cfg.MosDNSBinPath)
+	}
+	return nil
+}
+
+func restartIfActive(ctx context.Context, exec reconcile.SystemExecutor, units ...string) error {
+	if exec == nil {
+		return nil
+	}
+	initSys := exec.DetectInitSystem()
+	for _, u := range units {
+		if exec.ServiceIsActive(ctx, initSys, u) {
+			if err := exec.ServiceRestart(ctx, initSys, u); err != nil {
+				return fmt.Errorf("restart %s: %w", u, err)
+			}
+			if !exec.ServiceIsActive(ctx, initSys, u) {
+				return fmt.Errorf("service %s failed health check after restart", u)
+			}
+		}
+	}
+	return nil
+}
+
+func bestEffortRestartActive(ctx context.Context, exec reconcile.SystemExecutor, units ...string) {
+	if exec == nil {
+		return
+	}
+	initSys := exec.DetectInitSystem()
+	for _, u := range units {
+		if exec.ServiceIsActive(ctx, initSys, u) {
+			_ = exec.ServiceRestart(ctx, initSys, u)
+		}
+	}
+}

@@ -48,9 +48,10 @@ func TestLayeredDependencyDAG(t *testing.T) {
 		"render":    {"fsutil": true, "cryptoext": true, "state": true},
 		"migrate":   {"fsutil": true, "cryptoext": true, "state": true, "render": true},
 		"reconcile": {"fsutil": true, "cryptoext": true, "state": true, "cert": true, "render": true},
+		"update":    {"fsutil": true, "state": true, "reconcile": true},
 		"daemon":    {"version": true, "fsutil": true, "cryptoext": true, "doh": true, "state": true, "cert": true, "socks5out": true, "render": true, "reconcile": true},
 		"web":       {"version": true, "fsutil": true, "cryptoext": true, "doh": true, "state": true, "cert": true, "socks5out": true, "render": true, "migrate": true, "reconcile": true, "daemon": true},
-		"cli":       {"version": true, "fsutil": true, "cryptoext": true, "doh": true, "state": true, "cert": true, "socks5out": true, "render": true, "migrate": true, "reconcile": true, "daemon": true, "web": true},
+		"cli":       {"version": true, "fsutil": true, "cryptoext": true, "doh": true, "state": true, "cert": true, "socks5out": true, "render": true, "migrate": true, "reconcile": true, "update": true, "daemon": true, "web": true},
 	}
 
 	fset := token.NewFileSet()
@@ -93,9 +94,9 @@ func TestLayeredDependencyDAG(t *testing.T) {
 func TestAtomicWriteCentralization(t *testing.T) {
 	root := repoRoot(t)
 	allowCreateTemp := map[string]bool{
-		"internal/fsutil/atomic.go": true,
-		"internal/cli/dl.go":        true, // streaming HTTP download staging
-		"internal/cli/ops.go":       true, // zip archive entry & rollback binary staging
+		"internal/fsutil/atomic.go":    true,
+		"internal/update/download.go":   true, // streaming HTTP download staging
+		"internal/update/operations.go": true, // zip archive entry & rollback binary staging
 	}
 
 	err := filepath.WalkDir(filepath.Join(root, "internal"), func(path string, d fs.DirEntry, err error) error {

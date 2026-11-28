@@ -15,6 +15,7 @@ import (
 	"github.com/stuinxo/dex/internal/reconcile"
 	"github.com/stuinxo/dex/internal/render"
 	"github.com/stuinxo/dex/internal/state"
+	"github.com/stuinxo/dex/internal/update"
 	"github.com/stuinxo/dex/internal/web"
 	"io"
 	"net"
@@ -277,10 +278,10 @@ func cmdDaemon(store *state.Store, exec reconcile.SystemExecutor, args []string,
 	webSrv.Metrics = runner.Metrics
 	webSrv.CertReloadCmd = buildCertReloadCmd(store.Dir)
 	webSrv.UpdateRulesFn = func(ctx context.Context, includeAds bool, w io.Writer) error {
-		return UpdateRules(ctx, store, exec, OpsConfig{}, includeAds, false, w)
+		return update.UpdateRules(ctx, store, exec, update.OpsConfig{}, includeAds, false, w)
 	}
 	webSrv.UpdateComponentsFn = func(ctx context.Context, component, ver string, w io.Writer) error {
-		return UpdateComponents(ctx, store, exec, OpsConfig{SkipDaemonRestart: true}, component, ver, w)
+		return update.UpdateComponents(ctx, store, exec, update.OpsConfig{SkipDaemonRestart: true}, component, ver, w)
 	}
 	webSrv.ReloadCertFn = func(ctx context.Context) {
 		reconcile.ReloadCertConsumers(ctx, exec, false, nil)

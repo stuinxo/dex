@@ -7,6 +7,7 @@ import (
 	"github.com/stuinxo/dex/internal/reconcile"
 	"github.com/stuinxo/dex/internal/render"
 	"github.com/stuinxo/dex/internal/state"
+	"github.com/stuinxo/dex/internal/update"
 	"github.com/stuinxo/dex/internal/version"
 	"io"
 	"net"
@@ -233,7 +234,7 @@ func runInteractiveMenu(store *state.Store, exec reconcile.SystemExecutor, stdin
 
 func menuApplyAndStatus(store *state.Store, exec reconcile.SystemExecutor, stdout, stderr io.Writer) {
 	if _, isOS := exec.(reconcile.OSExecutor); isOS {
-		if err := bootstrapRoleRuntimeDeps(context.Background(), store, exec, "", OpsConfig{}, stdout); err != nil {
+		if err := bootstrapRoleRuntimeDeps(context.Background(), store, exec, "", update.OpsConfig{}, stdout); err != nil {
 			fmt.Fprintf(stderr, "bootstrap runtime dependencies failed: %v\n", err)
 			return
 		}
@@ -404,7 +405,7 @@ func menuInitWizardForRole(store *state.Store, exec reconcile.SystemExecutor, r 
 			}
 		}
 		if p.askYesNo("立即安装运行依赖并应用配置?", true) {
-			if err := bootstrapRoleRuntimeDeps(context.Background(), store, exec, r, OpsConfig{}, stdout); err != nil {
+			if err := bootstrapRoleRuntimeDeps(context.Background(), store, exec, r, update.OpsConfig{}, stdout); err != nil {
 				fmt.Fprintf(stderr, "bootstrap runtime dependencies failed: %v\n", err)
 				return 1
 			}
@@ -1081,5 +1082,3 @@ func menuUpdateComponents(store *state.Store, exec reconcile.SystemExecutor, p *
 		}
 	}
 }
-
-// bootstrapRoleRuntimeDeps installs missing OS packages, core binaries, and rule datasets for role.

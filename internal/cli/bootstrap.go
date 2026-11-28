@@ -3,19 +3,21 @@ package cli
 import (
 	"context"
 	"fmt"
-	"github.com/stuinxo/dex/internal/reconcile"
-	"github.com/stuinxo/dex/internal/state"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/stuinxo/dex/internal/reconcile"
+	"github.com/stuinxo/dex/internal/state"
+	"github.com/stuinxo/dex/internal/update"
 )
 
-func bootstrapRoleRuntimeDeps(ctx context.Context, store *state.Store, exec reconcile.SystemExecutor, role string, opsCfg OpsConfig, stdout io.Writer) error {
+func bootstrapRoleRuntimeDeps(ctx context.Context, store *state.Store, exec reconcile.SystemExecutor, role string, opsCfg update.OpsConfig, stdout io.Writer) error {
 	if exec == nil {
 		return nil
 	}
-	cfg := opsCfg.withDefaults("latest")
+	cfg := opsCfg.WithDefaults("latest")
 	role = strings.ToLower(strings.TrimSpace(role))
 	if role == "" && store != nil {
 		if st, err := store.Load(); err == nil && st != nil {
@@ -60,7 +62,7 @@ func bootstrapRoleRuntimeDeps(ctx context.Context, store *state.Store, exec reco
 	}
 
 	if !exec.HasCommand(cfg.XrayBinPath) {
-		if err := UpdateComponents(ctx, store, exec, cfg, "xray", "latest", stdout); err != nil {
+		if err := update.UpdateComponents(ctx, store, exec, cfg, "xray", "latest", stdout); err != nil {
 			return fmt.Errorf("install xray: %w", err)
 		}
 	}
@@ -72,12 +74,12 @@ func bootstrapRoleRuntimeDeps(ctx context.Context, store *state.Store, exec reco
 	switch role {
 	case state.RoleClient:
 		if !exec.HasCommand(cfg.MosDNSBinPath) {
-			if err := UpdateComponents(ctx, store, exec, cfg, "mosdns", "latest", stdout); err != nil {
+			if err := update.UpdateComponents(ctx, store, exec, cfg, "mosdns", "latest", stdout); err != nil {
 				return fmt.Errorf("install mosdns: %w", err)
 			}
 		}
 		if clientRulesMissing(store, rulesDir) {
-			if err := UpdateRules(ctx, store, exec, cfg, false, true, stdout); err != nil {
+			if err := update.UpdateRules(ctx, store, exec, cfg, false, true, stdout); err != nil {
 				return fmt.Errorf("install client rules: %w", err)
 			}
 		}
@@ -128,7 +130,7 @@ func clientRulesMissing(store *state.Store, rulesDir string) bool {
 	return false
 }
 
-func ensureGeoDatRules(ctx context.Context, cfg OpsConfig, rulesDir string, stdout io.Writer) error {
+func ensureGeoDatRules(ctx context.Context, cfg update.OpsConfig, rulesDir string, stdout io.Writer) error {
 	targets := []struct {
 		name string
 		url  string
@@ -154,7 +156,7 @@ func ensureGeoDatRules(ctx context.Context, cfg OpsConfig, rulesDir string, stdo
 		if stdout != nil {
 			fmt.Fprintf(stdout, "[*] Downloading %s (SHA256 verified)...\n", t.name)
 		}
-		if err := DownloadVerifiedFile(ctx, cfg.Client, t.url, t.url+".sha256sum", t.dst, false); err != nil {
+		if err := update.DownloadVerifiedFile(ctx, cfg.Client, t.url, t.url+".sha256sum", t.dst, false); err != nil {
 			return fmt.Errorf("download %s: %w", t.name, err)
 		}
 	}
