@@ -972,4 +972,3 @@ func TestMutationsEnsureDefaultsWGAndIDs(t *testing.T) {
 		t.Fatalf("unexpected DefaultExtraInboundTag: %q", tag)
 	}
 }
-

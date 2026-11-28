@@ -50,6 +50,41 @@
     setTimeout(function () { t.classList.add("hidden"); }, 3500);
   }
 
+  function pruneNodeRefsInState(clientCfg, deletedId) {
+    if (!clientCfg || !deletedId) { return; }
+    if (clientCfg.active_node_id === deletedId) {
+      clientCfg.active_node_id = (clientCfg.nodes && clientCfg.nodes[0]) ? clientCfg.nodes[0].id : "";
+    }
+    if (clientCfg.routing) {
+      if (clientCfg.routing.service_map) {
+        Object.keys(clientCfg.routing.service_map).forEach(function (svc) {
+          if (clientCfg.routing.service_map[svc] === deletedId) {
+            delete clientCfg.routing.service_map[svc];
+          }
+        });
+      }
+      if (clientCfg.routing.apple_node_id === deletedId) { clientCfg.routing.apple_node_id = ""; }
+      if (clientCfg.routing.divert && clientCfg.routing.divert.node_id === deletedId) { clientCfg.routing.divert.node_id = ""; }
+      if (clientCfg.routing.custom && clientCfg.routing.custom.node_id === deletedId) { clientCfg.routing.custom.node_id = ""; }
+    }
+    if (clientCfg.fwd1 && clientCfg.fwd1.upstream_node_id === deletedId) { clientCfg.fwd1.upstream_node_id = ""; }
+  }
+
+  function nextForwardID(forwards, listenPort, proto) {
+    var existing = {};
+    (forwards || []).forEach(function (f) { if (f && f.id) { existing[f.id] = true; } });
+    var cand = "fwd-" + listenPort;
+    if (!existing[cand]) { return cand; }
+    var pTag = (proto || "tcp").replace(/,/g, "-");
+    cand = "fwd-" + pTag + "-" + listenPort;
+    var suffix = 2;
+    while (existing[cand]) {
+      cand = "fwd-" + pTag + "-" + listenPort + "-" + suffix;
+      suffix++;
+    }
+    return cand;
+  }
+
   async function api(method, path, body) {
     var opts = {
       method: method,
@@ -681,23 +716,7 @@
       bDel.type = "button";
       bDel.addEventListener("click", function () {
         currentState.client.nodes.splice(idx, 1);
-        if (currentState.client.active_node_id === n.id) {
-          currentState.client.active_node_id = currentState.client.nodes[0] ? currentState.client.nodes[0].id : "";
-        }
-        var c = currentState.client;
-        if (c.routing) {
-          if (c.routing.service_map) {
-            Object.keys(c.routing.service_map).forEach(function (svc) {
-              if (c.routing.service_map[svc] === n.id) {
-                delete c.routing.service_map[svc];
-              }
-            });
-          }
-          if (c.routing.apple_node_id === n.id) { c.routing.apple_node_id = ""; }
-          if (c.routing.divert && c.routing.divert.node_id === n.id) { c.routing.divert.node_id = ""; }
-          if (c.routing.custom && c.routing.custom.node_id === n.id) { c.routing.custom.node_id = ""; }
-        }
-        if (c.fwd1 && c.fwd1.upstream_node_id === n.id) { c.fwd1.upstream_node_id = ""; }
+        pruneNodeRefsInState(currentState.client, n.id);
         renderNodesTable();
         renderOverviewNodes();
         refreshClientNodeSelects(n.id);
@@ -895,18 +914,7 @@
           return;
         }
         currentState.relay.forwards = currentState.relay.forwards || [];
-        var existingIDs = {};
-        currentState.relay.forwards.forEach(function (f) { if (f.id) { existingIDs[f.id] = true; } });
-        var fwdID = "fwd-" + lp;
-        if (existingIDs[fwdID]) {
-          var pTag = (fProto.value || "tcp").replace(/,/g, "-");
-          fwdID = "fwd-" + pTag + "-" + lp;
-          var suffix = 2;
-          while (existingIDs[fwdID]) {
-            fwdID = "fwd-" + pTag + "-" + lp + "-" + suffix;
-            suffix++;
-          }
-        }
+        var fwdID = nextForwardID(currentState.relay.forwards, lp, fProto.value);
         currentState.relay.forwards.push({
           id: fwdID,
           listen_port: lp,
@@ -1512,7 +1520,9 @@
         tr.appendChild(make("td", "mono", f.mod_time ? f.mod_time.slice(0, 19).replace("T", " ") : "-"));
         tbody.appendChild(tr);
       });
-    } catch (_) {}
+    } catch (e) {
+      if (e && e.message) { showToast("规则状态加载失败: " + e.message, true); }
+    }
   }
 
   function connectLogs() {
