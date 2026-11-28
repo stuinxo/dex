@@ -655,7 +655,7 @@ func TestWave2ParseNodeURIWGIPAndTimers(t *testing.T) {
 	}
 
 	// 2. NextAvailableWGIP fills gaps cleanly
-	ip, err := NextAvailableWGIP("172.16.66.1/24", []state.WGPeer{
+	ip, err := state.NextAvailableWGIP("172.16.66.1/24", []state.WGPeer{
 		{Name: "p1", IP: "172.16.66.11"},
 		{Name: "p3", IP: "172.16.66.13"},
 	})

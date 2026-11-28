@@ -101,22 +101,3 @@ func (h *TaskHub) SubscribeWithSnapshot(sinceSeq uint64) ([]LogEntry, <-chan Log
 		h.mu.Unlock()
 	}
 }
-
-// Subscribe registers a subscriber channel and returns a cancel function.
-func (h *TaskHub) Subscribe() (<-chan LogEntry, func()) {
-	ch := make(chan LogEntry, 64)
-	h.mu.Lock()
-	h.nextID++
-	id := h.nextID
-	h.subs[id] = ch
-	h.mu.Unlock()
-
-	return ch, func() {
-		h.mu.Lock()
-		if c, ok := h.subs[id]; ok {
-			delete(h.subs, id)
-			close(c)
-		}
-		h.mu.Unlock()
-	}
-}

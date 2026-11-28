@@ -975,10 +975,6 @@ func cleanupLegacyV2(ctx context.Context, exec reconcile.SystemExecutor, stdout 
 	return cleanupLegacyV2WithPaths(ctx, exec, "/opt/de_GWD/nftables", "/etc/nginx/conf.d", stdout)
 }
 
-func cleanupLegacyV2WithNFTDir(ctx context.Context, exec reconcile.SystemExecutor, v2NFTDir string, stdout io.Writer) *v2CleanupSnapshot {
-	return cleanupLegacyV2WithPaths(ctx, exec, v2NFTDir, "/etc/nginx/conf.d", stdout)
-}
-
 func cleanupLegacyV2WithPaths(ctx context.Context, exec reconcile.SystemExecutor, v2NFTDir, nginxConfDir string, stdout io.Writer) *v2CleanupSnapshot {
 	initSys := exec.DetectInitSystem()
 	snap := &v2CleanupSnapshot{

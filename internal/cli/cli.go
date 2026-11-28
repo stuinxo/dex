@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -324,7 +323,7 @@ func printServerClientBootstrapInfo(w io.Writer, store *state.Store, st *state.S
 		fmt.Fprintf(w, "Client Quick:   %s\n", initCmd)
 	}
 	if store != nil {
-		certFile, keyFile := resolveActiveCertPaths(store, st)
+		certFile, keyFile := reconcile.ResolveActiveCertPaths(store, st)
 		if cb, err1 := os.ReadFile(certFile); err1 == nil {
 			if kb, err2 := os.ReadFile(keyFile); err2 == nil {
 				if rep, ierr := cert.InspectPair(cb, kb); ierr == nil && rep.SelfSigned {
@@ -666,13 +665,6 @@ func serviceStatusSummary(exec reconcile.SystemExecutor, st *state.State) string
 	return strings.Join(parts, " ")
 }
 
-func resolveActiveCertPaths(store *state.Store, st *state.State) (string, string) {
-	if st != nil && st.Cert.Mode == "imported" && st.Cert.CertFile != "" && st.Cert.KeyFile != "" {
-		return st.Cert.CertFile, st.Cert.KeyFile
-	}
-	return store.DefaultCert(), store.DefaultKey()
-}
-
 func cmdStatus(store *state.Store, exec reconcile.SystemExecutor, stdout, stderr io.Writer) int {
 	st, err := store.Load()
 	if err != nil {
@@ -711,7 +703,7 @@ func cmdStatus(store *state.Store, exec reconcile.SystemExecutor, stdout, stderr
 	if sum := serviceStatusSummary(exec, st); sum != "" {
 		fmt.Fprintf(stdout, "Services: %s\n", sum)
 	}
-	certFile, keyFile := resolveActiveCertPaths(store, st)
+	certFile, keyFile := reconcile.ResolveActiveCertPaths(store, st)
 	if cb, err1 := os.ReadFile(certFile); err1 == nil {
 		if kb, err2 := os.ReadFile(keyFile); err2 == nil {
 			if rep, ierr := cert.InspectPair(cb, kb); ierr == nil {
@@ -1417,7 +1409,7 @@ func cmdCert(store *state.Store, exec reconcile.SystemExecutor, args []string, s
 func cmdCertWithOpts(store *state.Store, exec reconcile.SystemExecutor, applyOpts reconcile.ApplyOptions, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "inspect" {
 		st, _ := store.Load()
-		certFile, keyFile := resolveActiveCertPaths(store, st)
+		certFile, keyFile := reconcile.ResolveActiveCertPaths(store, st)
 		if applyOpts.RootPrefix != "" {
 			certFile = fsutil.MapRootPrefix(applyOpts.RootPrefix, certFile)
 			keyFile = fsutil.MapRootPrefix(applyOpts.RootPrefix, keyFile)
@@ -1460,45 +1452,9 @@ func cmdCertWithOpts(store *state.Store, exec reconcile.SystemExecutor, applyOpt
 		if fs.NArg() > 0 && cn == "localhost" {
 			cn = fs.Arg(0)
 		}
-		certChanged := false
-		if *force {
-			if err := cert.ForceSelfSigned(store.DefaultCert(), store.DefaultKey(), cn); err != nil {
-				fmt.Fprintf(stderr, "self-sign failed: %v\n", err)
-				return 1
-			}
-			certChanged = true
-		} else {
-			prevCert, _ := os.ReadFile(store.DefaultCert())
-			if err := cert.EnsureSelfSigned(store.DefaultCert(), store.DefaultKey(), cn); err != nil {
-				fmt.Fprintf(stderr, "self-sign failed: %v\n", err)
-				return 1
-			}
-			afterCert, _ := os.ReadFile(store.DefaultCert())
-			certChanged = !bytes.Equal(prevCert, afterCert)
-		}
-		hadCustomExternal := false
-		if st, err := store.Load(); err == nil && st != nil {
-			hadCustomExternal = st.Cert.Mode == "imported" &&
-				((st.Cert.CertFile != "" && st.Cert.CertFile != store.DefaultCert()) ||
-					(st.Cert.KeyFile != "" && st.Cert.KeyFile != store.DefaultKey()))
-			if _, uerr := store.Update(st.Role, func(cur *state.State) error {
-				cur.Cert.Mode = "self_signed"
-				cur.Cert.CertFile = ""
-				cur.Cert.KeyFile = ""
-				return nil
-			}); uerr != nil {
-				fmt.Fprintf(stderr, "update state after self-sign failed: %v\n", uerr)
-				return 1
-			}
-			if hadCustomExternal {
-				if _, rerr := reconcile.Reconcile(context.Background(), store, exec, applyOpts); rerr != nil {
-					fmt.Fprintf(stderr, "reconcile after self-sign failed: %v\n", rerr)
-					return 1
-				}
-			}
-		}
-		if certChanged || hadCustomExternal {
-			reloadCertConsumers(context.Background(), exec, stdout)
+		if _, _, _, err := reconcile.SelfSignCertAndSync(context.Background(), store, exec, applyOpts, cn, *force, true, stdout); err != nil {
+			fmt.Fprintf(stderr, "self-sign failed: %v\n", err)
+			return 1
 		}
 		fmt.Fprintf(stdout, "Self-signed certificate ready at %s\n", store.DefaultCert())
 		return 0
@@ -1508,38 +1464,10 @@ func cmdCertWithOpts(store *state.Store, exec reconcile.SystemExecutor, applyOpt
 			return 2
 		}
 		allowSelf := len(rest) > 2 && rest[2] == "--allow-self-signed"
-		var checkDomains []string
-		st, stErr := store.Load()
-		if stErr == nil && st != nil && st.Server.Domain != "" {
-			checkDomains = append(checkDomains, st.Server.Domain)
-		}
-		rep, changed, err := cert.ImportPair(rest[0], rest[1], store.DefaultCert(), store.DefaultKey(), allowSelf, checkDomains)
+		rep, changed, _, err := reconcile.ImportCertAndSync(context.Background(), store, exec, applyOpts, rest[0], rest[1], allowSelf, true, stdout)
 		if err != nil {
 			fmt.Fprintf(stderr, "import failed: %v\n", err)
 			return 1
-		}
-		pathsChanged := false
-		if stErr == nil && st != nil {
-			pathsChanged = (st.Cert.CertFile != "" && st.Cert.CertFile != store.DefaultCert()) ||
-				(st.Cert.KeyFile != "" && st.Cert.KeyFile != store.DefaultKey())
-			if _, uerr := store.Update(st.Role, func(cur *state.State) error {
-				cur.Cert.Mode = "imported"
-				cur.Cert.CertFile = store.DefaultCert()
-				cur.Cert.KeyFile = store.DefaultKey()
-				return nil
-			}); uerr != nil {
-				fmt.Fprintf(stderr, "update state after import failed: %v\n", uerr)
-				return 1
-			}
-			if pathsChanged {
-				if _, rerr := reconcile.Reconcile(context.Background(), store, exec, applyOpts); rerr != nil {
-					fmt.Fprintf(stderr, "reconcile after cert import failed: %v\n", rerr)
-					return 1
-				}
-			}
-		}
-		if changed || pathsChanged {
-			reloadCertConsumers(context.Background(), exec, stdout)
 		}
 		fmt.Fprintf(stdout, "Certificate imported (changed=%v, expires=%s, SANs=%s)\n",
 			changed, rep.NotAfter.Format("2006-01-02"), strings.Join(rep.SANs, ", "))
@@ -1556,87 +1484,32 @@ func cmdCertWithOpts(store *state.Store, exec reconcile.SystemExecutor, applyOpt
 		if err := fs.Parse(rest); err != nil {
 			return 2
 		}
-		st, _ := store.Load()
-		if *dom == "" && st != nil {
-			*dom = st.Cert.Domain
-			if *dom == "" {
-				*dom = st.Server.Domain
-			}
-		}
-		if *tok == "" && st != nil {
-			*tok = st.Cert.CFToken
-		}
-		if *email == "" && st != nil {
-			*email = st.Cert.CFEmail
-		}
 		acmeMode := strings.ToLower(strings.TrimSpace(*mode))
-		var (
-			rep *cert.CertReport
-			err error
-		)
-		cfg := cert.ACMEConfig{
-			Domain:    *dom,
-			CFToken:   *tok,
-			CFEmail:   *email,
-			Webroot:   *webroot,
-			ListenV6:  st != nil && st.System.EnableIPv6,
-			AutoRenew: *renew,
-			CertPath:  store.DefaultCert(),
-			KeyPath:   store.DefaultKey(),
-			ReloadCmd: buildCertReloadCmd(store.Dir),
-		}
 		switch acmeMode {
-		case "", "cf", "cloudflare", "dns":
-			rep, err = cert.IssueCloudflareACME(context.Background(), nil, cfg)
-		case "http", "http-01":
-			rep, err = cert.IssueHTTPACME(context.Background(), nil, cfg)
+		case "", "cf", "cloudflare", "dns", "http", "http-01":
 		default:
 			fmt.Fprintf(stderr, "unsupported --mode %q (expected cf or http)\n", *mode)
 			return 2
 		}
+		rep, _, err := reconcile.IssueACMEAndSync(context.Background(), store, exec, applyOpts, nil, reconcile.IssueACMEParams{
+			Mode:          acmeMode,
+			Domain:        *dom,
+			CFToken:       *tok,
+			CFEmail:       *email,
+			Webroot:       *webroot,
+			AutoRenew:     renew,
+			ReloadCmd:     buildCertReloadCmd(store.Dir),
+			IncludeDaemon: true,
+			LogOut:        stdout,
+		})
 		if err != nil {
 			fmt.Fprintf(stderr, "acme issue failed: %v\n", err)
 			return 1
 		}
-		if st != nil {
-			hadCustomExternal := (st.Cert.CertFile != "" && st.Cert.CertFile != store.DefaultCert()) ||
-				(st.Cert.KeyFile != "" && st.Cert.KeyFile != store.DefaultKey())
-			certMode := "acme_cf"
-			if acmeMode == "http" || acmeMode == "http-01" {
-				certMode = "acme_http"
-			}
-			if _, uerr := store.Update(st.Role, func(cur *state.State) error {
-				cur.Cert.Mode = certMode
-				cur.Cert.Domain = *dom
-				cur.Cert.CertFile = ""
-				cur.Cert.KeyFile = ""
-				cur.Cert.AutoRenew = *renew
-				if certMode == "acme_http" {
-					// HTTP-01 does not rely on CF API tokens
-				} else if *renew {
-					cur.Cert.CFToken = *tok
-					cur.Cert.CFEmail = *email
-				} else {
-					cur.Cert.CFToken = ""
-					cur.Cert.CFEmail = ""
-				}
-				return nil
-			}); uerr != nil {
-				fmt.Fprintf(stderr, "update state after issue failed: %v\n", uerr)
-				return 1
-			}
-			if hadCustomExternal {
-				if _, rerr := reconcile.Reconcile(context.Background(), store, exec, applyOpts); rerr != nil {
-					fmt.Fprintf(stderr, "reconcile after cert issue failed: %v\n", rerr)
-					return 1
-				}
-			}
-		}
-		reloadCertConsumers(context.Background(), exec, stdout)
 		fmt.Fprintf(stdout, "Certificate issued for %s (expires %s)\n", strings.Join(rep.SANs, ", "), rep.NotAfter.Format("2006-01-02"))
 		return 0
 	case "reload":
-		reloadCertConsumers(context.Background(), exec, stdout)
+		reconcile.ReloadCertConsumers(context.Background(), exec, true, stdout)
 		return 0
 	default:
 		fmt.Fprintf(stderr, "unknown cert subcommand %q\n", sub)
@@ -1650,41 +1523,6 @@ func buildCertReloadCmd(stateDir string) string {
 		exe = "/usr/local/bin/dex"
 	}
 	return fmt.Sprintf("%s --state-dir %s cert reload", render.ShellSingleQuote(exe), render.ShellSingleQuote(stateDir))
-}
-
-func reloadNonDaemonCertConsumers(ctx context.Context, exec reconcile.SystemExecutor, stdout io.Writer) {
-	if exec == nil {
-		return
-	}
-	initSys := exec.DetectInitSystem()
-	var reloaded []string
-	if exec.ServiceIsActive(ctx, initSys, "nginx") {
-		if err := exec.ServiceReload(ctx, initSys, "nginx"); err != nil {
-			_ = exec.ServiceRestart(ctx, initSys, "nginx")
-		}
-		reloaded = append(reloaded, "nginx")
-	}
-	if exec.ServiceIsActive(ctx, initSys, "dex-xray") {
-		_ = exec.ServiceRestart(ctx, initSys, "dex-xray")
-		reloaded = append(reloaded, "dex-xray")
-	}
-	if stdout != nil && len(reloaded) > 0 {
-		fmt.Fprintf(stdout, "Reloaded TLS consumers: %s\n", strings.Join(reloaded, ", "))
-	}
-}
-
-func reloadCertConsumers(ctx context.Context, exec reconcile.SystemExecutor, stdout io.Writer) {
-	if exec == nil {
-		return
-	}
-	reloadNonDaemonCertConsumers(ctx, exec, stdout)
-	initSys := exec.DetectInitSystem()
-	if exec.ServiceIsActive(ctx, initSys, "dex-daemon") {
-		_ = exec.ServiceRestart(ctx, initSys, "dex-daemon")
-		if stdout != nil {
-			fmt.Fprintln(stdout, "Reloaded TLS consumers: dex-daemon")
-		}
-	}
 }
 
 func cmdWG(store *state.Store, exec reconcile.SystemExecutor, args []string, stdout, stderr io.Writer) int {
@@ -1726,26 +1564,7 @@ func cmdWG(store *state.Store, exec reconcile.SystemExecutor, args []string, std
 			return 2
 		}
 		mut := func(cur *state.State) error {
-			cur.Client.WireGuard.Enabled = true
-			if *ep != "" {
-				cur.Client.WireGuard.EndpointHost = *ep
-			}
-			if cur.Client.WireGuard.EndpointHost == "" {
-				cur.Client.WireGuard.EndpointHost = "vpn.example.com"
-			}
-			cur.Client.WireGuard.ListenPort = *port
-			if cur.Client.WireGuard.SubnetCIDR == "" {
-				cur.Client.WireGuard.SubnetCIDR = "172.16.66.1/24"
-			}
-			if cur.Client.WireGuard.ServerPrivateKey == "" {
-				priv, pub, err := cryptoext.GenerateWireGuardKeypair()
-				if err != nil {
-					return err
-				}
-				cur.Client.WireGuard.ServerPrivateKey = priv
-				cur.Client.WireGuard.ServerPublicKey = pub
-			}
-			return nil
+			return cur.EnableWireGuard(*ep, *port, "")
 		}
 		if err := applyOrSave(store, exec, state.RoleClient, *doApply, mut); err != nil {
 			fmt.Fprintf(stderr, "wg enable failed: %v\n", err)
@@ -1773,48 +1592,13 @@ func cmdWG(store *state.Store, exec reconcile.SystemExecutor, args []string, std
 		}
 		name := rest[0]
 		doApply := len(rest) > 1 && rest[1] == "--apply"
-		priv, pub, err := cryptoext.GenerateWireGuardKeypair()
-		if err != nil {
-			fmt.Fprintf(stderr, "generate keypair: %v\n", err)
-			return 1
-		}
 		var cfgText string
 		mut := func(cur *state.State) error {
-			wg := &cur.Client.WireGuard
-			for _, p := range wg.Peers {
-				if p.Name == name {
-					return fmt.Errorf("peer %q already exists", name)
-				}
+			peer, perr := cur.AddWireGuardPeer(name, "", 0, "")
+			if perr != nil {
+				return perr
 			}
-			if wg.ServerPrivateKey == "" {
-				sp, spub, kerr := cryptoext.GenerateWireGuardKeypair()
-				if kerr != nil {
-					return kerr
-				}
-				wg.ServerPrivateKey = sp
-				wg.ServerPublicKey = spub
-			}
-			if wg.ListenPort == 0 {
-				wg.ListenPort = 51820
-			}
-			if wg.SubnetCIDR == "" {
-				wg.SubnetCIDR = "172.16.66.1/24"
-			}
-			if wg.EndpointHost == "" {
-				if cur.Client.DDNS.Domain != "" {
-					wg.EndpointHost = cur.Client.DDNS.Domain
-				} else {
-					wg.EndpointHost = "vpn.example.com"
-				}
-			}
-			wg.Enabled = true
-			ip, ipErr := render.NextAvailableWGIP(wg.SubnetCIDR, wg.Peers)
-			if ipErr != nil {
-				return ipErr
-			}
-			peer := state.WGPeer{Name: name, IP: ip, PrivateKey: priv, PublicKey: pub}
-			wg.Peers = append(wg.Peers, peer)
-			cfgText = render.BuildWGPeerConfig(*wg, peer)
+			cfgText = render.BuildWGPeerConfig(cur.Client.WireGuard, peer)
 			return nil
 		}
 		if err := applyOrSave(store, exec, state.RoleClient, doApply, mut); err != nil {
@@ -1826,15 +1610,11 @@ func cmdWG(store *state.Store, exec reconcile.SystemExecutor, args []string, std
 
 	case "keygen-server":
 		doApply := len(rest) > 0 && rest[0] == "--apply"
-		priv, pub, err := cryptoext.GenerateWireGuardKeypair()
-		if err != nil {
-			fmt.Fprintf(stderr, "generate server keypair: %v\n", err)
-			return 1
-		}
+		var pub string
 		if err := applyOrSave(store, exec, state.RoleClient, doApply, func(cur *state.State) error {
-			cur.Client.WireGuard.ServerPrivateKey = priv
-			cur.Client.WireGuard.ServerPublicKey = pub
-			return nil
+			var kerr error
+			pub, kerr = cur.RegenerateWireGuardServerKeys()
+			return kerr
 		}); err != nil {
 			fmt.Fprintf(stderr, "wg keygen-server failed: %v\n", err)
 			return 1
@@ -1849,23 +1629,14 @@ func cmdWG(store *state.Store, exec reconcile.SystemExecutor, args []string, std
 		}
 		name := rest[0]
 		doApply := len(rest) > 1 && rest[1] == "--apply"
-		priv, pub, err := cryptoext.GenerateWireGuardKeypair()
-		if err != nil {
-			fmt.Fprintf(stderr, "generate keypair: %v\n", err)
-			return 1
-		}
 		var cfgText string
 		if err := applyOrSave(store, exec, state.RoleClient, doApply, func(cur *state.State) error {
-			wg := &cur.Client.WireGuard
-			for i := range wg.Peers {
-				if wg.Peers[i].Name == name {
-					wg.Peers[i].PrivateKey = priv
-					wg.Peers[i].PublicKey = pub
-					cfgText = render.BuildWGPeerConfig(*wg, wg.Peers[i])
-					return nil
-				}
+			peer, perr := cur.RegenerateWireGuardPeer(name)
+			if perr != nil {
+				return perr
 			}
-			return fmt.Errorf("peer %q not found", name)
+			cfgText = render.BuildWGPeerConfig(cur.Client.WireGuard, peer)
+			return nil
 		}); err != nil {
 			fmt.Fprintf(stderr, "wg peer-regen failed: %v\n", err)
 			return 1
@@ -1881,20 +1652,7 @@ func cmdWG(store *state.Store, exec reconcile.SystemExecutor, args []string, std
 		name := rest[0]
 		doApply := len(rest) > 1 && rest[1] == "--apply"
 		if err := applyOrSave(store, exec, state.RoleClient, doApply, func(cur *state.State) error {
-			var next []state.WGPeer
-			found := false
-			for _, p := range cur.Client.WireGuard.Peers {
-				if p.Name == name {
-					found = true
-					continue
-				}
-				next = append(next, p)
-			}
-			if !found {
-				return fmt.Errorf("peer %q not found", name)
-			}
-			cur.Client.WireGuard.Peers = next
-			return nil
+			return cur.DeleteWireGuardPeer(name)
 		}); err != nil {
 			fmt.Fprintf(stderr, "wg peer-del failed: %v\n", err)
 			return 1
@@ -2148,22 +1906,7 @@ func cmdRelay(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 		assignedID := strings.TrimSpace(*id)
 		if err := applyOrSave(store, exec, state.RoleRelay, *doApply, func(cur *state.State) error {
 			if assignedID == "" {
-				used := make(map[string]bool, len(cur.Relay.Forwards))
-				for _, f := range cur.Relay.Forwards {
-					used[f.ID] = true
-				}
-				cand := fmt.Sprintf("fwd-%d", *listen)
-				if used[cand] {
-					pTag := strings.ReplaceAll(strings.TrimSpace(*proto), ",", "-")
-					if pTag == "" {
-						pTag = "tcp"
-					}
-					cand = fmt.Sprintf("fwd-%s-%d", pTag, *listen)
-					for suffix := 2; used[cand]; suffix++ {
-						cand = fmt.Sprintf("fwd-%s-%d-%d", pTag, *listen, suffix)
-					}
-				}
-				assignedID = cand
+				assignedID = cur.Relay.NextForwardID(*listen, *proto)
 			}
 			cur.Relay.Forwards = append(cur.Relay.Forwards, state.ForwardRule{
 				ID:         assignedID,
@@ -2527,7 +2270,7 @@ func addTLSExtraInbound(store *state.Store, exec reconcile.SystemExecutor, defRo
 	}
 	t := strings.TrimSpace(*tag)
 	if t == "" {
-		t = fmt.Sprintf("inbound-%s-%d", strings.ReplaceAll(proto, "vless-", ""), *port)
+		t = state.DefaultExtraInboundTag(proto, *port)
 	}
 	ex := state.ExtraInbound{
 		Tag:        t,
@@ -2633,7 +2376,7 @@ func cmdExtra(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 		}
 		t := strings.TrimSpace(*tag)
 		if t == "" {
-			t = fmt.Sprintf("inbound-dokodemo-%d", *port)
+			t = state.DefaultExtraInboundTag("dokodemo", *port)
 		}
 		ex := state.ExtraInbound{
 			Tag:        t,
@@ -2700,7 +2443,7 @@ func cmdExtra(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 		}
 		t := strings.TrimSpace(*tag)
 		if t == "" {
-			t = fmt.Sprintf("inbound-reality-%d", *port)
+			t = state.DefaultExtraInboundTag("vless-reality", *port)
 		}
 		d := strings.TrimSpace(*dest)
 		if d == "" {
@@ -2746,7 +2489,7 @@ func cmdExtra(store *state.Store, exec reconcile.SystemExecutor, args []string, 
 		}
 		t := strings.TrimSpace(*tag)
 		if t == "" {
-			t = fmt.Sprintf("inbound-socks5-%d", *port)
+			t = state.DefaultExtraInboundTag("socks5", *port)
 		}
 		ex := state.ExtraInbound{
 			Tag:        t,
@@ -2946,7 +2689,7 @@ func cmdDaemon(store *state.Store, exec reconcile.SystemExecutor, args []string,
 		return UpdateComponents(ctx, store, exec, OpsConfig{SkipDaemonRestart: true}, component, ver, w)
 	}
 	webSrv.ReloadCertFn = func(ctx context.Context) {
-		reloadNonDaemonCertConsumers(ctx, exec, nil)
+		reconcile.ReloadCertConsumers(ctx, exec, false, nil)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

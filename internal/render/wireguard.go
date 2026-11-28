@@ -1,7 +1,6 @@
 package render
 
 import (
-	"errors"
 	"fmt"
 	"net/netip"
 	"path/filepath"
@@ -9,29 +8,6 @@ import (
 
 	"github.com/stuinxo/dex/internal/state"
 )
-
-// NextAvailableWGIP allocates the lowest unused host IP (>= .11) inside subnetCIDR for a WireGuard peer.
-func NextAvailableWGIP(subnetCIDR string, peers []state.WGPeer) (string, error) {
-	prefix, err := netip.ParsePrefix(strings.TrimSpace(subnetCIDR))
-	if err != nil {
-		prefix = netip.MustParsePrefix("172.16.66.1/24")
-	}
-	used := map[netip.Addr]bool{prefix.Addr(): true}
-	for _, p := range peers {
-		raw := strings.TrimSpace(strings.Split(p.IP, "/")[0])
-		if a, err := netip.ParseAddr(raw); err == nil {
-			used[a] = true
-		}
-	}
-	base4 := prefix.Addr().As4()
-	for lastOctet := 11; lastOctet <= 254; lastOctet++ {
-		cand := netip.AddrFrom4([4]byte{base4[0], base4[1], base4[2], byte(lastOctet)})
-		if prefix.Contains(cand) && !used[cand] {
-			return cand.String(), nil
-		}
-	}
-	return "", errors.New("no free WireGuard peer IP available in subnet")
-}
 
 func wireGuardServerIP(wg state.WireGuardConfig) string {
 	if p, err := netip.ParsePrefix(strings.TrimSpace(wg.SubnetCIDR)); err == nil {

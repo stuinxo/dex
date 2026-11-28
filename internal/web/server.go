@@ -798,12 +798,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, _ *session
 	}
 
 	var certSummary any
-	certPath := s.Store.DefaultCert()
-	keyPath := s.Store.DefaultKey()
-	if st.Cert.Mode == "imported" && st.Cert.CertFile != "" && st.Cert.KeyFile != "" {
-		certPath = st.Cert.CertFile
-		keyPath = st.Cert.KeyFile
-	}
+	certPath, keyPath := reconcile.ResolveActiveCertPaths(s.Store, st)
 	if cb, e1 := os.ReadFile(certPath); e1 == nil {
 		if kb, e2 := os.ReadFile(keyPath); e2 == nil {
 			if rep, e3 := cert.InspectPair(cb, kb); e3 == nil {
@@ -929,47 +924,9 @@ func (s *Server) handlePutState(w http.ResponseWriter, r *http.Request, _ *sessi
 			incoming.System.Notify.TelegramBotToken = cur.System.Notify.TelegramBotToken
 		}
 	}
-	for i := range incoming.ExtraInbounds {
-		ex := &incoming.ExtraInbounds[i]
-		if ex.Protocol == "vless-reality" {
-			if strings.TrimSpace(ex.UUID) == "" {
-				ex.UUID, _ = cryptoext.GenerateUUID()
-			}
-			if strings.TrimSpace(ex.RealityPrivKey) == "" {
-				if priv, pub, kerr := cryptoext.GenerateRealityKeypair(); kerr == nil {
-					ex.RealityPrivKey = priv
-					ex.RealityPubKey = pub
-				}
-			}
-			if strings.TrimSpace(ex.RealityShortID) == "" {
-				ex.RealityShortID, _ = cryptoext.GenerateHexToken(4)
-			}
-			if strings.TrimSpace(ex.RealitySNI) == "" {
-				ex.RealitySNI = "www.apple.com"
-			}
-			if strings.TrimSpace(ex.RealityDest) == "" {
-				ex.RealityDest = ex.RealitySNI + ":443"
-			}
-		} else if (ex.Protocol == "vless-xhttp" || ex.Protocol == "vless-ws" || ex.Protocol == "vmess-ws") && strings.TrimSpace(ex.UUID) == "" {
-			ex.UUID, _ = cryptoext.GenerateUUID()
-		}
-	}
-	if incoming.Role == state.RoleClient && incoming.Client.WireGuard.Enabled {
-		if strings.TrimSpace(incoming.Client.WireGuard.ServerPrivateKey) == "" || strings.TrimSpace(incoming.Client.WireGuard.ServerPublicKey) == "" {
-			if priv, pub, kerr := cryptoext.GenerateWireGuardKeypair(); kerr == nil {
-				incoming.Client.WireGuard.ServerPrivateKey = priv
-				incoming.Client.WireGuard.ServerPublicKey = pub
-			}
-		}
-	}
-	if incoming.Role == state.RoleClient && incoming.Client.DNS.EnableDoHServer && strings.TrimSpace(incoming.Client.DNS.DoHServerPath) == "" {
-		incoming.Client.DNS.DoHServerPath = state.GenerateDefaultClientDoHPath()
-	}
-	if incoming.Role != state.RoleServer {
-		incoming.Server.EnableDoH = false
-	}
-	if incoming.Role != state.RoleClient {
-		incoming.Client.DNS.EnableDoHServer = false
+	if err := incoming.EnsureGeneratedDefaults(); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 	if err := incoming.Validate(); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -1273,66 +1230,14 @@ func (s *Server) handleAddWGPeer(w http.ResponseWriter, r *http.Request, _ *sess
 		return
 	}
 
-	priv, pub, err := cryptoext.GenerateWireGuardKeypair()
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
 	var addedPeer state.WGPeer
 	var updatedWG state.WireGuardConfig
-	_, _, err = reconcile.UpdateAndReconcile(r.Context(), s.Store, state.RoleClient, s.Exec, s.ApplyOpts, func(cur *state.State) error {
-		for _, p := range cur.Client.WireGuard.Peers {
-			if p.Name == name {
-				return fmt.Errorf("peer %q already exists", name)
-			}
+	_, _, err := reconcile.UpdateAndReconcile(r.Context(), s.Store, state.RoleClient, s.Exec, s.ApplyOpts, func(cur *state.State) error {
+		peer, perr := cur.AddWireGuardPeer(name, req.EndpointHost, req.ListenPort, req.SubnetCIDR)
+		if perr != nil {
+			return perr
 		}
-		if strings.TrimSpace(cur.Client.WireGuard.ServerPrivateKey) == "" || strings.TrimSpace(cur.Client.WireGuard.ServerPublicKey) == "" {
-			sp, spub, kerr := cryptoext.GenerateWireGuardKeypair()
-			if kerr != nil {
-				return kerr
-			}
-			cur.Client.WireGuard.ServerPrivateKey = sp
-			cur.Client.WireGuard.ServerPublicKey = spub
-		}
-		if ep := strings.TrimSpace(req.EndpointHost); ep != "" && state.IsValidAddress(ep) {
-			cur.Client.WireGuard.EndpointHost = ep
-		}
-		if req.ListenPort >= 1 && req.ListenPort <= 65535 {
-			cur.Client.WireGuard.ListenPort = req.ListenPort
-		}
-		if sub := strings.TrimSpace(req.SubnetCIDR); sub != "" {
-			if p, perr := netip.ParsePrefix(sub); perr == nil && p.Addr().Is4() {
-				cur.Client.WireGuard.SubnetCIDR = sub
-			}
-		}
-		if cur.Client.WireGuard.ListenPort == 0 {
-			cur.Client.WireGuard.ListenPort = 51820
-		}
-		if cur.Client.WireGuard.SubnetCIDR == "" {
-			cur.Client.WireGuard.SubnetCIDR = "172.16.66.1/24"
-		}
-		if cur.Client.WireGuard.EndpointHost == "" {
-			if cur.Client.DDNS.Domain != "" {
-				cur.Client.WireGuard.EndpointHost = cur.Client.DDNS.Domain
-			} else if cur.Cert.Domain != "" {
-				cur.Client.WireGuard.EndpointHost = cur.Cert.Domain
-			} else {
-				cur.Client.WireGuard.EndpointHost = "vpn.example.com"
-			}
-		}
-		ip, iperr := render.NextAvailableWGIP(cur.Client.WireGuard.SubnetCIDR, cur.Client.WireGuard.Peers)
-		if iperr != nil {
-			return iperr
-		}
-		cur.Client.WireGuard.Enabled = true
-		addedPeer = state.WGPeer{
-			Name:       name,
-			IP:         ip,
-			PrivateKey: priv,
-			PublicKey:  pub,
-		}
-		cur.Client.WireGuard.Peers = append(cur.Client.WireGuard.Peers, addedPeer)
+		addedPeer = peer
 		updatedWG = cur.Client.WireGuard
 		return nil
 	})
@@ -1350,15 +1255,11 @@ func (s *Server) handleAddWGPeer(w http.ResponseWriter, r *http.Request, _ *sess
 }
 
 func (s *Server) handleRegenWGServer(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
-	priv, pub, err := cryptoext.GenerateWireGuardKeypair()
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
+	var pub string
 	updated, _, err := reconcile.UpdateAndReconcile(r.Context(), s.Store, state.RoleClient, s.Exec, s.ApplyOpts, func(cur *state.State) error {
-		cur.Client.WireGuard.ServerPrivateKey = priv
-		cur.Client.WireGuard.ServerPublicKey = pub
-		return nil
+		var kerr error
+		pub, kerr = cur.RegenerateWireGuardServerKeys()
+		return kerr
 	})
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -1376,24 +1277,16 @@ func (s *Server) handleRegenWGServer(w http.ResponseWriter, r *http.Request, _ *
 
 func (s *Server) handleRegenWGPeer(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
 	name := r.PathValue("name")
-	priv, pub, err := cryptoext.GenerateWireGuardKeypair()
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
 	var updatedPeer state.WGPeer
 	var updatedWG state.WireGuardConfig
-	_, _, err = reconcile.UpdateAndReconcile(r.Context(), s.Store, state.RoleClient, s.Exec, s.ApplyOpts, func(cur *state.State) error {
-		for i := range cur.Client.WireGuard.Peers {
-			if cur.Client.WireGuard.Peers[i].Name == name {
-				cur.Client.WireGuard.Peers[i].PrivateKey = priv
-				cur.Client.WireGuard.Peers[i].PublicKey = pub
-				updatedPeer = cur.Client.WireGuard.Peers[i]
-				updatedWG = cur.Client.WireGuard
-				return nil
-			}
+	_, _, err := reconcile.UpdateAndReconcile(r.Context(), s.Store, state.RoleClient, s.Exec, s.ApplyOpts, func(cur *state.State) error {
+		peer, perr := cur.RegenerateWireGuardPeer(name)
+		if perr != nil {
+			return perr
 		}
-		return fmt.Errorf("peer %q not found", name)
+		updatedPeer = peer
+		updatedWG = cur.Client.WireGuard
+		return nil
 	})
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, err.Error())
@@ -1707,15 +1600,8 @@ func (s *Server) handleProxyStop(w http.ResponseWriter, r *http.Request, _ *sess
 			stopped = append(stopped, svc)
 		}
 	}
-	if st.Role == state.RoleClient && s.Exec.HasCommand("ip") {
-		for _, family := range []string{"-4", "-6"} {
-			for i := 0; i < 4; i++ {
-				if _, err := s.Exec.RunCommand(r.Context(), nil, "ip", family, "rule", "del", "fwmark", "0x9", "table", "220"); err != nil {
-					break
-				}
-			}
-			_, _ = s.Exec.RunCommand(r.Context(), nil, "ip", family, "route", "flush", "table", "220")
-		}
+	if st.Role == state.RoleClient {
+		reconcile.CleanupTProxyPolicyRoutes(r.Context(), s.Exec)
 	}
 	s.Hub.Log("INFO", "proxy", fmt.Sprintf("stopped proxy services: %v", stopped))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "stopped": stopped})
@@ -1879,90 +1765,36 @@ func (s *Server) handleCertIssue(w http.ResponseWriter, r *http.Request, _ *sess
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	dom := strings.TrimSpace(req.Domain)
-	if dom == "" {
-		dom = firstNonEmptyStr(st.Cert.Domain, st.Server.Domain)
-	}
 	tok := strings.TrimSpace(req.CFToken)
-	if tok == "" || tok == secretKeepSentinel {
-		tok = st.Cert.CFToken
+	if tok == secretKeepSentinel {
+		tok = ""
 	}
-	email := strings.TrimSpace(req.CFEmail)
-	if email == "" {
-		email = st.Cert.CFEmail
-	}
-	autoRenew := st.Cert.AutoRenew
+	autoRenew := true
 	if req.AutoRenew != nil {
 		autoRenew = *req.AutoRenew
-	} else {
-		autoRenew = true
 	}
-
 	mode := strings.ToLower(strings.TrimSpace(req.Mode))
 	if mode == "" {
 		mode = "cf"
 	}
-	cfg := cert.ACMEConfig{
-		Domain:    dom,
-		CFToken:   tok,
-		CFEmail:   email,
-		Webroot:   strings.TrimSpace(req.Webroot),
-		ListenV6:  st != nil && st.System.EnableIPv6,
-		AutoRenew: autoRenew,
-		CertPath:  s.Store.DefaultCert(),
-		KeyPath:   s.Store.DefaultKey(),
-		ReloadCmd: s.CertReloadCmd,
-	}
-	var rep *cert.CertReport
-	switch mode {
-	case "cf", "cloudflare", "dns":
-		rep, err = cert.IssueCloudflareACME(r.Context(), s.CertRunner, cfg)
-	case "http", "http-01":
-		rep, err = cert.IssueHTTPACME(r.Context(), s.CertRunner, cfg)
-	default:
-		writeJSONError(w, http.StatusBadRequest, "mode must be 'cf' or 'http'")
-		return
-	}
+	rep, dom, err := reconcile.IssueACMEAndSync(r.Context(), s.Store, s.Exec, s.ApplyOpts, s.CertRunner, reconcile.IssueACMEParams{
+		Mode:          mode,
+		Domain:        req.Domain,
+		CFToken:       tok,
+		CFEmail:       req.CFEmail,
+		Webroot:       req.Webroot,
+		AutoRenew:     &autoRenew,
+		ReloadCmd:     s.CertReloadCmd,
+		IncludeDaemon: false,
+	})
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
-	hadCustomExternal := (st.Cert.CertFile != "" && st.Cert.CertFile != s.Store.DefaultCert()) ||
-		(st.Cert.KeyFile != "" && st.Cert.KeyFile != s.Store.DefaultKey())
-	certMode := "acme_cf"
-	if mode == "http" || mode == "http-01" {
-		certMode = "acme_http"
-	}
-	if _, uerr := s.Store.Update(st.Role, func(cur *state.State) error {
-		cur.Cert.Mode = certMode
-		cur.Cert.Domain = dom
-		cur.Cert.CertFile = ""
-		cur.Cert.KeyFile = ""
-		cur.Cert.AutoRenew = autoRenew
-		if certMode == "acme_http" {
-			// HTTP-01 does not touch CF token
-		} else if autoRenew {
-			cur.Cert.CFToken = tok
-			cur.Cert.CFEmail = email
-		} else {
-			cur.Cert.CFToken = ""
-			cur.Cert.CFEmail = ""
-		}
-		return nil
-	}); uerr != nil {
-		writeJSONError(w, http.StatusInternalServerError, uerr.Error())
-		return
-	}
-	if hadCustomExternal {
-		if _, rerr := reconcile.Reconcile(r.Context(), s.Store, s.Exec, s.ApplyOpts); rerr != nil {
-			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("reconcile after cert issue: %v", rerr))
-			return
-		}
-	}
 	if s.ReloadCertFn != nil {
 		s.ReloadCertFn(r.Context())
 	}
+	_ = st
 	s.Hub.Log("INFO", "cert", fmt.Sprintf("issued %s ACME cert for %s", mode, dom))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cert": rep})
 	s.scheduleDaemonRestart("TLS certificate issued")
@@ -1980,8 +1812,7 @@ func (s *Server) handleCertImport(w http.ResponseWriter, r *http.Request, _ *ses
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	st, err := s.Store.Load()
-	if err != nil {
+	if _, err := s.Store.Load(); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -2027,38 +1858,17 @@ func (s *Server) handleCertImport(w http.ResponseWriter, r *http.Request, _ *ses
 		writeJSONError(w, http.StatusBadRequest, "cert_path/key_path or cert_pem/key_pem are required")
 		return
 	}
-	var checkDomains []string
-	if d := firstNonEmptyStr(st.Cert.Domain, st.Server.Domain); d != "" {
-		checkDomains = append(checkDomains, d)
-	}
-	rep, changed, err := cert.ImportPair(srcCert, srcKey, s.Store.DefaultCert(), s.Store.DefaultKey(), req.AllowSelfSigned, checkDomains)
+	rep, changed, pathsChanged, err := reconcile.ImportCertAndSync(r.Context(), s.Store, s.Exec, s.ApplyOpts, srcCert, srcKey, req.AllowSelfSigned, false, nil)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	hadCustomExternal := (st.Cert.CertFile != "" && st.Cert.CertFile != s.Store.DefaultCert()) ||
-		(st.Cert.KeyFile != "" && st.Cert.KeyFile != s.Store.DefaultKey())
-	if _, uerr := s.Store.Update(st.Role, func(cur *state.State) error {
-		cur.Cert.Mode = "imported"
-		cur.Cert.CertFile = s.Store.DefaultCert()
-		cur.Cert.KeyFile = s.Store.DefaultKey()
-		return nil
-	}); uerr != nil {
-		writeJSONError(w, http.StatusInternalServerError, uerr.Error())
-		return
-	}
-	if hadCustomExternal {
-		if _, rerr := reconcile.Reconcile(r.Context(), s.Store, s.Exec, s.ApplyOpts); rerr != nil {
-			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("reconcile after cert import: %v", rerr))
-			return
-		}
-	}
-	if (changed || hadCustomExternal) && s.ReloadCertFn != nil {
+	if (changed || pathsChanged) && s.ReloadCertFn != nil {
 		s.ReloadCertFn(r.Context())
 	}
 	s.Hub.Log("INFO", "cert", fmt.Sprintf("imported certificate CN=%s changed=%v", rep.CommonName, changed))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "changed": changed, "cert": rep})
-	if changed || hadCustomExternal {
+	if changed || pathsChanged {
 		s.scheduleDaemonRestart("TLS certificate imported")
 	}
 }
@@ -2069,48 +1879,22 @@ func (s *Server) handleCertSelfSign(w http.ResponseWriter, r *http.Request, _ *s
 		Force *bool  `json:"force"`
 	}
 	_ = decodeJSONBody(r, &req, 4096)
-	st, err := s.Store.Load()
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	cn := firstNonEmptyStr(req.CN, st.Cert.Domain, st.Server.Domain, "localhost")
 	force := true
 	if req.Force != nil {
 		force = *req.Force
 	}
-	if force {
-		err = cert.ForceSelfSigned(s.Store.DefaultCert(), s.Store.DefaultKey(), cn)
-	} else {
-		err = cert.EnsureSelfSigned(s.Store.DefaultCert(), s.Store.DefaultKey(), cn)
-	}
+	rep, _, _, err := reconcile.SelfSignCertAndSync(r.Context(), s.Store, s.Exec, s.ApplyOpts, req.CN, force, false, nil)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	hadCustomExternal := (st.Cert.CertFile != "" && st.Cert.CertFile != s.Store.DefaultCert()) ||
-		(st.Cert.KeyFile != "" && st.Cert.KeyFile != s.Store.DefaultKey())
-	if _, uerr := s.Store.Update(st.Role, func(cur *state.State) error {
-		cur.Cert.Mode = "self_signed"
-		cur.Cert.CertFile = ""
-		cur.Cert.KeyFile = ""
-		return nil
-	}); uerr != nil {
-		writeJSONError(w, http.StatusInternalServerError, uerr.Error())
-		return
-	}
-	if hadCustomExternal {
-		if _, rerr := reconcile.Reconcile(r.Context(), s.Store, s.Exec, s.ApplyOpts); rerr != nil {
-			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("reconcile after self-sign: %v", rerr))
-			return
-		}
-	}
 	if s.ReloadCertFn != nil {
 		s.ReloadCertFn(r.Context())
 	}
-	cb, _ := os.ReadFile(s.Store.DefaultCert())
-	kb, _ := os.ReadFile(s.Store.DefaultKey())
-	rep, _ := cert.InspectPair(cb, kb)
+	cn := ""
+	if rep != nil {
+		cn = rep.CommonName
+	}
 	s.Hub.Log("INFO", "cert", fmt.Sprintf("generated self-signed cert CN=%s", cn))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cert": rep})
 	s.scheduleDaemonRestart("self-signed TLS certificate regenerated")

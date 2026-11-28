@@ -936,3 +936,40 @@ func TestNetRuleAndSanitizeHelpers(t *testing.T) {
 	}
 }
 
+func TestMutationsEnsureDefaultsWGAndIDs(t *testing.T) {
+	st := NewDefaultState(RoleClient)
+	st.Client.DNS.EnableDoHServer = true
+	st.Client.DNS.DoHServerPath = ""
+	st.Server.EnableDoH = true
+	st.Client.WireGuard.Enabled = true
+	st.Client.WireGuard.EndpointHost = "wg.example.com"
+	if err := st.EnsureGeneratedDefaults(); err != nil {
+		t.Fatalf("EnsureGeneratedDefaults: %v", err)
+	}
+	if st.Server.EnableDoH {
+		t.Fatalf("expected Server.EnableDoH normalized to false on client role")
+	}
+	if st.Client.DNS.DoHServerPath == "" || st.Client.WireGuard.ServerPublicKey == "" {
+		t.Fatalf("expected auto-generated DoHServerPath and WG keys")
+	}
+
+	p1, err := st.AddWireGuardPeer("phone", "wg.example.com", 51820, "")
+	if err != nil || p1.IP != "172.16.66.11" {
+		t.Fatalf("AddWireGuardPeer: got %+v err=%v", p1, err)
+	}
+	if err := st.DeleteWireGuardPeer("phone"); err != nil {
+		t.Fatalf("DeleteWireGuardPeer: %v", err)
+	}
+
+	var rel RelayConfig
+	id1 := rel.NextForwardID(10001, "tcp")
+	rel.Forwards = append(rel.Forwards, ForwardRule{ID: id1})
+	id2 := rel.NextForwardID(10001, "udp")
+	if id1 != "fwd-10001" || id2 != "fwd-udp-10001" {
+		t.Fatalf("unexpected forward IDs: %q, %q", id1, id2)
+	}
+	if tag := DefaultExtraInboundTag("vless-reality", 9443); tag != "inbound-reality-9443" {
+		t.Fatalf("unexpected DefaultExtraInboundTag: %q", tag)
+	}
+}
+

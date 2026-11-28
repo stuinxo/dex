@@ -454,12 +454,6 @@ func Reconcile(ctx context.Context, store *state.Store, exec SystemExecutor, opt
 	return res, nil
 }
 
-func isCustomExternalCertState(st *state.State, store *state.Store) bool {
-	return st.Cert.Mode == "imported" &&
-		((st.Cert.CertFile != "" && st.Cert.CertFile != store.DefaultCert()) ||
-			(st.Cert.KeyFile != "" && st.Cert.KeyFile != store.DefaultKey()))
-}
-
 func dryRunPreflight(ctx context.Context, exec SystemExecutor, store *state.Store, st *state.State, ropts render.RenderOptions, rootPrefix string, bundle *render.RenderBundle) error {
 	dryDir, err := os.MkdirTemp("", "dex-dryrun-*")
 	if err != nil {
@@ -469,7 +463,7 @@ func dryRunPreflight(ctx context.Context, exec SystemExecutor, store *state.Stor
 
 	dryRopts := ropts
 	dryFiles := bundle.Files
-	if !isCustomExternalCertState(st, store) {
+	if !HasCustomExternalCert(store, st) {
 		certDisk := fsutil.MapRootPrefix(rootPrefix, ropts.CertFile)
 		keyDisk := fsutil.MapRootPrefix(rootPrefix, ropts.KeyFile)
 		_, errC := os.Stat(certDisk)
@@ -599,7 +593,7 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 			}
 		}
 	}
-	if !isCustomExternalCertState(st, store) {
+	if !HasCustomExternalCert(store, st) {
 		certDisk := fsutil.MapRootPrefix(opts.RootPrefix, ropts.CertFile)
 		keyDisk := fsutil.MapRootPrefix(opts.RootPrefix, ropts.KeyFile)
 		prevCert, errC := os.ReadFile(certDisk)
@@ -979,15 +973,8 @@ func reconcileUnlocked(ctx context.Context, store *state.Store, exec SystemExecu
 				}
 			}
 		}
-		if !bundle.NFTClientNeeded && isOS && exec.HasCommand("ip") {
-			for _, family := range []string{"-4", "-6"} {
-				for i := 0; i < 4; i++ {
-					if _, err := exec.RunCommand(ctx, nil, "ip", family, "rule", "del", "fwmark", "0x9", "table", "220"); err != nil {
-						break
-					}
-				}
-				_, _ = exec.RunCommand(ctx, nil, "ip", family, "route", "flush", "table", "220")
-			}
+		if !bundle.NFTClientNeeded && isOS {
+			CleanupTProxyPolicyRoutes(ctx, exec)
 		}
 
 		// Manage dex-daemon carefully: start if inactive, avoid self-restarting when already active (e.g. Web UI apply)
