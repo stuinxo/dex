@@ -146,3 +146,29 @@ func TestNotifyTestAndNodeMetricsEndpoints(t *testing.T) {
 		t.Fatalf("expected test webhook event, got %+v", receivedWebhook)
 	}
 }
+
+func TestNodeMetricsDoesNotExposeRemovedNodes(t *testing.T) {
+	srv, store, _ := setupTestWeb(t, false)
+	srv.Metrics.Record(daemon.ProbeNodeResult{NodeID: "n1", Healthy: true, LatencyMS: 10})
+	if _, err := store.Update(state.RoleClient, func(st *state.State) error {
+		st.Client.Nodes = nil
+		st.Client.ActiveNodeID = ""
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	srv.handleNodeMetrics(rec, httptest.NewRequest("GET", "/api/v1/metrics/nodes", nil), nil)
+	if rec.Code != 200 {
+		t.Fatalf("metrics returned %d", rec.Code)
+	}
+	var response struct {
+		Nodes []daemon.NodeMetricsSummary `json:"nodes"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Nodes) != 0 {
+		t.Fatal("metrics endpoint returned removed nodes")
+	}
+}

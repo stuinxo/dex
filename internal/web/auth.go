@@ -4,19 +4,24 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
-	"github.com/stuinxo/dex/internal/cryptoext"
-	"github.com/stuinxo/dex/internal/state"
+	"errors"
 	"net"
 	"net/http"
 	"net/netip"
 	"strings"
 	"time"
+
+	"github.com/stuinxo/dex/internal/cryptoext"
+	"github.com/stuinxo/dex/internal/state"
 )
 
+var errCredentialsChanged = errors.New("credentials changed during request")
+
 type sessionRecord struct {
-	id        string
-	csrfToken string
-	expiresAt time.Time
+	credentialHash string
+	id             string
+	csrfToken      string
+	expiresAt      time.Time
 }
 
 // DoHProbeResult reports reachability and RTT for a DoH/DoT/DoQ upstream URL.
@@ -147,16 +152,24 @@ func (s *Server) getSession(r *http.Request) *sessionRecord {
 	now := time.Now()
 	s.sessMu.RLock()
 	rec := s.sessions[c.Value]
+	var snapshot sessionRecord
+	if rec != nil {
+		snapshot = *rec
+	}
 	s.sessMu.RUnlock()
-	if rec == nil || now.After(rec.expiresAt) {
-		if rec != nil {
-			s.sessMu.Lock()
-			delete(s.sessions, c.Value)
-			s.sessMu.Unlock()
-		}
+	if rec == nil {
 		return nil
 	}
-	return rec
+	st, loadErr := s.Store.Load()
+	if now.After(snapshot.expiresAt) || loadErr != nil || snapshot.credentialHash != st.Auth.PasswordHash {
+		s.sessMu.Lock()
+		if s.sessions[c.Value] == rec {
+			delete(s.sessions, c.Value)
+		}
+		s.sessMu.Unlock()
+		return nil
+	}
+	return &snapshot
 }
 
 func (s *Server) requireAuth(requireCSRF bool, fn func(http.ResponseWriter, *http.Request, *sessionRecord)) http.HandlerFunc {
@@ -212,11 +225,21 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	if needsRehash {
 		if newHash, herr := cryptoext.HashPassword(req.Password); herr == nil {
-			_, _ = s.Store.Update(st.Role, func(cur *state.State) error {
+			updated, updateErr := s.Store.Update(st.Role, func(cur *state.State) error {
+				if cur.Auth.PasswordHash != st.Auth.PasswordHash {
+					return errCredentialsChanged
+				}
 				cur.Auth.PasswordHash = newHash
 				return nil
 			})
-			s.Hub.Log("INFO", "auth", "upgraded legacy v2 password hash to PBKDF2-SHA256")
+			if errors.Is(updateErr, errCredentialsChanged) {
+				writeJSONError(w, http.StatusUnauthorized, "invalid credentials")
+				return
+			}
+			if updateErr == nil {
+				st = updated
+				s.Hub.Log("INFO", "auth", "upgraded legacy v2 password hash to PBKDF2-SHA256")
+			}
 		}
 	}
 
@@ -228,9 +251,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now()
 	rec := &sessionRecord{
-		id:        sid,
-		csrfToken: csrf,
-		expiresAt: now.Add(sessionTTL),
+		credentialHash: st.Auth.PasswordHash,
+		id:             sid,
+		csrfToken:      csrf,
+		expiresAt:      now.Add(sessionTTL),
 	}
 	s.sessMu.Lock()
 	for id, existing := range s.sessions {
@@ -334,27 +358,43 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request, se
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Hold session publication across the credential write so concurrent readers
+	// cannot remove the current session before its replacement is published.
+	s.sessMu.Lock()
 	if _, err := s.Store.Update(st.Role, func(cur *state.State) error {
+		if cur.Auth.PasswordHash != st.Auth.PasswordHash {
+			return errCredentialsChanged
+		}
 		cur.Auth.PasswordHash = newHash
 		return nil
 	}); err != nil {
+		s.sessMu.Unlock()
+		if errors.Is(err, errCredentialsChanged) {
+			writeJSONError(w, http.StatusUnauthorized, "current password incorrect")
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	// Rotate CSRF token and drop other sessions
 	newCSRF, _ := randomHex32()
-	s.sessMu.Lock()
 	for id := range s.sessions {
 		if id != sess.id {
 			delete(s.sessions, id)
 		}
 	}
+	// Session values handed to requests are snapshots; publish a replacement.
+	next := *sess
+	next.credentialHash = newHash
 	if newCSRF != "" {
-		sess.csrfToken = newCSRF
+		next.csrfToken = newCSRF
+	}
+	if _, exists := s.sessions[sess.id]; exists {
+		s.sessions[sess.id] = &next
 	}
 	s.sessMu.Unlock()
 	s.Hub.Log("INFO", "auth", "web UI password changed")
 
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "csrf_token": sess.csrfToken})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "csrf_token": next.csrfToken})
 }

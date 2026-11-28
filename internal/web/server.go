@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"github.com/stuinxo/dex/internal/cert"
 	"github.com/stuinxo/dex/internal/daemon"
-	"github.com/stuinxo/dex/internal/doh"
 	"github.com/stuinxo/dex/internal/reconcile"
 	"github.com/stuinxo/dex/internal/socks5out"
 	"github.com/stuinxo/dex/internal/state"
@@ -73,14 +72,7 @@ type Server struct {
 	rlMu     sync.Mutex
 	failures map[string][]time.Time
 
-	dohMu           sync.RWMutex
-	dohStateModNano int64
-	dohStateSize    int64
-	dohLoaded       bool
-	dohEnabled      bool
-	dohPath         string
-	dohUpstreamsKey string
-	dohHandler      *doh.Handler
+	clientDoH clientDoHCache
 
 	handler http.Handler
 }
@@ -118,74 +110,13 @@ func NewServer(store *state.Store, exec reconcile.SystemExecutor, hub *daemon.Ta
 	return s
 }
 
-// InvalidateDoHCache forces the next DoH path lookup to reload state.json immediately.
+// InvalidateDoHCache forces the next DoH path lookup to reload stored state.
 func (s *Server) InvalidateDoHCache() {
-	s.dohMu.Lock()
-	s.dohLoaded = false
-	s.dohMu.Unlock()
-}
-
-func (s *Server) matchClientDoH(reqPath string) *doh.Handler {
-	if s.Store == nil || reqPath == "" || reqPath == "/" || strings.HasPrefix(reqPath, "/api/") {
-		return nil
-	}
-	var modNano, fSize int64
-	if fi, err := os.Stat(s.Store.StatePath()); err == nil {
-		modNano = fi.ModTime().UnixNano()
-		fSize = fi.Size()
-	}
-	ups := s.ClientDoHUpstreams
-	if len(ups) == 0 {
-		ups = []string{"127.0.0.1:53"}
-	}
-	upsKey := strings.Join(ups, ",")
-
-	s.dohMu.RLock()
-	if s.dohLoaded && s.dohStateModNano == modNano && s.dohStateSize == fSize && s.dohUpstreamsKey == upsKey {
-		enabled := s.dohEnabled
-		path := s.dohPath
-		h := s.dohHandler
-		s.dohMu.RUnlock()
-		if enabled && reqPath == path {
-			return h
-		}
-		return nil
-	}
-	s.dohMu.RUnlock()
-
-	st, err := s.Store.Load()
-	enabled := err == nil && st != nil && st.Role == state.RoleClient && st.Client.DNS.EnableDoHServer
-	path := ""
-	if enabled {
-		path = st.Client.DNS.EffectiveDoHPath()
-	}
-
-	s.dohMu.Lock()
-	if enabled && (s.dohHandler == nil || s.dohPath != path || s.dohUpstreamsKey != upsKey) {
-		s.dohHandler = doh.NewHandler(doh.Config{
-			Path:          path,
-			Upstreams:     append([]string(nil), ups...),
-			Timeout:       5 * time.Second,
-			MaxConcurrent: 128,
-		})
-	}
-	s.dohEnabled = enabled
-	s.dohPath = path
-	s.dohUpstreamsKey = upsKey
-	s.dohStateModNano = modNano
-	s.dohStateSize = fSize
-	s.dohLoaded = true
-	h := s.dohHandler
-	s.dohMu.Unlock()
-
-	if enabled && reqPath == path {
-		return h
-	}
-	return nil
+	s.clientDoH.invalidate()
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h := s.matchClientDoH(r.URL.Path); h != nil {
+	if h := s.clientDoH.lookup(s.Store, r.URL.Path, s.ClientDoHUpstreams); h != nil {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		h.ServeHTTP(w, r)
 		return

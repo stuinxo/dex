@@ -180,6 +180,27 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request, _ *sessi
 	})
 }
 
+// preserveStateSecrets resolves masked or omitted secrets against cur.
+// Live writes must supply cur from inside the serialized Store mutation.
+func preserveStateSecrets(incoming, cur *state.State) {
+	if cur == nil || incoming == nil {
+		return
+	}
+	incoming.Auth.PasswordHash = cur.Auth.PasswordHash
+	if incoming.Cert.CFToken == "" || incoming.Cert.CFToken == secretKeepSentinel {
+		incoming.Cert.CFToken = cur.Cert.CFToken
+	}
+	if incoming.Client.DDNS.CFToken == "" || incoming.Client.DDNS.CFToken == secretKeepSentinel {
+		incoming.Client.DDNS.CFToken = cur.Client.DDNS.CFToken
+	}
+	if incoming.System.Notify.WebhookURL == "" || incoming.System.Notify.WebhookURL == secretKeepSentinel {
+		incoming.System.Notify.WebhookURL = cur.System.Notify.WebhookURL
+	}
+	if incoming.System.Notify.TelegramBotToken == "" || incoming.System.Notify.TelegramBotToken == secretKeepSentinel {
+		incoming.System.Notify.TelegramBotToken = cur.System.Notify.TelegramBotToken
+	}
+}
+
 func (s *Server) handlePutState(w http.ResponseWriter, r *http.Request, _ *sessionRecord) {
 	var incoming state.State
 	if err := decodeJSONBody(r, &incoming, 4<<20); err != nil {
@@ -193,27 +214,17 @@ func (s *Server) handlePutState(w http.ResponseWriter, r *http.Request, _ *sessi
 		return
 	}
 
-	// Preserve sensitive stored secrets when masked or omitted in UI payload.
-	if cur != nil {
-		incoming.Auth.PasswordHash = cur.Auth.PasswordHash
-		if incoming.Cert.CFToken == "" || incoming.Cert.CFToken == secretKeepSentinel {
-			incoming.Cert.CFToken = cur.Cert.CFToken
-		}
-		if incoming.Client.DDNS.CFToken == "" || incoming.Client.DDNS.CFToken == secretKeepSentinel {
-			incoming.Client.DDNS.CFToken = cur.Client.DDNS.CFToken
-		}
-		if incoming.System.Notify.WebhookURL == "" || incoming.System.Notify.WebhookURL == secretKeepSentinel {
-			incoming.System.Notify.WebhookURL = cur.System.Notify.WebhookURL
-		}
-		if incoming.System.Notify.TelegramBotToken == "" || incoming.System.Notify.TelegramBotToken == secretKeepSentinel {
-			incoming.System.Notify.TelegramBotToken = cur.System.Notify.TelegramBotToken
-		}
-	}
 	if err := incoming.EnsureGeneratedDefaults(); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := incoming.Validate(); err != nil {
+	preview, err := incoming.Clone()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	preserveStateSecrets(preview, cur)
+	if err := preview.Validate(); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -223,7 +234,7 @@ func (s *Server) handlePutState(w http.ResponseWriter, r *http.Request, _ *sessi
 		opts.Force = true
 	}
 	if r.URL.Query().Get("dry_run") == "1" {
-		res, err := render.RenderAll(&incoming, opts.RenderOpts)
+		res, err := render.RenderAll(preview, opts.RenderOpts)
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
@@ -232,8 +243,10 @@ func (s *Server) handlePutState(w http.ResponseWriter, r *http.Request, _ *sessi
 		return
 	}
 
-	listenChanged := cur != nil && strings.TrimSpace(cur.Auth.ListenAddr) != strings.TrimSpace(incoming.Auth.ListenAddr)
+	listenChanged := false
 	updated, applyRes, err := reconcile.UpdateAndReconcile(r.Context(), s.Store, incoming.Role, s.Exec, opts, func(dst *state.State) error {
+		preserveStateSecrets(&incoming, dst)
+		listenChanged = strings.TrimSpace(dst.Auth.ListenAddr) != strings.TrimSpace(incoming.Auth.ListenAddr)
 		*dst = incoming
 		return nil
 	})
@@ -375,8 +388,10 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request, _ *sessio
 		return
 	}
 
-	// Preserve existing v3 password hash if the imported source has none.
-	if imported.Auth.PasswordHash == "" {
+	// Preserve existing v3 password hash if the imported source has none,
+	// re-resolving against the live Store inside the serialized mutation.
+	preserveCurHash := imported.Auth.PasswordHash == ""
+	if preserveCurHash {
 		if cur, cerr := s.Store.Load(); cerr == nil {
 			imported.Auth.PasswordHash = cur.Auth.PasswordHash
 		}
@@ -388,6 +403,9 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request, _ *sessio
 
 	if req.Apply {
 		_, _, err = reconcile.UpdateAndReconcile(r.Context(), s.Store, imported.Role, s.Exec, s.ApplyOpts, func(dst *state.State) error {
+			if preserveCurHash && dst.Auth.PasswordHash != "" {
+				imported.Auth.PasswordHash = dst.Auth.PasswordHash
+			}
 			*dst = *imported
 			return nil
 		})
@@ -396,7 +414,13 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request, _ *sessio
 			return
 		}
 	} else {
-		if err := s.Store.Save(imported); err != nil {
+		if _, err := s.Store.Update(imported.Role, func(dst *state.State) error {
+			if preserveCurHash && dst.Auth.PasswordHash != "" {
+				imported.Auth.PasswordHash = dst.Auth.PasswordHash
+			}
+			*dst = *imported
+			return nil
+		}); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
