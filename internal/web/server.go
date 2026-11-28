@@ -177,6 +177,11 @@ func (s *Server) buildRouter() http.Handler {
 
 func withSecurityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if r.Body != nil && r.ContentLength > 0 && r.ContentLength <= 64<<10 && r.Header.Get("Expect") == "" {
+				_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, 64<<10))
+			}
+		}()
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "same-origin")

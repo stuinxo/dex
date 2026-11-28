@@ -27,13 +27,13 @@ type ApplyOptions struct {
 
 // ApplyResult summarizes the outcome of Reconcile.
 type ApplyResult struct {
-	Bundle            *render.RenderBundle
-	FilesWritten      []string
-	FilesRemoved      []string
-	ServicesOn        []string
-	ServicesRestarted []string
-	ServicesOff       []string
-	Warnings          []string
+	Bundle            *render.RenderBundle `json:"-"`
+	FilesWritten      []string             `json:"FilesWritten,omitempty"`
+	FilesRemoved      []string             `json:"FilesRemoved,omitempty"`
+	ServicesOn        []string             `json:"ServicesOn,omitempty"`
+	ServicesRestarted []string             `json:"ServicesRestarted,omitempty"`
+	ServicesOff       []string             `json:"ServicesOff,omitempty"`
+	Warnings          []string             `json:"Warnings,omitempty"`
 }
 
 // UpdateAndReconcile atomically snapshots state.json, runs mutator, saves state, and reconciles;

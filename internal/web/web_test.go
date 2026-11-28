@@ -1167,3 +1167,97 @@ func TestClientInProcessDoHEndpointAndHotSwap(t *testing.T) {
 		t.Fatalf("expected /dq to return 404 when disabled, got %d", disabledRec.Code)
 	}
 }
+
+func TestApplyResponsesOmitBundleSecretsAndDrainSmallCloseBody(t *testing.T) {
+	srv, store, _ := setupTestWeb(t, false)
+	var peerPriv, srvPriv string
+	if _, err := store.Update(state.RoleClient, func(st *state.State) error {
+		peer, err := st.AddWireGuardPeer("ipad", "vpn.example.com", 51820, "")
+		if err != nil {
+			return err
+		}
+		peerPriv = peer.PrivateKey
+		srvPriv = st.Client.WireGuard.ServerPrivateKey
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if peerPriv == "" || srvPriv == "" {
+		t.Fatal("expected generated WireGuard private keys")
+	}
+
+	ts := httptest.NewTLSServer(srv)
+	defer ts.Close()
+
+	tr := ts.Client().Transport.(*http.Transport).Clone()
+	tr.DisableKeepAlives = true
+	tr.ForceAttemptHTTP2 = false
+	if tr.TLSClientConfig != nil {
+		tr.TLSClientConfig.NextProtos = []string{"http/1.1"}
+	}
+	client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
+
+	loginReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/auth/login", strings.NewReader(`{"password":"myPass123"}`))
+	loginReq.Header.Set("Content-Type", "application/json")
+	loginResp, err := client.Do(loginReq)
+	if err != nil {
+		t.Fatalf("login failed: %v", err)
+	}
+	var loginData map[string]any
+	_ = json.NewDecoder(loginResp.Body).Decode(&loginData)
+	_ = loginResp.Body.Close()
+	csrf, _ := loginData["csrf_token"].(string)
+	cookies := loginResp.Cookies()
+	if csrf == "" || len(cookies) == 0 {
+		t.Fatalf("expected csrf token and session cookie, got csrf=%q cookies=%d", csrf, len(cookies))
+	}
+
+	postClose := func(path, body string) []byte {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-CSRF-Token", csrf)
+		req.Close = true
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s failed: %v", path, err)
+		}
+		defer resp.Body.Close()
+		raw, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read POST %s body failed: %v", path, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("POST %s returned %d: %s", path, resp.StatusCode, string(raw))
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			t.Fatalf("invalid JSON from POST %s: %v", path, err)
+		}
+		return raw
+	}
+
+	assertNoSecretsOrBundle := func(endpoint string, raw []byte) {
+		s := string(raw)
+		if strings.Contains(s, `"Bundle"`) {
+			t.Fatalf("%s leaked ApplyResult.Bundle in JSON response (len=%d)", endpoint, len(raw))
+		}
+		if strings.Contains(s, srvPriv) || strings.Contains(s, peerPriv) {
+			t.Fatalf("%s leaked WireGuard private key in JSON response", endpoint)
+		}
+		b64Srv := base64.StdEncoding.EncodeToString([]byte(srvPriv))
+		if strings.Contains(s, b64Srv) {
+			t.Fatalf("%s leaked base64 WireGuard private key in JSON response", endpoint)
+		}
+	}
+
+	for i := 0; i < 3; i++ {
+		_ = postClose("/api/v1/proxy/stop", `{}`)
+		resRaw := postClose("/api/v1/proxy/restart", `{}`)
+		assertNoSecretsOrBundle("proxy/restart", resRaw)
+	}
+	applyRaw := postClose("/api/v1/apply", `{}`)
+	assertNoSecretsOrBundle("apply", applyRaw)
+}
