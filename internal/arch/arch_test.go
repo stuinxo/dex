@@ -2,12 +2,15 @@ package arch_test
 
 import (
 	"bytes"
+	"fmt"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -32,69 +35,103 @@ func repoRoot(t *testing.T) string {
 	}
 }
 
-func TestLayeredDependencyDAG(t *testing.T) {
-	root := repoRoot(t)
+// allowedInternalDeps encodes the strict minimal direct production dependency DAG.
+// Any new internal package or edge requires explicit architectural review.
+var allowedInternalDeps = map[string]string{
+	"arch":      "",
+	"version":   "",
+	"fsutil":    "",
+	"cryptoext": "",
+	"doh":       "",
+	"state":     "cryptoext fsutil",
+	"cert":      "fsutil",
+	"socks5out": "state",
+	"render":    "cryptoext state",
+	"migrate":   "cryptoext render state",
+	"reconcile": "cert fsutil render state",
+	"update":    "fsutil reconcile state",
+	"daemon":    "reconcile render socks5out state",
+	"web":       "cert cryptoext daemon doh migrate reconcile render socks5out state version",
+	"cli":       "cert cryptoext daemon doh fsutil migrate reconcile render socks5out state update version web",
+}
+
+func checkInternalDependencies(internalRoot string) []string {
 	const modPrefix = "github.com/stuinxo/dex/internal/"
-
-	allowedInternal := map[string]map[string]bool{
-		"arch":      {},
-		"version":   {},
-		"fsutil":    {},
-		"cryptoext": {},
-		"doh":       {},
-		"state":     {"fsutil": true, "cryptoext": true},
-		"cert":      {"fsutil": true, "cryptoext": true, "state": true},
-		"socks5out": {"fsutil": true, "cryptoext": true, "state": true},
-		"render":    {"fsutil": true, "cryptoext": true, "state": true},
-		"migrate":   {"fsutil": true, "cryptoext": true, "state": true, "render": true},
-		"reconcile": {"fsutil": true, "cryptoext": true, "state": true, "cert": true, "render": true},
-		"update":    {"fsutil": true, "state": true, "reconcile": true},
-		"daemon":    {"version": true, "fsutil": true, "cryptoext": true, "doh": true, "state": true, "cert": true, "socks5out": true, "render": true, "reconcile": true},
-		"web":       {"version": true, "fsutil": true, "cryptoext": true, "doh": true, "state": true, "cert": true, "socks5out": true, "render": true, "migrate": true, "reconcile": true, "daemon": true},
-		"cli":       {"version": true, "fsutil": true, "cryptoext": true, "doh": true, "state": true, "cert": true, "socks5out": true, "render": true, "migrate": true, "reconcile": true, "update": true, "daemon": true, "web": true},
-	}
-
 	fset := token.NewFileSet()
-	internalRoot := filepath.Join(root, "internal")
-	err := filepath.WalkDir(internalRoot, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-			return err
+	var violations []string
+
+	err := filepath.WalkDir(internalRoot, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-		rel, _ := filepath.Rel(internalRoot, path)
-		pkgName := strings.Split(filepath.ToSlash(rel), "/")[0]
-		allowed, knownPkg := allowedInternal[pkgName]
-		if !knownPkg {
-			t.Errorf("unregistered internal package %q at %s (add it to TestLayeredDependencyDAG)", pkgName, rel)
+		if d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
-
-		f, perr := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
-		if perr != nil {
-			t.Errorf("parse %s: %v", rel, perr)
+		rel, err := filepath.Rel(internalRoot, path)
+		if err != nil {
+			return err
+		}
+		pkgName := strings.Split(filepath.ToSlash(rel), "/")[0]
+		permitted, known := allowedInternalDeps[pkgName]
+		if !known {
+			violations = append(violations, fmt.Sprintf("unregistered internal package %q at %s", pkgName, rel))
+			return nil
+		}
+		f, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
+		if err != nil {
+			violations = append(violations, fmt.Sprintf("parse %s: %v", rel, err))
 			return nil
 		}
 		for _, imp := range f.Imports {
-			impPath := strings.Trim(imp.Path.Value, `"`)
+			impPath, uerr := strconv.Unquote(imp.Path.Value)
+			if uerr != nil {
+				violations = append(violations, fmt.Sprintf("unquote import in %s: %v", rel, uerr))
+				continue
+			}
 			if pkgName == "render" && (impPath == "os/exec" || impPath == "net/http") {
-				t.Errorf("pure compiler package render (%s) must not import %q", rel, impPath)
+				violations = append(violations, fmt.Sprintf("pure compiler package render (%s) must not import %q", rel, impPath))
 			}
 			if depPkg, ok := strings.CutPrefix(impPath, modPrefix); ok {
-				if !allowed[depPkg] {
-					t.Errorf("layer violation: internal/%s (%s) must not import internal/%s", pkgName, rel, depPkg)
+				if !strings.Contains(" "+permitted+" ", " "+depPkg+" ") {
+					violations = append(violations, fmt.Sprintf("layer violation: internal/%s (%s) must not import internal/%s", pkgName, rel, depPkg))
 				}
 			}
 		}
 		return nil
 	})
 	if err != nil {
+		violations = append(violations, err.Error())
+	}
+	return violations
+}
+
+func TestLayeredDependencyDAG(t *testing.T) {
+	internalRoot := filepath.Join(repoRoot(t), "internal")
+	for _, v := range checkInternalDependencies(internalRoot) {
+		t.Error(v)
+	}
+}
+
+func TestDependencyGuardRejectsLayerViolation(t *testing.T) {
+	tmpRoot := t.TempDir()
+	stateDir := filepath.Join(tmpRoot, "state")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		t.Fatal(err)
+	}
+	badFile := filepath.Join(stateDir, "invalid.go")
+	if err := os.WriteFile(badFile, []byte("package state\nimport _ \"github.com/stuinxo/dex/internal/web\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	violations := checkInternalDependencies(tmpRoot)
+	if len(violations) != 1 || !strings.Contains(violations[0], "must not import internal/web") {
+		t.Fatalf("guard did not reject state -> web: %v", violations)
 	}
 }
 
 func TestAtomicWriteCentralization(t *testing.T) {
 	root := repoRoot(t)
 	allowCreateTemp := map[string]bool{
-		"internal/fsutil/atomic.go":    true,
+		"internal/fsutil/atomic.go":     true,
 		"internal/update/download.go":   true, // streaming HTTP download staging
 		"internal/update/operations.go": true, // zip archive entry & rollback binary staging
 	}
@@ -113,12 +150,77 @@ func TestAtomicWriteCentralization(t *testing.T) {
 			return rerr
 		}
 		if bytes.Contains(b, []byte("os.CreateTemp(")) {
-			t.Errorf("%s calls os.CreateTemp directly; use internal/fsutil.WriteFileAtomic or WriteJSONAtomic instead", relSlash)
+			t.Errorf("%s calls os.CreateTemp directly; use internal/fsutil instead", relSlash)
 		}
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCertificateTransitionOwnership(t *testing.T) {
+	root := repoRoot(t)
+	fset := token.NewFileSet()
+	for _, pkg := range []string{"cli", "web", "reconcile"} {
+		files, err := filepath.Glob(filepath.Join(root, "internal", pkg, "*.go"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, path := range files {
+			if strings.HasSuffix(path, "_test.go") {
+				continue
+			}
+			f, err := parser.ParseFile(fset, path, nil, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ast.Inspect(f, func(n ast.Node) bool {
+				assign, ok := n.(*ast.AssignStmt)
+				if !ok {
+					return true
+				}
+				for _, lhs := range assign.Lhs {
+					field, ok := lhs.(*ast.SelectorExpr)
+					if !ok {
+						continue
+					}
+					certSel, ok := field.X.(*ast.SelectorExpr)
+					if !ok || certSel.Sel.Name != "Cert" {
+						continue
+					}
+					switch field.Sel.Name {
+					case "Mode", "CertFile", "KeyFile", "AutoRenew":
+						t.Errorf("%s: certificate transition field assignment must use state.CertConfig methods", fset.Position(field.Pos()))
+					}
+				}
+				return true
+			})
+		}
+	}
+}
+
+func TestPortAllocationOwnership(t *testing.T) {
+	root := repoRoot(t)
+	fset := token.NewFileSet()
+	files, err := filepath.Glob(filepath.Join(root, "internal", "render", "*.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range files {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, decl := range f.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if ok && (fn.Name.Name == "ExtraInternalPort" || fn.Name.Name == "AllocateViaNginxInternalPorts") {
+				t.Errorf("%s redeclares state-owned port allocation helper %s", filepath.Base(path), fn.Name.Name)
+			}
+		}
 	}
 }
 
@@ -172,11 +274,11 @@ func TestInstallerTripletAndSecurityInvariants(t *testing.T) {
 			t.Fatalf("read %s: %v", alias, rerr)
 		}
 		if !bytes.Equal(b, instBytes) {
-			t.Errorf("%s is out of sync with scripts/install.sh", alias)
+			t.Errorf("%s is out of sync with scripts/install.sh (run sh scripts/sync-install.sh)", alias)
 		}
 	}
 
-	// Build forbidden patterns dynamically so CI's literal grep checks never self-match this test file.
+	// Build forbidden pattern dynamically so CI's literal grep checks never self-match this test file.
 	forbiddenFlag := []byte("--no-check-" + "certificate")
 	aptLockRe := regexp.MustCompile(`rm\s+(-rf|-f)\s+(/var/lib/(apt|dpkg)/.*lock|/var/cache/apt/archives/lock)`)
 

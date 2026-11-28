@@ -45,17 +45,65 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
 # 1. POSIX syntax check & bootstrap entrypoint sync (scripts/install.sh == dex == i)
 # ---------------------------------------------------------------------------
 for script in "$INSTALL_SCRIPT" "${REPO_ROOT}/dex" "${REPO_ROOT}/i"; do
-  if sh -n "$script" 2>/dev/null; then
+  if sh -n "$script" 2>/dev/null &&
+     [ "$(head -n 1 "$script")" = '#!/bin/sh' ]; then
     pass "POSIX syntax valid: $(basename "$script")"
   else
     fail "POSIX syntax invalid: $script"
   fi
 done
 
-if cmp -s "$INSTALL_SCRIPT" "${REPO_ROOT}/dex" && cmp -s "$INSTALL_SCRIPT" "${REPO_ROOT}/i"; then
-  pass "Bootstrap entrypoints (scripts/install.sh, dex, i) are byte-identical"
+if sh "$REPO_ROOT/scripts/sync-install.sh" --check; then
+  pass "Published bootstrap entrypoints match their canonical source"
 else
-  fail "Bootstrap entrypoints diverged (scripts/install.sh, dex, i must stay identical)"
+  fail "Bootstrap entrypoints are stale"
+fi
+
+# Exercise generation and drift detection in an isolated checkout.
+fixture="$TMP_ROOT/entry-generation"
+mkdir -p "$fixture/scripts"
+cp "$REPO_ROOT/scripts/sync-install.sh" "$fixture/scripts/sync-install.sh"
+printf '#!/bin/sh\nexit 0\n' > "$fixture/scripts/install.sh"
+if sh "$fixture/scripts/sync-install.sh" &&
+   sh "$fixture/scripts/sync-install.sh" --check &&
+   cmp -s "$fixture/scripts/install.sh" "$fixture/dex" &&
+   cmp -s "$fixture/scripts/install.sh" "$fixture/i"; then
+  pass "Canonical source generates both standalone entrypoints"
+else
+  fail "Entrypoint generation failed"
+fi
+printf '# drift\n' >> "$fixture/dex"
+cp "$fixture/dex" "$fixture/before-check"
+if sh "$fixture/scripts/sync-install.sh" --check >/dev/null 2>&1; then
+  fail "Check accepted a stale entrypoint"
+elif cmp -s "$fixture/dex" "$fixture/before-check"; then
+  pass "Check rejects drift without changing published files"
+else
+  fail "Check modified a published file"
+fi
+if sh "$fixture/scripts/sync-install.sh" &&
+   sh "$fixture/scripts/sync-install.sh" --check; then
+  pass "Regeneration repairs drift"
+else
+  fail "Regeneration did not repair drift"
+fi
+
+chmod 0644 "$fixture/i"
+if sh "$fixture/scripts/sync-install.sh" --check >/dev/null 2>&1; then
+  fail "Check accepted a non-executable entrypoint"
+elif sh "$fixture/scripts/sync-install.sh" && [ -x "$fixture/i" ]; then
+  pass "Generation repairs executable permissions"
+else
+  fail "Generation failed to repair executable permissions"
+fi
+cp "$fixture/dex" "$fixture/before-invalid-source"
+printf 'if\n' > "$fixture/scripts/install.sh"
+if sh "$fixture/scripts/sync-install.sh" >/dev/null 2>&1; then
+  fail "Generation accepted invalid shell syntax"
+elif cmp -s "$fixture/dex" "$fixture/before-invalid-source"; then
+  pass "Invalid canonical source leaves published entrypoints untouched"
+else
+  fail "Generation overwrote entrypoints with invalid syntax"
 fi
 
 # ---------------------------------------------------------------------------

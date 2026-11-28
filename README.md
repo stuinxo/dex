@@ -49,3 +49,5 @@ go test -race ./...
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/dex-linux-amd64 ./cmd/dex
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o dist/dex-linux-arm64 ./cmd/dex
 ```
+
+安装脚本的唯一编辑源为 `scripts/install.sh`。修改后运行 `sh scripts/sync-install.sh`，生成兼容原始下载地址的 `dex` 和 `i`。提交前运行 `sh scripts/test-install.sh`，CI 使用同一入口校验同步、语法和安装行为。

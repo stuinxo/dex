@@ -1,0 +1,18 @@
+# Architecture Governance Progress (`dex`)
+
+Status: **Converged** on branch `arch/governance` (forked from `main` `3529762` / `v0.0.8`; `main` untouched).
+
+## Wave Log
+
+| Wave | Focus | Key Changes | Verification |
+|---|---|---|---|
+| **Wave 0** (`b4c4a40`) | Isolation & Baseline | Isolated git worktree, domain map, initial baseline verification | `go vet ./...`, `go test -race ./...` |
+| **Wave 1** (`76471cd`) | Leaf I/O & Pure Domain Root | Extracted `internal/fsutil`; removed `state -> socks5out` and `render -> socks5out`; purified `State.Validate()` + `Normalize()` | Full test suite |
+| **Wave 2** (`938df08`) | Topology SSOT & Bug Fix | Added `render.ComputeServicePlan` / `ManagedNFTTables` (fixing missing `dex-nft` on host-fw VPS status); unified `BuildExtraURI`; removed port pass-throughs; aligned `0.0.8` | Render/CLI/Web/Full `-race` tests |
+| **Wave 3** (`eafa081`) | Control-Plane Workflows & Mutations | Unified cert ops (`reconcile/cert_ops.go`), TPROXY route cleanup, `state/mutations.go`; removed dead helpers | Reconcile/State/CLI/Web `-race` tests |
+| **Wave 4** (`bb7feb6`) | Domain Decomposition | Split monolithic `reconcile/apply.go`, `web/server.go`, `cli/cli.go`, `cli/menu.go`, `ui/app.js` (all non-test Go files `<= 1,344` lines) | Full `-race` suite |
+| **Wave 5** (`4ea6403`) | Executable Contract Guards | Added `internal/arch/arch_test.go` (DAG, `fsutil`, NodeSM UI parity, installer invariants, monolith ceiling) | `test-install.sh`, `go test -race`, Linux `amd64`/`arm64` static builds |
+| **Wave 6** (`2e9405f`) | State Lock Serialization & Cert Ownership | Serialized `Store.Save`/`Update` under `apply.lock -> state.lock` with scoped `Store`; dual primary/backup rollback from `.txn`; `Store.ActiveCertPaths`, `CertConfig.Use*`, atomic `cert_ops` with single `ReloadFn` hook | `write_serialization_test.go`, `rollback_backup_test.go`, `cert_paths_test.go`, `certificate_test.go`, `transaction_test.go`, `share_test.go` + full `-race` |
+| **Wave 7** (`086e5af`) | `internal/update` Extraction | Extracted `internal/update` serialized via `WithApplyLock` + `fsutil.CopyFileAtomic` + `state.ManagedRuleFiles`; retained `.rules-bak-*` on restore error; removed `cli/dl*` & `FindLocalPackage` | `download_test.go`, `serialization_test.go`, `rules_recovery_test.go`, `update`/`cli`/`arch` `-race` |
+| **Wave 8** (`92d9184`) | Web Auth, Secrets, DoH Cache & Metrics | Split `daemon/metrics.go` & `web/doh_cache.go`; credential-bound session snapshots + CAS; serialized `preserveStateSecrets` in `PUT /state` & `handleMigrate` | `metrics_test.go`, `doh_cache_test.go`, `session_lifecycle_test.go`, `state_concurrency_test.go`, `daemon`/`web` `-race` |
+| **Wave 9** | Installer Sync, Tight Guards & Canonical Docs | Added `scripts/sync-install.sh` + 19-test `test-install.sh`; tightened `internal/arch/arch_test.go` (exact direct DAG + negative fixture, cert/port AST guards); unified `docs/*`; removed `CONTEXT.md`/`docs/adr` | `sync-install.sh --check`, `test-install.sh` (19/19), CI security greps, `go vet ./...`, full `go test -race -count=1 ./...`, Linux `amd64`/`arm64` static builds |

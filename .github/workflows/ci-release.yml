@@ -19,12 +19,6 @@ jobs:
 
       - name: Shell syntax & safety checks
         run: |
-          sh -n scripts/install.sh
-          sh -n i
-          sh -n dex
-          head -n 1 dex | grep -q '^#!/bin/sh'
-          cmp -s i scripts/install.sh
-          cmp -s dex scripts/install.sh
           sh scripts/test-install.sh
           ! grep -rn -- '--no-check-certificate' dex i scripts/ internal/ cmd/
           ! grep -rnE 'rm[[:space:]]+(-rf|-f)[[:space:]]+(/var/lib/(apt|dpkg)/.*lock|/var/cache/apt/archives/lock)' dex i scripts/

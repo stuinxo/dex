@@ -1,5 +1,6 @@
 #!/bin/sh
 # DEX Bootstrap Installer (POSIX sh)
+# Edit scripts/install.sh, then run sh scripts/sync-install.sh to publish dex and i.
 # Supports Debian 12/13, Ubuntu (apt + systemd), and Alpine 3.x (apk + OpenRC) on amd64/arm64.
 set -eu
 [ "${DEX_KEEP_PATH:-0}" = "1" ] || export PATH="${PATH:-/usr/bin:/bin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin"
